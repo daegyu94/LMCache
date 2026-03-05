@@ -229,6 +229,7 @@ def _bench_rust_raw_block(
     use_odirect: bool,
     alignment: int,
     cleanup_raw_device: bool,
+    use_callback: bool,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -238,7 +239,6 @@ def _bench_rust_raw_block(
         max_local_cpu_size=0.1,
         lmcache_instance_id="bench_rust_raw_block",
     )
-
     # Create a backing file if raw_device is not provided. For a real block
     # device path (e.g. /dev/nvme*), do not truncate.
     temp_dir: Optional[str] = None
@@ -288,14 +288,32 @@ def _bench_rust_raw_block(
     keepalive: list[torch.Tensor] = []
     objs = _make_memory_objs(num_ops, use_odirect, alignment, keepalive)
 
+    completed = 0
+    lock = threading.Lock()
+    done = threading.Event()
+
     futures = []
     fut_lock = threading.Lock()
 
+    def on_complete(_key: CacheEngineKey) -> None:
+        nonlocal completed
+        with lock:
+            completed += 1
+            if completed >= num_ops:
+                done.set()
+
     def submit_slice(start: int, end: int) -> None:
-        futs = backend.batched_submit_put_task(keys[start:end], objs[start:end])
-        if futs:
-            with fut_lock:
-                futures.extend(futs)
+        if use_callback:
+            backend.batched_submit_put_task(
+                keys[start:end],
+                objs[start:end],
+                on_complete_callback=on_complete,
+            )
+        else:
+            futs = backend.batched_submit_put_task(keys[start:end], objs[start:end])
+            if futs:
+                with fut_lock:
+                    futures.extend(futs)
 
     slice_size = max(1, num_ops // concurrency)
     slices = []
@@ -307,8 +325,19 @@ def _bench_rust_raw_block(
         for s in slices:
             ex.submit(submit_slice, s[0], s[1])
 
-    for fut in futures:
-        fut.result(timeout=120)
+    if use_callback:
+        timeout_sec = max(300.0, float(num_ops) / 100.0)
+        while not done.wait(timeout=1.0):
+            if completed >= num_ops:
+                break
+            if (time.perf_counter() - start) >= timeout_sec:
+                raise TimeoutError(
+                    "RustRaw benchmark timed out: "
+                    f"completed={completed}, expected={num_ops}"
+                )
+    else:
+        for fut in futures:
+            fut.result(timeout=120)
 
     elapsed = time.perf_counter() - start
 
@@ -389,6 +418,7 @@ def main() -> None:
         default="",
         help="Output JSON file path or directory",
     )
+    parser.add_argument("--raw-use-callback", action="store_true")
 
     args = parser.parse_args()
 
@@ -421,6 +451,7 @@ def main() -> None:
                 use_odirect=args.raw_odirect,
                 alignment=args.alignment,
                 cleanup_raw_device=cleanup_raw_device,
+                use_callback=args.raw_use_callback,
             )
         )
 
