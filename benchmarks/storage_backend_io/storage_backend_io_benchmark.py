@@ -318,6 +318,7 @@ def _bench_rust_raw_block(
     alignment: int,
     cleanup_raw_device: bool,
     use_callback: bool,
+    raw_slot_bytes: int,
     operation: str,
     payload_shape: torch.Size,
     payload_size_kb: float,
@@ -360,6 +361,8 @@ def _bench_rust_raw_block(
         "rust_raw_block.manifest_path": manifest_path,
         "rust_raw_block.manifest_write_interval": 0,
     }
+    if raw_slot_bytes > 0:
+        config.extra_config["rust_raw_block.slot_bytes"] = raw_slot_bytes
 
     local_cpu = LocalCPUBackend(
         config=config,
@@ -477,6 +480,7 @@ def _bench_rust_raw_block(
         "concurrency": concurrency,
         "use_odirect": use_odirect,
         "raw_device": raw_device,
+        "raw_slot_bytes": raw_slot_bytes,
         "operation": operation,
         "payload_size_kb": payload_size_kb,
     }
@@ -529,6 +533,15 @@ def main() -> None:
         "--raw-odirect",
         action="store_true",
         help="Enable O_DIRECT for raw block backend",
+    )
+    parser.add_argument(
+        "--raw-slot-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Override rust_raw_block slot size in bytes. "
+            "0 means backend default sizing."
+        ),
     )
     parser.add_argument("--alignment", type=int, default=4096)
     parser.add_argument(
@@ -594,6 +607,7 @@ def main() -> None:
                 alignment=args.alignment,
                 cleanup_raw_device=cleanup_raw_device,
                 use_callback=args.raw_use_callback,
+                raw_slot_bytes=args.raw_slot_bytes,
                 operation=args.operation,
                 payload_shape=payload_shape,
                 payload_size_kb=args.payload_size_kb,
