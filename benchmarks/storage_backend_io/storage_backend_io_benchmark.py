@@ -35,7 +35,7 @@ from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
     RustRawBlockBackend,
 )
 
-DEFAULT_SHAPE = torch.Size([2, 16, 8, 128])
+DEFAULT_PAYLOAD_SHAPE = torch.Size([2, 16, 8, 128])
 DEFAULT_DTYPE = torch.bfloat16
 
 
@@ -64,17 +64,40 @@ def _build_metadata() -> LMCacheMetadata:
     )
 
 
+def _resolve_payload_shape(payload_size_kb: float) -> torch.Size:
+    payload_bytes = int(payload_size_kb * 1024)
+    if payload_bytes <= 0:
+        raise ValueError("payload_size_kb must be > 0")
+
+    itemsize = DEFAULT_DTYPE.itemsize
+    if payload_bytes % itemsize != 0:
+        raise ValueError(
+            "payload_size_kb must produce a whole number of dtype elements"
+        )
+    numel = payload_bytes // itemsize
+
+    # Keep the historical tensor layout [2, 16, 8, X].
+    base = 2 * 16 * 8
+    if numel % base != 0:
+        raise ValueError(
+            "payload_size_kb must be a multiple of 0.5KB "
+            "(for bfloat16 with layout [2,16,8,X])"
+        )
+    return torch.Size([2, 16, 8, numel // base])
+
+
 def _make_memory_objs(
     num_ops: int,
     use_aligned: bool,
     alignment: int,
     keepalive: list[torch.Tensor],
+    payload_shape: torch.Size,
 ) -> list:
     allocator = AdHocMemoryAllocator(device="cpu")
     objs = []
     for _ in range(num_ops):
         if use_aligned:
-            num_bytes = DEFAULT_SHAPE.numel() * DEFAULT_DTYPE.itemsize
+            num_bytes = payload_shape.numel() * DEFAULT_DTYPE.itemsize
             base = torch.empty(
                 torch.Size([num_bytes + alignment]),
                 dtype=torch.uint8,
@@ -86,21 +109,21 @@ def _make_memory_objs(
             obj = TensorMemoryObj(
                 raw_data=aligned,
                 metadata=MemoryObjMetadata(
-                    shape=DEFAULT_SHAPE,
+                    shape=payload_shape,
                     dtype=DEFAULT_DTYPE,
                     address=0,
                     phy_size=0,
                     ref_count=1,
                     pin_count=0,
                     fmt=MemoryFormat.KV_T2D,
-                    shapes=[DEFAULT_SHAPE],
+                    shapes=[payload_shape],
                     dtypes=[DEFAULT_DTYPE],
                 ),
                 parent_allocator=allocator,
             )
         else:
             obj = allocator.allocate(
-                [DEFAULT_SHAPE],
+                [payload_shape],
                 [DEFAULT_DTYPE],
                 fmt=MemoryFormat.KV_T2D,
             )
@@ -161,6 +184,8 @@ def _bench_local_disk(
     use_odirect: bool,
     alignment: int,
     operation: str,
+    payload_shape: torch.Size,
+    payload_size_kb: float,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -192,7 +217,9 @@ def _bench_local_disk(
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
-    objs = _make_memory_objs(num_ops, use_odirect, alignment, keepalive)
+    objs = _make_memory_objs(
+        num_ops, use_odirect, alignment, keepalive, payload_shape
+    )
 
     completed = 0
     lock = threading.Lock()
@@ -268,6 +295,7 @@ def _bench_local_disk(
         "use_odirect": use_odirect,
         "local_disk_dir": local_disk_dir,
         "operation": operation,
+        "payload_size_kb": payload_size_kb,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -291,6 +319,8 @@ def _bench_rust_raw_block(
     cleanup_raw_device: bool,
     use_callback: bool,
     operation: str,
+    payload_shape: torch.Size,
+    payload_size_kb: float,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -347,7 +377,9 @@ def _bench_rust_raw_block(
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
-    objs = _make_memory_objs(num_ops, use_odirect, alignment, keepalive)
+    objs = _make_memory_objs(
+        num_ops, use_odirect, alignment, keepalive, payload_shape
+    )
 
     completed = 0
     lock = threading.Lock()
@@ -446,6 +478,7 @@ def _bench_rust_raw_block(
         "use_odirect": use_odirect,
         "raw_device": raw_device,
         "operation": operation,
+        "payload_size_kb": payload_size_kb,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -499,6 +532,15 @@ def main() -> None:
     )
     parser.add_argument("--alignment", type=int, default=4096)
     parser.add_argument(
+        "--payload-size-kb",
+        type=float,
+        default=64.0,
+        help=(
+            "Payload size per I/O operation in KB. Must be a multiple of 0.5KB "
+            "for bfloat16 layout [2,16,8,X]."
+        ),
+    )
+    parser.add_argument(
         "--output-json",
         type=str,
         default="",
@@ -517,6 +559,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    payload_shape = _resolve_payload_shape(args.payload_size_kb)
 
     results = []
     if args.backend in ("local_disk", "both"):
@@ -529,6 +572,8 @@ def main() -> None:
                 use_odirect=args.local_disk_odirect,
                 alignment=args.alignment,
                 operation=args.operation,
+                payload_shape=payload_shape,
+                payload_size_kb=args.payload_size_kb,
             )
         )
 
@@ -550,6 +595,8 @@ def main() -> None:
                 cleanup_raw_device=cleanup_raw_device,
                 use_callback=args.raw_use_callback,
                 operation=args.operation,
+                payload_shape=payload_shape,
+                payload_size_kb=args.payload_size_kb,
             )
         )
 
@@ -558,6 +605,7 @@ def main() -> None:
             print(
                 f"{result['backend']} [put]: ops={result['num_ops']} "
                 f"concurrency={result['concurrency']} "
+                f"payload={result['payload_size_kb']}KB "
                 f"elapsed={result['put_elapsed_sec']:.3f}s "
                 f"ops/sec={result['put_ops_per_sec']:.2f}"
             )
@@ -565,6 +613,7 @@ def main() -> None:
             print(
                 f"{result['backend']} [get]: ops={result['num_ops']} "
                 f"concurrency={result['concurrency']} "
+                f"payload={result['payload_size_kb']}KB "
                 f"elapsed={result['get_elapsed_sec']:.3f}s "
                 f"ops/sec={result['get_ops_per_sec']:.2f}"
             )
