@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark LocalDiskBackend vs RustRawBlockBackend under high write concurrency."""
+"""Benchmark LocalDiskBackend vs RustRawBlockBackend for put/get I/O."""
 
 # Future
 from __future__ import annotations
@@ -127,6 +127,32 @@ def _make_keys(num_ops: int) -> list[CacheEngineKey]:
     ]
 
 
+def _bench_get_phase(
+    backend: LocalDiskBackend | RustRawBlockBackend,
+    keys: list[CacheEngineKey],
+    concurrency: int,
+) -> float:
+    def read_slice(start: int, end: int) -> None:
+        for key in keys[start:end]:
+            obj = backend.get_blocking(key)
+            if obj is None:
+                raise RuntimeError(f"get miss for key={key}")
+            obj.ref_count_down()
+
+    slice_size = max(1, len(keys) // concurrency)
+    slices = []
+    for i in range(0, len(keys), slice_size):
+        slices.append((i, min(i + slice_size, len(keys))))
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = [ex.submit(read_slice, s[0], s[1]) for s in slices]
+        timeout_sec = max(300.0, float(len(keys)) / 100.0)
+        for fut in futures:
+            fut.result(timeout=timeout_sec)
+    return time.perf_counter() - start
+
+
 def _bench_local_disk(
     num_ops: int,
     concurrency: int,
@@ -134,6 +160,7 @@ def _bench_local_disk(
     max_disk_gb: float,
     use_odirect: bool,
     alignment: int,
+    operation: str,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -145,13 +172,15 @@ def _bench_local_disk(
     )
     config.local_disk = local_disk_dir
     config.max_local_disk_size = max_disk_gb
-    config.extra_config = {"use_odirect": use_odirect}
+    config.extra_config = {"use_odirect": use_odirect,
+                           "local_cpu.pinned_align_bytes": 4096,
+                           }
 
     local_cpu = LocalCPUBackend(
         config=config,
         metadata=metadata,
         dst_device="cpu",
-        memory_allocator=AdHocMemoryAllocator(device="cpu"),
+        # memory_allocator=AdHocMemoryAllocator(device="cpu"),
     )
     backend = LocalDiskBackend(
         config=config,
@@ -188,37 +217,68 @@ def _bench_local_disk(
     for i in range(0, num_ops, slice_size):
         slices.append((i, min(i + slice_size, num_ops)))
 
-    start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for s in slices:
-            ex.submit(submit_slice, s[0], s[1])
+    def run_put_phase(measure: bool) -> float:
+        nonlocal completed
+        completed = 0
+        done.clear()
 
-    # Keep a floor for normal runs but scale for large-op runs.
-    # This avoids premature timeout for long single-shot benchmarks.
-    timeout_sec = max(300.0, float(num_ops) / 100.0)
-    while not done.wait(timeout=1.0):
-        if completed >= num_ops:
-            break
-        if (time.perf_counter() - start) >= timeout_sec:
-            raise TimeoutError(
-                "LocalDisk benchmark timed out: "
-                f"completed={completed}, expected={num_ops}"
-            )
-    elapsed = time.perf_counter() - start
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            for s in slices:
+                ex.submit(submit_slice, s[0], s[1])
+
+        # Keep a floor for normal runs but scale for large-op runs.
+        # This avoids premature timeout for long single-shot benchmarks.
+        timeout_sec = max(300.0, float(num_ops) / 100.0)
+        while not done.wait(timeout=1.0):
+            if completed >= num_ops:
+                break
+            if (time.perf_counter() - start) >= timeout_sec:
+                raise TimeoutError(
+                    "LocalDisk benchmark timed out: "
+                    f"completed={completed}, expected={num_ops}"
+                )
+        elapsed = time.perf_counter() - start
+        return elapsed if measure else 0.0
+
+    put_elapsed: Optional[float] = None
+    get_phase_elapsed: Optional[float] = None
+    get_with_buffered_io = False
+
+    if operation in ("put", "both"):
+        put_elapsed = run_put_phase(measure=True)
 
     _release_memory_objs(objs)
+
+    if operation in ("both"):
+        # LocalDisk get path may hit EINVAL with O_DIRECT if read buffer
+        # alignment is not compatible with O_DIRECT requirements.
+        get_with_buffered_io = backend.use_odirect
+        if get_with_buffered_io:
+            backend.use_odirect = False
+        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency)
+
     backend.disk_worker.close()
     _stop_loop(loop, t)
 
-    return {
+    result = {
         "backend": "local_disk",
         "num_ops": num_ops,
         "concurrency": concurrency,
-        "elapsed_sec": elapsed,
-        "ops_per_sec": num_ops / elapsed if elapsed > 0 else 0.0,
         "use_odirect": use_odirect,
         "local_disk_dir": local_disk_dir,
+        "operation": operation,
     }
+    if put_elapsed is not None:
+        result["put_elapsed_sec"] = put_elapsed
+        result["put_ops_per_sec"] = num_ops / put_elapsed if put_elapsed > 0 else 0.0
+    if get_phase_elapsed is not None:
+        result["get_elapsed_sec"] = get_phase_elapsed
+        result["get_ops_per_sec"] = (
+            num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
+        )
+        result["get_buffered_io_fallback"] = get_with_buffered_io
+    return result
 
 
 def _bench_rust_raw_block(
@@ -230,6 +290,7 @@ def _bench_rust_raw_block(
     alignment: int,
     cleanup_raw_device: bool,
     use_callback: bool,
+    operation: str,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -320,28 +381,45 @@ def _bench_rust_raw_block(
     for i in range(0, num_ops, slice_size):
         slices.append((i, min(i + slice_size, num_ops)))
 
-    start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for s in slices:
-            ex.submit(submit_slice, s[0], s[1])
+    def run_put_phase(measure: bool) -> float:
+        nonlocal completed
+        completed = 0
+        done.clear()
+        with fut_lock:
+            futures.clear()
 
-    if use_callback:
-        timeout_sec = max(300.0, float(num_ops) / 100.0)
-        while not done.wait(timeout=1.0):
-            if completed >= num_ops:
-                break
-            if (time.perf_counter() - start) >= timeout_sec:
-                raise TimeoutError(
-                    "RustRaw benchmark timed out: "
-                    f"completed={completed}, expected={num_ops}"
-                )
-    else:
-        for fut in futures:
-            fut.result(timeout=120)
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            for s in slices:
+                ex.submit(submit_slice, s[0], s[1])
 
-    elapsed = time.perf_counter() - start
+        if use_callback:
+            timeout_sec = max(300.0, float(num_ops) / 100.0)
+            while not done.wait(timeout=1.0):
+                if completed >= num_ops:
+                    break
+                if (time.perf_counter() - start) >= timeout_sec:
+                    raise TimeoutError(
+                        "RustRaw benchmark timed out: "
+                        f"completed={completed}, expected={num_ops}"
+                    )
+        else:
+            for fut in futures:
+                fut.result(timeout=120)
+        elapsed = time.perf_counter() - start
+        return elapsed if measure else 0.0
+
+    put_elapsed: Optional[float] = None
+    get_phase_elapsed: Optional[float] = None
+
+    if operation in ("put", "both"):
+        put_elapsed = run_put_phase(measure=True)
 
     _release_memory_objs(objs)
+
+    if operation in ("both"):
+        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency)
+
     backend.close()
     _stop_loop(loop, t)
 
@@ -361,25 +439,33 @@ def _bench_rust_raw_block(
     except Exception:
         pass
 
-    return {
+    result = {
         "backend": "rust_raw_block",
         "num_ops": num_ops,
         "concurrency": concurrency,
-        "elapsed_sec": elapsed,
-        "ops_per_sec": num_ops / elapsed if elapsed > 0 else 0.0,
         "use_odirect": use_odirect,
         "raw_device": raw_device,
+        "operation": operation,
     }
+    if put_elapsed is not None:
+        result["put_elapsed_sec"] = put_elapsed
+        result["put_ops_per_sec"] = num_ops / put_elapsed if put_elapsed > 0 else 0.0
+    if get_phase_elapsed is not None:
+        result["get_elapsed_sec"] = get_phase_elapsed
+        result["get_ops_per_sec"] = (
+            num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
+        )
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark LocalDiskBackend vs RustRawBlockBackend "
-            "under high write concurrency."
+            "for put/get workloads."
         )
     )
-    parser.add_argument("--num-ops", type=int, default=256, help="Total put ops")
+    parser.add_argument("--num-ops", type=int, default=256, help="Total KV ops")
     parser.add_argument(
         "--concurrency", type=int, default=16, help="Number of submit threads"
     )
@@ -419,6 +505,16 @@ def main() -> None:
         help="Output JSON file path or directory",
     )
     parser.add_argument("--raw-use-callback", action="store_true")
+    parser.add_argument(
+        "--operation",
+        choices=["put", "both"],
+        default="put",
+        help=(
+            "Benchmark operation: "
+            "'put' writes only, "
+            "'both' measures put then get."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -432,6 +528,7 @@ def main() -> None:
                 max_disk_gb=args.max_local_disk_gb,
                 use_odirect=args.local_disk_odirect,
                 alignment=args.alignment,
+                operation=args.operation,
             )
         )
 
@@ -452,16 +549,25 @@ def main() -> None:
                 alignment=args.alignment,
                 cleanup_raw_device=cleanup_raw_device,
                 use_callback=args.raw_use_callback,
+                operation=args.operation,
             )
         )
 
     for result in results:
-        print(
-            f"{result['backend']}: ops={result['num_ops']} "
-            f"concurrency={result['concurrency']} "
-            f"elapsed={result['elapsed_sec']:.3f}s "
-            f"ops/sec={result['ops_per_sec']:.2f}"
-        )
+        if "put_elapsed_sec" in result:
+            print(
+                f"{result['backend']} [put]: ops={result['num_ops']} "
+                f"concurrency={result['concurrency']} "
+                f"elapsed={result['put_elapsed_sec']:.3f}s "
+                f"ops/sec={result['put_ops_per_sec']:.2f}"
+            )
+        if "get_elapsed_sec" in result:
+            print(
+                f"{result['backend']} [get]: ops={result['num_ops']} "
+                f"concurrency={result['concurrency']} "
+                f"elapsed={result['get_elapsed_sec']:.3f}s "
+                f"ops/sec={result['get_ops_per_sec']:.2f}"
+            )
 
     if args.output_json:
         output_path = args.output_json
