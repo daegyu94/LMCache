@@ -197,15 +197,13 @@ def _bench_local_disk(
     )
     config.local_disk = local_disk_dir
     config.max_local_disk_size = max_disk_gb
-    config.extra_config = {"use_odirect": use_odirect,
-                           "local_cpu.pinned_align_bytes": 4096,
-                           }
+    config.extra_config = {"use_odirect": use_odirect}
 
     local_cpu = LocalCPUBackend(
         config=config,
         metadata=metadata,
         dst_device="cpu",
-        # memory_allocator=AdHocMemoryAllocator(device="cpu"),
+        memory_allocator=AdHocMemoryAllocator(device="cpu"),
     )
     backend = LocalDiskBackend(
         config=config,
