@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 # Standard
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Optional
 import argparse
 import asyncio
+import collections
 import json
 import os
 import stat
@@ -37,6 +39,98 @@ from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
 
 DEFAULT_PAYLOAD_SHAPE = torch.Size([2, 16, 8, 128])
 DEFAULT_DTYPE = torch.bfloat16
+
+
+@dataclass
+class _ThreadLatencyStats:
+    ops: int = 0
+    total_ns: int = 0
+
+
+@dataclass
+class _LatencyBreakdownCollector:
+    e2e_total_ns: dict[str, int] = field(
+        default_factory=lambda: collections.defaultdict(int)
+    )
+    e2e_ops: dict[str, int] = field(
+        default_factory=lambda: collections.defaultdict(int)
+    )
+    e2e_by_thread: dict[str, dict[int, _ThreadLatencyStats]] = field(
+        default_factory=lambda: collections.defaultdict(
+            lambda: collections.defaultdict(_ThreadLatencyStats)
+        )
+    )
+    io_total_ns: dict[str, int] = field(
+        default_factory=lambda: collections.defaultdict(int)
+    )
+    io_ops: dict[str, int] = field(default_factory=lambda: collections.defaultdict(int))
+    io_by_thread: dict[str, dict[int, _ThreadLatencyStats]] = field(
+        default_factory=lambda: collections.defaultdict(
+            lambda: collections.defaultdict(_ThreadLatencyStats)
+        )
+    )
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record_e2e(self, op: str, latency_ns: int, thread_id: int) -> None:
+        with self._lock:
+            self.e2e_total_ns[op] += latency_ns
+            self.e2e_ops[op] += 1
+            thread_stats = self.e2e_by_thread[op][thread_id]
+            thread_stats.ops += 1
+            thread_stats.total_ns += latency_ns
+
+    def record_io(self, op: str, latency_ns: int, thread_id: int) -> None:
+        with self._lock:
+            self.io_total_ns[op] += latency_ns
+            self.io_ops[op] += 1
+            thread_stats = self.io_by_thread[op][thread_id]
+            thread_stats.ops += 1
+            thread_stats.total_ns += latency_ns
+
+    def to_result_dict(self) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        for op in sorted(set(self.e2e_ops.keys()) | set(self.io_ops.keys())):
+            e2e_ops = int(self.e2e_ops.get(op, 0))
+            io_ops = int(self.io_ops.get(op, 0))
+            e2e_total_ns = int(self.e2e_total_ns.get(op, 0))
+            io_total_ns = int(self.io_total_ns.get(op, 0))
+            lmcache_total_ns = max(0, e2e_total_ns - io_total_ns)
+            ref_ops = e2e_ops if e2e_ops > 0 else io_ops
+
+            result[op] = {
+                "samples_e2e": e2e_ops,
+                "samples_io_syscall": io_ops,
+                "e2e_total_us": e2e_total_ns / 1e3,
+                "e2e_avg_us": (e2e_total_ns / e2e_ops / 1e3) if e2e_ops > 0 else 0.0,
+                "io_syscall_total_us": io_total_ns / 1e3,
+                "io_syscall_avg_us": (io_total_ns / io_ops / 1e3)
+                if io_ops > 0
+                else 0.0,
+                "lmcache_total_us": lmcache_total_ns / 1e3,
+                "lmcache_avg_us": (lmcache_total_ns / ref_ops / 1e3)
+                if ref_ops > 0
+                else 0.0,
+                "e2e_by_thread": self._serialize_thread_stats(self.e2e_by_thread[op]),
+                "io_syscall_by_thread": self._serialize_thread_stats(
+                    self.io_by_thread[op]
+                ),
+            }
+        return result
+
+    @staticmethod
+    def _serialize_thread_stats(
+        thread_stats: dict[int, _ThreadLatencyStats],
+    ) -> dict[str, dict[str, float | int]]:
+        serialized: dict[str, dict[str, float | int]] = {}
+        for tid, stats in sorted(thread_stats.items()):
+            serialized[str(tid)] = {
+                "ops": int(stats.ops),
+                "total_us": stats.total_ns / 1e3,
+                "avg_us": (stats.total_ns / stats.ops / 1e3)
+                if stats.ops > 0
+                else 0.0,
+            }
+        return serialized
 
 
 def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
@@ -154,12 +248,20 @@ def _bench_get_phase(
     backend: LocalDiskBackend | RustRawBlockBackend,
     keys: list[CacheEngineKey],
     concurrency: int,
+    latency: Optional[_LatencyBreakdownCollector] = None,
 ) -> float:
     def read_slice(start: int, end: int) -> None:
         for key in keys[start:end]:
+            e2e_start_ns = time.perf_counter_ns() if latency is not None else 0
             obj = backend.get_blocking(key)
             if obj is None:
                 raise RuntimeError(f"get miss for key={key}")
+            if latency is not None:
+                latency.record_e2e(
+                    "read",
+                    time.perf_counter_ns() - e2e_start_ns,
+                    threading.get_native_id(),
+                )
             obj.ref_count_down()
 
     slice_size = max(1, len(keys) // concurrency)
@@ -186,6 +288,7 @@ def _bench_local_disk(
     operation: str,
     payload_shape: torch.Size,
     payload_size_kb: float,
+    measure_latency_breakdown: bool,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -212,6 +315,9 @@ def _bench_local_disk(
         dst_device="cpu",
         metadata=metadata,
     )
+    latency = _LatencyBreakdownCollector() if measure_latency_breakdown else None
+    if latency is not None:
+        backend.set_io_latency_callback(latency.record_io)
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
@@ -222,15 +328,27 @@ def _bench_local_disk(
     completed = 0
     lock = threading.Lock()
     done = threading.Event()
+    submit_start_ns: dict[CacheEngineKey, int] = {}
 
     def on_complete(_key: CacheEngineKey) -> None:
         nonlocal completed
+        end_ns = time.perf_counter_ns() if latency is not None else 0
         with lock:
+            started = submit_start_ns.pop(_key, None) if latency is not None else None
+            if started is not None and latency is not None:
+                latency.record_e2e(
+                    "write", end_ns - started, threading.get_native_id()
+                )
             completed += 1
             if completed >= num_ops:
                 done.set()
 
     def submit_slice(start: int, end: int) -> None:
+        if latency is not None:
+            now_ns = time.perf_counter_ns()
+            with lock:
+                for key in keys[start:end]:
+                    submit_start_ns[key] = now_ns
         backend.batched_submit_put_task(
             keys[start:end],
             objs[start:end],
@@ -281,7 +399,7 @@ def _bench_local_disk(
         get_with_buffered_io = backend.use_odirect
         if get_with_buffered_io:
             backend.use_odirect = False
-        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency)
+        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency, latency)
 
     backend.disk_worker.close()
     _stop_loop(loop, t)
@@ -304,6 +422,8 @@ def _bench_local_disk(
             num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
         )
         result["get_buffered_io_fallback"] = get_with_buffered_io
+    if latency is not None:
+        result["latency_breakdown"] = latency.to_result_dict()
     return result
 
 
@@ -320,6 +440,7 @@ def _bench_rust_raw_block(
     operation: str,
     payload_shape: torch.Size,
     payload_size_kb: float,
+    measure_latency_breakdown: bool,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -375,6 +496,9 @@ def _bench_rust_raw_block(
         loop=loop,
         dst_device="cpu",
     )
+    latency = _LatencyBreakdownCollector() if measure_latency_breakdown else None
+    if latency is not None:
+        backend.set_io_latency_callback(latency.record_io)
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
@@ -385,18 +509,30 @@ def _bench_rust_raw_block(
     completed = 0
     lock = threading.Lock()
     done = threading.Event()
+    submit_start_ns: dict[CacheEngineKey, int] = {}
 
-    futures = []
+    futures: list[tuple[Future, CacheEngineKey]] = []
     fut_lock = threading.Lock()
 
     def on_complete(_key: CacheEngineKey) -> None:
         nonlocal completed
+        end_ns = time.perf_counter_ns() if latency is not None else 0
         with lock:
+            started = submit_start_ns.pop(_key, None) if latency is not None else None
+            if started is not None and latency is not None:
+                latency.record_e2e(
+                    "write", end_ns - started, threading.get_native_id()
+                )
             completed += 1
             if completed >= num_ops:
                 done.set()
 
     def submit_slice(start: int, end: int) -> None:
+        if latency is not None:
+            now_ns = time.perf_counter_ns()
+            with lock:
+                for key in keys[start:end]:
+                    submit_start_ns[key] = now_ns
         if use_callback:
             backend.batched_submit_put_task(
                 keys[start:end],
@@ -407,7 +543,8 @@ def _bench_rust_raw_block(
             futs = backend.batched_submit_put_task(keys[start:end], objs[start:end])
             if futs:
                 with fut_lock:
-                    futures.extend(futs)
+                    for key, fut in zip(keys[start:end], futs, strict=False):
+                        futures.append((fut, key))
 
     slice_size = max(1, num_ops // concurrency)
     slices = []
@@ -437,8 +574,17 @@ def _bench_rust_raw_block(
                         f"completed={completed}, expected={num_ops}"
                     )
         else:
-            for fut in futures:
+            for fut, key in futures:
                 fut.result(timeout=120)
+                end_ns = time.perf_counter_ns() if latency is not None else 0
+                with lock:
+                    started = (
+                        submit_start_ns.pop(key, None) if latency is not None else None
+                    )
+                if started is not None and latency is not None:
+                    latency.record_e2e(
+                        "write", end_ns - started, threading.get_native_id()
+                    )
         elapsed = time.perf_counter() - start
         return elapsed if measure else 0.0
 
@@ -451,7 +597,7 @@ def _bench_rust_raw_block(
     _release_memory_objs(objs)
 
     if operation in ("both"):
-        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency)
+        get_phase_elapsed = _bench_get_phase(backend, keys, concurrency, latency)
 
     backend.close()
     _stop_loop(loop, t)
@@ -490,6 +636,8 @@ def _bench_rust_raw_block(
         result["get_ops_per_sec"] = (
             num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
         )
+    if latency is not None:
+        result["latency_breakdown"] = latency.to_result_dict()
     return result
 
 
@@ -559,6 +707,14 @@ def main() -> None:
     )
     parser.add_argument("--raw-use-callback", action="store_true")
     parser.add_argument(
+        "--latency-breakdown",
+        action="store_true",
+        help=(
+            "Enable latency breakdown instrumentation "
+            "(E2E / LMCache / syscall I/O, unit=us)."
+        ),
+    )
+    parser.add_argument(
         "--operation",
         choices=["put", "both"],
         default="put",
@@ -585,6 +741,7 @@ def main() -> None:
                 operation=args.operation,
                 payload_shape=payload_shape,
                 payload_size_kb=args.payload_size_kb,
+                measure_latency_breakdown=args.latency_breakdown,
             )
         )
 
@@ -609,6 +766,7 @@ def main() -> None:
                 operation=args.operation,
                 payload_shape=payload_shape,
                 payload_size_kb=args.payload_size_kb,
+                measure_latency_breakdown=args.latency_breakdown,
             )
         )
 
@@ -629,6 +787,31 @@ def main() -> None:
                 f"elapsed={result['get_elapsed_sec']:.3f}s "
                 f"ops/sec={result['get_ops_per_sec']:.2f}"
             )
+        latency_breakdown = result.get("latency_breakdown", {})
+        for op in ("write", "read"):
+            op_stats = latency_breakdown.get(op)
+            if op_stats is None:
+                continue
+            print(
+                f"{result['backend']} [{op}-latency]: "
+                f"e2e_avg={op_stats['e2e_avg_us']:.3f}us "
+                f"lmcache_avg={op_stats['lmcache_avg_us']:.3f}us "
+                f"io_syscall_avg={op_stats['io_syscall_avg_us']:.3f}us "
+                f"(samples_e2e={op_stats['samples_e2e']}, "
+                f"samples_io={op_stats['samples_io_syscall']})"
+            )
+            io_by_thread = op_stats.get("io_syscall_by_thread", {})
+            e2e_by_thread = op_stats.get("e2e_by_thread", {})
+            if e2e_by_thread:
+                print(
+                    f"{result['backend']} [{op}-e2e-thread-breakdown]: "
+                    f"{json.dumps(e2e_by_thread, sort_keys=True)}"
+                )
+            if io_by_thread:
+                print(
+                    f"{result['backend']} [{op}-io-thread-breakdown]: "
+                    f"{json.dumps(io_by_thread, sort_keys=True)}"
+                )
 
     if args.output_json:
         output_path = args.output_json

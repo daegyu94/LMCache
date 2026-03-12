@@ -153,6 +153,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
 
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -170,6 +171,15 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def __str__(self):
         return "LocalDiskBackend"
+
+    def set_io_latency_callback(
+        self, callback: Optional[Callable[[str, int, int], None]]
+    ) -> None:
+        """Set optional callback invoked on disk read/write syscall timing.
+
+        The callback receives `(operation, latency_ns, native_thread_id)`.
+        """
+        self.io_latency_callback = callback
 
     def _key_to_path(
         self,
@@ -582,6 +592,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def write_file(self, buffer, path):
         start_time = time.time()
+        io_start_ns = time.perf_counter_ns()
         size = len(buffer)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
             with open(path, "wb") as f:
@@ -590,6 +601,9 @@ class LocalDiskBackend(StorageBackendInterface):
             fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
             os.write(fd, buffer)
             os.close(fd)
+        io_elapsed_ns = time.perf_counter_ns() - io_start_ns
+        if self.io_latency_callback is not None:
+            self.io_latency_callback("write", io_elapsed_ns, threading.get_native_id())
         disk_write_time = time.time() - start_time
         logger.debug(
             f"Disk write size: {size} bytes, "
@@ -607,6 +621,7 @@ class LocalDiskBackend(StorageBackendInterface):
             )
 
         try:
+            io_start_ns = time.perf_counter_ns()
             if not fblock_aligned or not self.use_odirect:
                 with open(path, "rb") as f:
                     f.readinto(buffer)
@@ -614,6 +629,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
                 with os.fdopen(fd, "rb", buffering=0) as fdo:
                     fdo.readinto(buffer)
+            io_elapsed_ns = time.perf_counter_ns() - io_start_ns
+            if self.io_latency_callback is not None:
+                self.io_latency_callback(
+                    "read", io_elapsed_ns, threading.get_native_id()
+                )
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):

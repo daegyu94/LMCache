@@ -12,6 +12,7 @@ import ctypes
 import json
 import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -187,6 +188,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         # Track ongoing put tasks to match exists_in_put_tasks semantics.
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
 
         logger.info(
             "RustRawBlockBackend init: device=%s cap=%s slot=%d align=%d header=%d",
@@ -234,6 +236,15 @@ class RustRawBlockBackend(StoragePluginInterface):
 
     def __str__(self) -> str:
         return "RustRawBlockBackend"
+
+    def set_io_latency_callback(
+        self, callback: Optional[Callable[[str, int, int], None]]
+    ) -> None:
+        """Set optional callback invoked on raw-device read/write timing.
+
+        The callback receives `(operation, latency_ns, native_thread_id)`.
+        """
+        self.io_latency_callback = callback
 
     def _rawdev(self):
         """Lazy init: create single-FD device for synchronous read/write operations."""
@@ -506,6 +517,7 @@ class RustRawBlockBackend(StoragePluginInterface):
             def _do_write():
                 try:
                     raw_dev = self._rawdev()
+                    io_start_ns = time.perf_counter_ns()
                     # Write header
                     hdr_total = (
                         _round_up(len(header), self.block_align)
@@ -517,6 +529,11 @@ class RustRawBlockBackend(StoragePluginInterface):
                     raw_dev.pwrite_from_buffer(
                         offset + self.header_bytes, buf, payload_len, total_len
                     )
+                    io_elapsed_ns = time.perf_counter_ns() - io_start_ns
+                    if self.io_latency_callback is not None:
+                        self.io_latency_callback(
+                            "write", io_elapsed_ns, threading.get_native_id()
+                        )
                 except Exception as e:
                     logger.error(
                         f"Write failed for key {self._dbg_key_short(key)}: {e}"
@@ -605,6 +622,7 @@ class RustRawBlockBackend(StoragePluginInterface):
             pass
 
         try:
+            io_start_ns = time.perf_counter_ns()
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,
@@ -625,6 +643,11 @@ class RustRawBlockBackend(StoragePluginInterface):
             else:
                 self._rawdev().pread_into(
                     entry.offset + self.header_bytes, buf, payload_len, total_len
+                )
+            io_elapsed_ns = time.perf_counter_ns() - io_start_ns
+            if self.io_latency_callback is not None:
+                self.io_latency_callback(
+                    "read", io_elapsed_ns, threading.get_native_id()
                 )
         except Exception as e:
             logger.error(f"Read failed for key {self._dbg_key_short(key)}: {e}")
