@@ -204,15 +204,18 @@ class RustRawBlockBackend(StoragePluginInterface):
         # Track ongoing put tasks to match exists_in_put_tasks semantics.
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
-        self._submit_executor: Optional[ThreadPoolExecutor] = None
+        self._submit_executors: list[ThreadPoolExecutor] = []
         self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
         self.put_stage_latency_callback: Optional[
             Callable[[str, str, int, int], None]
         ] = None
         if self.submit_mode == "threadpool":
-            self._submit_executor = ThreadPoolExecutor(
-                max_workers=int(extra.get("rust_raw_block.submit_workers", 4))
-            )
+            submit_pools = max(1, int(extra.get("rust_raw_block.submit_pools", 1)))
+            submit_workers = int(extra.get("rust_raw_block.submit_workers", 4))
+            self._submit_executors = [
+                ThreadPoolExecutor(max_workers=submit_workers)
+                for _ in range(submit_pools)
+            ]
 
         logger.info(
             "RustRawBlockBackend init: device=%s cap=%s slot=%d align=%d header=%d",
@@ -517,8 +520,8 @@ class RustRawBlockBackend(StoragePluginInterface):
                 else:
                     fut.set_result(None)
             elif self.submit_mode == "threadpool":
-                assert self._submit_executor is not None
-                fut = self._submit_executor.submit(
+                submit_executor = self._select_submit_executor(key)
+                fut = submit_executor.submit(
                     self._submit_write_sync,
                     key,
                     offset,
@@ -836,9 +839,9 @@ class RustRawBlockBackend(StoragePluginInterface):
                 logger.warning(f"Failed to close raw block device: {e}")
             finally:
                 self._raw = None
-        if self._submit_executor is not None:
-            self._submit_executor.shutdown(wait=True)
-            self._submit_executor = None
+        for submit_executor in self._submit_executors:
+            submit_executor.shutdown(wait=True)
+        self._submit_executors = []
 
     def _record_put_stage(self, stage: str, latency_ns: int) -> None:
         if self.put_stage_latency_callback is not None:
@@ -854,6 +857,15 @@ class RustRawBlockBackend(StoragePluginInterface):
         except Exception:
             loop_idx = 0
         return self._submit_loops[loop_idx]
+
+    def _select_submit_executor(self, key: CacheEngineKey) -> ThreadPoolExecutor:
+        if not self._submit_executors:
+            raise RuntimeError("No submit executors configured for threadpool mode")
+        try:
+            executor_idx = int(key.chunk_hash) % len(self._submit_executors)
+        except Exception:
+            executor_idx = 0
+        return self._submit_executors[executor_idx]
 
     def _maybe_save_manifest(self) -> None:
         """Save manifest periodically (every N writes) for crash recovery."""

@@ -529,6 +529,7 @@ def _bench_rust_raw_block(
     raw_submit_mode: str,
     raw_submit_workers: int,
     raw_submit_loops: int,
+    raw_submit_pools: int,
 ) -> dict:
     loop_pairs: list[tuple[asyncio.AbstractEventLoop, threading.Thread]] = []
     loop: Optional[asyncio.AbstractEventLoop] = None
@@ -575,6 +576,7 @@ def _bench_rust_raw_block(
         "rust_raw_block.manifest_write_interval": 0,
         "rust_raw_block.submit_mode": raw_submit_mode,
         "rust_raw_block.submit_workers": raw_submit_workers,
+        "rust_raw_block.submit_pools": raw_submit_pools,
     }
     if raw_slot_bytes > 0:
         config.extra_config["rust_raw_block.slot_bytes"] = raw_slot_bytes
@@ -749,6 +751,7 @@ def _bench_rust_raw_block(
         "raw_submit_mode": raw_submit_mode,
         "raw_submit_workers": raw_submit_workers,
         "raw_submit_loops": raw_submit_loops,
+        "raw_submit_pools": raw_submit_pools,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -846,17 +849,28 @@ def main() -> None:
             "Rust raw-block submit path: "
             "'async_loop' uses run_coroutine_threadsafe()+asyncio.to_thread "
             "and shards keys across --raw-submit-loops by chunk_hash %% num_loops, "
-            "'threadpool' submits directly to a backend ThreadPoolExecutor, "
+            "'threadpool' submits directly to sharded backend "
+            "ThreadPoolExecutors by chunk_hash %% num_pools, "
             "'sync' executes writes on the caller thread."
         ),
     )
     parser.add_argument(
         "--raw-submit-workers",
         type=int,
-        default=4,
+        default=1,
         help=(
-            "Worker count for rust raw-block 'threadpool' submit mode. "
+            "Worker count per pool for rust raw-block 'threadpool' submit mode. "
             "Ignored by other modes."
+        ),
+    )
+    parser.add_argument(
+        "--raw-submit-pools",
+        type=int,
+        default=1,
+        help=(
+            "Number of ThreadPoolExecutor shards for rust raw-block "
+            "'threadpool' submit mode. Keys are assigned by chunk_hash %% "
+            "num_pools. Ignored by other modes."
         ),
     )
     parser.add_argument(
@@ -944,6 +958,7 @@ def main() -> None:
                 raw_submit_mode=args.raw_submit_mode,
                 raw_submit_workers=args.raw_submit_workers,
                 raw_submit_loops=args.raw_submit_loops,
+                raw_submit_pools=args.raw_submit_pools,
             )
         )
 
