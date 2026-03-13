@@ -69,6 +69,23 @@ class _LatencyBreakdownCollector:
             lambda: collections.defaultdict(_ThreadLatencyStats)
         )
     )
+    stage_total_ns: dict[str, dict[str, int]] = field(
+        default_factory=lambda: collections.defaultdict(
+            lambda: collections.defaultdict(int)
+        )
+    )
+    stage_ops: dict[str, dict[str, int]] = field(
+        default_factory=lambda: collections.defaultdict(
+            lambda: collections.defaultdict(int)
+        )
+    )
+    stage_by_thread: dict[str, dict[str, dict[int, _ThreadLatencyStats]]] = field(
+        default_factory=lambda: collections.defaultdict(
+            lambda: collections.defaultdict(
+                lambda: collections.defaultdict(_ThreadLatencyStats)
+            )
+        )
+    )
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def record_e2e(self, op: str, latency_ns: int, thread_id: int) -> None:
@@ -84,6 +101,16 @@ class _LatencyBreakdownCollector:
             self.io_total_ns[op] += latency_ns
             self.io_ops[op] += 1
             thread_stats = self.io_by_thread[op][thread_id]
+            thread_stats.ops += 1
+            thread_stats.total_ns += latency_ns
+
+    def record_stage(
+        self, op: str, stage: str, latency_ns: int, thread_id: int
+    ) -> None:
+        with self._lock:
+            self.stage_total_ns[op][stage] += latency_ns
+            self.stage_ops[op][stage] += 1
+            thread_stats = self.stage_by_thread[op][stage][thread_id]
             thread_stats.ops += 1
             thread_stats.total_ns += latency_ns
 
@@ -114,8 +141,23 @@ class _LatencyBreakdownCollector:
                 "io_syscall_by_thread": self._serialize_thread_stats(
                     self.io_by_thread[op]
                 ),
+                "stages": self._serialize_stage_stats(op),
             }
         return result
+
+    def _serialize_stage_stats(self, op: str) -> dict[str, dict]:
+        serialized: dict[str, dict] = {}
+        for stage, total_ns in sorted(self.stage_total_ns[op].items()):
+            stage_ops = int(self.stage_ops[op][stage])
+            serialized[stage] = {
+                "samples": stage_ops,
+                "total_us": total_ns / 1e3,
+                "avg_us": (total_ns / stage_ops / 1e3) if stage_ops > 0 else 0.0,
+                "by_thread": self._serialize_thread_stats(
+                    self.stage_by_thread[op][stage]
+                ),
+            }
+        return serialized
 
     @staticmethod
     def _serialize_thread_stats(
@@ -289,6 +331,7 @@ def _bench_local_disk(
     payload_shape: torch.Size,
     payload_size_kb: float,
     measure_latency_breakdown: bool,
+    submit_mode: str,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -318,6 +361,7 @@ def _bench_local_disk(
     latency = _LatencyBreakdownCollector() if measure_latency_breakdown else None
     if latency is not None:
         backend.set_io_latency_callback(latency.record_io)
+        backend.set_put_stage_latency_callback(latency.record_stage)
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
@@ -344,6 +388,18 @@ def _bench_local_disk(
                 done.set()
 
     def submit_slice(start: int, end: int) -> None:
+        if submit_mode == "single_key":
+            for key, obj in zip(keys[start:end], objs[start:end], strict=False):
+                if latency is not None:
+                    with lock:
+                        submit_start_ns[key] = time.perf_counter_ns()
+                backend.batched_submit_put_task(
+                    [key],
+                    [obj],
+                    on_complete_callback=on_complete,
+                )
+            return
+
         if latency is not None:
             now_ns = time.perf_counter_ns()
             with lock:
@@ -412,6 +468,7 @@ def _bench_local_disk(
         "local_disk_dir": local_disk_dir,
         "operation": operation,
         "payload_size_kb": payload_size_kb,
+        "submit_mode": submit_mode,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -441,8 +498,14 @@ def _bench_rust_raw_block(
     payload_shape: torch.Size,
     payload_size_kb: float,
     measure_latency_breakdown: bool,
+    submit_mode: str,
+    raw_submit_mode: str,
+    raw_submit_workers: int,
 ) -> dict:
-    loop, t = _start_loop()
+    loop: Optional[asyncio.AbstractEventLoop] = None
+    t: Optional[threading.Thread] = None
+    if raw_submit_mode == "async_loop":
+        loop, t = _start_loop()
     metadata = _build_metadata()
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
@@ -479,6 +542,8 @@ def _bench_rust_raw_block(
         "rust_raw_block.use_odirect": use_odirect,
         "rust_raw_block.manifest_path": manifest_path,
         "rust_raw_block.manifest_write_interval": 0,
+        "rust_raw_block.submit_mode": raw_submit_mode,
+        "rust_raw_block.submit_workers": raw_submit_workers,
     }
     if raw_slot_bytes > 0:
         config.extra_config["rust_raw_block.slot_bytes"] = raw_slot_bytes
@@ -499,6 +564,7 @@ def _bench_rust_raw_block(
     latency = _LatencyBreakdownCollector() if measure_latency_breakdown else None
     if latency is not None:
         backend.set_io_latency_callback(latency.record_io)
+        backend.set_put_stage_latency_callback(latency.record_stage)
 
     keys = _make_keys(num_ops)
     keepalive: list[torch.Tensor] = []
@@ -528,6 +594,25 @@ def _bench_rust_raw_block(
                 done.set()
 
     def submit_slice(start: int, end: int) -> None:
+        if submit_mode == "single_key":
+            for key, obj in zip(keys[start:end], objs[start:end], strict=False):
+                if latency is not None:
+                    with lock:
+                        submit_start_ns[key] = time.perf_counter_ns()
+                if use_callback:
+                    backend.batched_submit_put_task(
+                        [key],
+                        [obj],
+                        on_complete_callback=on_complete,
+                    )
+                else:
+                    futs = backend.batched_submit_put_task([key], [obj])
+                    if futs:
+                        with fut_lock:
+                            for fut in futs:
+                                futures.append((fut, key))
+            return
+
         if latency is not None:
             now_ns = time.perf_counter_ns()
             with lock:
@@ -600,7 +685,8 @@ def _bench_rust_raw_block(
         get_phase_elapsed = _bench_get_phase(backend, keys, concurrency, latency)
 
     backend.close()
-    _stop_loop(loop, t)
+    if loop is not None and t is not None:
+        _stop_loop(loop, t)
 
     # Best-effort cleanup for temp file or requested cleanup.
     if cleanup_raw_device or temp_dir:
@@ -627,6 +713,9 @@ def _bench_rust_raw_block(
         "raw_slot_bytes": raw_slot_bytes,
         "operation": operation,
         "payload_size_kb": payload_size_kb,
+        "submit_mode": submit_mode,
+        "raw_submit_mode": raw_submit_mode,
+        "raw_submit_workers": raw_submit_workers,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -707,6 +796,26 @@ def main() -> None:
     )
     parser.add_argument("--raw-use-callback", action="store_true")
     parser.add_argument(
+        "--raw-submit-mode",
+        choices=["async_loop", "threadpool", "sync"],
+        default="async_loop",
+        help=(
+            "Rust raw-block submit path: "
+            "'async_loop' uses run_coroutine_threadsafe()+asyncio.to_thread, "
+            "'threadpool' submits directly to a backend ThreadPoolExecutor, "
+            "'sync' executes writes on the caller thread."
+        ),
+    )
+    parser.add_argument(
+        "--raw-submit-workers",
+        type=int,
+        default=4,
+        help=(
+            "Worker count for rust raw-block 'threadpool' submit mode. "
+            "Ignored by other modes."
+        ),
+    )
+    parser.add_argument(
         "--latency-breakdown",
         action="store_true",
         help=(
@@ -722,6 +831,16 @@ def main() -> None:
             "Benchmark operation: "
             "'put' writes only, "
             "'both' measures put then get."
+        ),
+    )
+    parser.add_argument(
+        "--submit-mode",
+        choices=["single_key", "batch_slice"],
+        default="single_key",
+        help=(
+            "Write submission mode: "
+            "'single_key' submits one key at a time, "
+            "'batch_slice' submits one slice per worker thread."
         ),
     )
 
@@ -742,6 +861,7 @@ def main() -> None:
                 payload_shape=payload_shape,
                 payload_size_kb=args.payload_size_kb,
                 measure_latency_breakdown=args.latency_breakdown,
+                submit_mode=args.submit_mode,
             )
         )
 
@@ -767,6 +887,9 @@ def main() -> None:
                 payload_shape=payload_shape,
                 payload_size_kb=args.payload_size_kb,
                 measure_latency_breakdown=args.latency_breakdown,
+                submit_mode=args.submit_mode,
+                raw_submit_mode=args.raw_submit_mode,
+                raw_submit_workers=args.raw_submit_workers,
             )
         )
 
@@ -800,6 +923,16 @@ def main() -> None:
                 f"(samples_e2e={op_stats['samples_e2e']}, "
                 f"samples_io={op_stats['samples_io_syscall']})"
             )
+            stage_stats = op_stats.get("stages", {})
+            if stage_stats:
+                stage_summary = ", ".join(
+                    f"{stage}={stats['avg_us']:.3f}us"
+                    for stage, stats in sorted(stage_stats.items())
+                )
+                print(
+                    f"{result['backend']} [{op}-stages]: "
+                    f"{stage_summary}"
+                )
 
     if args.output_json:
         output_path = args.output_json

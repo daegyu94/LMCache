@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence
 import asyncio
@@ -12,6 +13,7 @@ import ctypes
 import json
 import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -90,12 +92,24 @@ class RustRawBlockBackend(StoragePluginInterface):
             local_cpu_backend=local_cpu_backend,
             loop=loop,
         )
-        if self.loop is None:
-            raise ValueError("RustRawBlockBackend requires an asyncio event loop")
-        if self.local_cpu_backend is None:
-            raise ValueError("RustRawBlockBackend requires local_cpu_backend")
         if self.config is None:
             raise ValueError("RustRawBlockBackend requires config")
+        extra = self.config.extra_config or {}
+        self.submit_mode: str = str(
+            extra.get("rust_raw_block.submit_mode", "async_loop")
+        )
+        if self.submit_mode not in {"async_loop", "sync", "threadpool"}:
+            raise ValueError(
+                "rust_raw_block.submit_mode must be one of "
+                "'async_loop', 'sync', 'threadpool'"
+            )
+        if self.loop is None and self.submit_mode == "async_loop":
+            raise ValueError(
+                "RustRawBlockBackend requires an asyncio event loop "
+                "when rust_raw_block.submit_mode='async_loop'"
+            )
+        if self.local_cpu_backend is None:
+            raise ValueError("RustRawBlockBackend requires local_cpu_backend")
 
         # TP > 1 not supported: multiple workers would conflict on device access.
         if self.metadata is not None:
@@ -110,7 +124,6 @@ class RustRawBlockBackend(StoragePluginInterface):
                     "For now, please use TP=1 or choose a different storage backend."
                 )
 
-        extra = self.config.extra_config or {}
         self.device_path: str = extra.get("rust_raw_block.device_path", "")
         if not self.device_path:
             raise ValueError("extra_config['rust_raw_block.device_path'] is required")
@@ -187,7 +200,15 @@ class RustRawBlockBackend(StoragePluginInterface):
         # Track ongoing put tasks to match exists_in_put_tasks semantics.
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        self._submit_executor: Optional[ThreadPoolExecutor] = None
         self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
+        self.put_stage_latency_callback: Optional[
+            Callable[[str, str, int, int], None]
+        ] = None
+        if self.submit_mode == "threadpool":
+            self._submit_executor = ThreadPoolExecutor(
+                max_workers=int(extra.get("rust_raw_block.submit_workers", 4))
+            )
 
         logger.info(
             "RustRawBlockBackend init: device=%s cap=%s slot=%d align=%d header=%d",
@@ -198,8 +219,9 @@ class RustRawBlockBackend(StoragePluginInterface):
             self.header_bytes,
         )
         logger.info(
-            "RustRawBlockBackend config: zero_copy=%s",
+            "RustRawBlockBackend config: zero_copy=%s submit_mode=%s",
             self.enable_zero_copy,
+            self.submit_mode,
         )
         logger.warning(
             "RustRawBlockBackend: Currently only TP=1 is supported. "
@@ -244,6 +266,15 @@ class RustRawBlockBackend(StoragePluginInterface):
         The callback receives `(operation, latency_ns, native_thread_id)`.
         """
         self.io_latency_callback = callback
+
+    def set_put_stage_latency_callback(
+        self, callback: Optional[Callable[[str, str, int, int], None]]
+    ) -> None:
+        """Set optional callback for write-path stage timing.
+
+        The callback receives `(operation, stage, latency_ns, native_thread_id)`.
+        """
+        self.put_stage_latency_callback = callback
 
     def _rawdev(self):
         """Lazy init: create single-FD device for synchronous read/write operations."""
@@ -431,6 +462,7 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         futures = []
         for key, obj in zip(keys, objs, strict=False):
+            submit_stage_start_ns = time.perf_counter_ns()
             with self._put_lock:
                 if key in self._put_tasks:
                     continue
@@ -464,18 +496,51 @@ class RustRawBlockBackend(StoragePluginInterface):
 
             header = self._encode_header(key, meta.size)
             obj.ref_count_up()
-            assert self.loop is not None
-            fut = asyncio.run_coroutine_threadsafe(
-                self._submit_write(
-                    key=key,
-                    offset=offset,
-                    header=header,
-                    memory_obj=obj,
-                    on_complete_callback=on_complete_callback,
-                ),
-                self.loop,
-            )
+            if self.submit_mode == "sync":
+                fut = Future()
+                try:
+                    self._submit_write_sync(
+                        key=key,
+                        offset=offset,
+                        header=header,
+                        memory_obj=obj,
+                        enqueued_ns=time.perf_counter_ns(),
+                        on_complete_callback=on_complete_callback,
+                    )
+                except Exception as e:
+                    fut.set_exception(e)
+                    raise
+                else:
+                    fut.set_result(None)
+            elif self.submit_mode == "threadpool":
+                assert self._submit_executor is not None
+                fut = self._submit_executor.submit(
+                    self._submit_write_sync,
+                    key,
+                    offset,
+                    header,
+                    obj,
+                    time.perf_counter_ns(),
+                    on_complete_callback,
+                )
+            else:
+                assert self.loop is not None
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._submit_write(
+                        key=key,
+                        offset=offset,
+                        header=header,
+                        memory_obj=obj,
+                        enqueued_ns=time.perf_counter_ns(),
+                        on_complete_callback=on_complete_callback,
+                    ),
+                    self.loop,
+                )
             futures.append(fut)
+            self._record_put_stage(
+                "submit_dispatch",
+                time.perf_counter_ns() - submit_stage_start_ns,
+            )
         return futures or None
 
     def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
@@ -506,84 +571,138 @@ class RustRawBlockBackend(StoragePluginInterface):
         offset: int,
         header: bytes,
         memory_obj: MemoryObj,
+        enqueued_ns: Optional[int] = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """Execute write: synchronous blocking write wrapped in async thread."""
         try:
-            buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
-
-            # Synchronous blocking write executed in thread pool
-            def _do_write():
-                try:
-                    raw_dev = self._rawdev()
-                    # Write header
-                    hdr_total = (
-                        _round_up(len(header), self.block_align)
-                        if self.use_odirect
-                        else len(header)
-                    )
-                    header_latency_ns, header_thread_id = (
-                        raw_dev.pwrite_from_buffer_timed(
-                            offset, header, len(header), hdr_total
-                        )
-                    )
-                    # Write payload
-                    payload_latency_ns, payload_thread_id = (
-                        raw_dev.pwrite_from_buffer_timed(
-                            offset + self.header_bytes, buf, payload_len, total_len
-                        )
-                    )
-                    if self.io_latency_callback is not None:
-                        io_elapsed_ns = header_latency_ns + payload_latency_ns
-                        thread_id = payload_thread_id
-                        if header_thread_id != payload_thread_id:
-                            logger.debug(
-                                "Rust raw write timing thread changed: header=%s payload=%s",
-                                header_thread_id,
-                                payload_thread_id,
-                            )
-                        self.io_latency_callback(
-                            "write", io_elapsed_ns, thread_id
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Write failed for key {self._dbg_key_short(key)}: {e}"
-                    )
-                    raise
-
+            if enqueued_ns is not None:
+                self._record_put_stage(
+                    "queue_wait",
+                    time.perf_counter_ns() - enqueued_ns,
+                )
             write_error: Optional[Exception] = None
             try:
-                await asyncio.to_thread(_do_write)
+                await asyncio.to_thread(
+                    self._write_payload_sync,
+                    key,
+                    offset,
+                    header,
+                    memory_obj,
+                )
             except Exception as e:
                 write_error = e
-            with self._lock:
-                inflight = self._inflight.pop(key, None)
-                if inflight is not None:
-                    if inflight.canceled or write_error is not None:
-                        self._free_slots.append(int(inflight.offset // self.slot_bytes))
-                    else:
-                        self._index[key] = _Entry(
-                            offset=inflight.offset,
-                            size=inflight.meta.size,
-                            meta=inflight.meta,
-                        )
-                        self._touch(key)
-
-            if write_error is None:
-                self._maybe_save_manifest()
-                if on_complete_callback is not None:
-                    try:
-                        on_complete_callback(key)
-                    except Exception as e:
-                        logger.warning(
-                            f"on_complete_callback failed for key {key}: {e}"
-                        )
-            else:
-                raise write_error
+            self._finalize_write(
+                key=key,
+                write_error=write_error,
+                on_complete_callback=on_complete_callback,
+            )
         finally:
             memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_tasks.discard(key)
+
+    def _submit_write_sync(
+        self,
+        key: CacheEngineKey,
+        offset: int,
+        header: bytes,
+        memory_obj: MemoryObj,
+        enqueued_ns: Optional[int] = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Execute write fully on the caller thread."""
+        try:
+            if enqueued_ns is not None:
+                self._record_put_stage(
+                    "queue_wait",
+                    time.perf_counter_ns() - enqueued_ns,
+                )
+            write_error: Optional[Exception] = None
+            try:
+                self._write_payload_sync(key, offset, header, memory_obj)
+            except Exception as e:
+                write_error = e
+            self._finalize_write(
+                key=key,
+                write_error=write_error,
+                on_complete_callback=on_complete_callback,
+            )
+        finally:
+            memory_obj.ref_count_down()
+            with self._put_lock:
+                self._put_tasks.discard(key)
+
+    def _write_payload_sync(
+        self,
+        key: CacheEngineKey,
+        offset: int,
+        header: bytes,
+        memory_obj: MemoryObj,
+    ) -> None:
+        """Perform the raw blocking writes on the current thread."""
+        buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
+        try:
+            raw_dev = self._rawdev()
+            hdr_total = (
+                _round_up(len(header), self.block_align)
+                if self.use_odirect
+                else len(header)
+            )
+            header_latency_ns, header_thread_id = raw_dev.pwrite_from_buffer_timed(
+                offset, header, len(header), hdr_total
+            )
+            payload_latency_ns, payload_thread_id = raw_dev.pwrite_from_buffer_timed(
+                offset + self.header_bytes, buf, payload_len, total_len
+            )
+            if self.io_latency_callback is not None:
+                io_elapsed_ns = header_latency_ns + payload_latency_ns
+                thread_id = payload_thread_id
+                if header_thread_id != payload_thread_id:
+                    logger.debug(
+                        "Rust raw write timing thread changed: header=%s payload=%s",
+                        header_thread_id,
+                        payload_thread_id,
+                    )
+                self.io_latency_callback("write", io_elapsed_ns, thread_id)
+        except Exception as e:
+            logger.error(f"Write failed for key {self._dbg_key_short(key)}: {e}")
+            raise
+
+    def _finalize_write(
+        self,
+        key: CacheEngineKey,
+        write_error: Optional[Exception],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Commit or roll back in-flight metadata after a write attempt."""
+        finalize_stage_start_ns = time.perf_counter_ns()
+        with self._lock:
+            inflight = self._inflight.pop(key, None)
+            if inflight is not None:
+                if inflight.canceled or write_error is not None:
+                    self._free_slots.append(int(inflight.offset // self.slot_bytes))
+                else:
+                    self._index[key] = _Entry(
+                        offset=inflight.offset,
+                        size=inflight.meta.size,
+                        meta=inflight.meta,
+                    )
+                    self._touch(key)
+
+        if write_error is None:
+            self._maybe_save_manifest()
+            if on_complete_callback is not None:
+                try:
+                    on_complete_callback(key)
+                except Exception as e:
+                    logger.warning(f"on_complete_callback failed for key {key}: {e}")
+        else:
+            raise write_error
+        self._record_put_stage(
+            "post_write_finalize",
+            time.perf_counter_ns() - finalize_stage_start_ns,
+        )
 
     def _encode_header(self, key: CacheEngineKey, payload_len: int) -> bytes:
         """Encode header: magic(8) + chunk_hash(8) + payload_len(8) + zero padding."""
@@ -713,6 +832,15 @@ class RustRawBlockBackend(StoragePluginInterface):
                 logger.warning(f"Failed to close raw block device: {e}")
             finally:
                 self._raw = None
+        if self._submit_executor is not None:
+            self._submit_executor.shutdown(wait=True)
+            self._submit_executor = None
+
+    def _record_put_stage(self, stage: str, latency_ns: int) -> None:
+        if self.put_stage_latency_callback is not None:
+            self.put_stage_latency_callback(
+                "write", stage, latency_ns, threading.get_native_id()
+            )
 
     def _maybe_save_manifest(self) -> None:
         """Save manifest periodically (every N writes) for crash recovery."""

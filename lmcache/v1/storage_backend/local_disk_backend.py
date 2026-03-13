@@ -154,6 +154,9 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
         self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
+        self.put_stage_latency_callback: Optional[
+            Callable[[str, str, int, int], None]
+        ] = None
 
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
@@ -180,6 +183,15 @@ class LocalDiskBackend(StorageBackendInterface):
         The callback receives `(operation, latency_ns, native_thread_id)`.
         """
         self.io_latency_callback = callback
+
+    def set_put_stage_latency_callback(
+        self, callback: Optional[Callable[[str, str, int, int], None]]
+    ) -> None:
+        """Set optional callback for write-path stage timing.
+
+        The callback receives `(operation, stage, latency_ns, native_thread_id)`.
+        """
+        self.put_stage_latency_callback = callback
 
     def _key_to_path(
         self,
@@ -313,6 +325,7 @@ class LocalDiskBackend(StorageBackendInterface):
             after the disk write completes. Callback exceptions are caught
             and logged.
         """
+        submit_stage_start_ns = time.perf_counter_ns()
         assert memory_obj.tensor is not None
 
         # skip repeated save
@@ -359,9 +372,14 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
+                enqueued_ns=time.perf_counter_ns(),
                 on_complete_callback=on_complete_callback,
             ),
             self.loop,
+        )
+        self._record_put_stage(
+            "submit_dispatch",
+            time.perf_counter_ns() - submit_stage_start_ns,
         )
 
     # TODO(Jiayi): enable real batching
@@ -492,6 +510,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        enqueued_ns: Optional[int] = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
@@ -503,6 +522,11 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
+        if enqueued_ns is not None:
+            self._record_put_stage(
+                "queue_wait",
+                time.perf_counter_ns() - enqueued_ns,
+            )
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
 
@@ -511,7 +535,12 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
+        write_stage_start_ns = time.perf_counter_ns()
         self.write_file(buffer, path)
+        self._record_put_stage(
+            "write_file_total",
+            time.perf_counter_ns() - write_stage_start_ns,
+        )
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -526,9 +555,14 @@ class LocalDiskBackend(StorageBackendInterface):
         cached_positions = memory_obj.metadata.cached_positions
         memory_obj.ref_count_down()
 
+        finalize_stage_start_ns = time.perf_counter_ns()
         self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
 
         self.disk_worker.remove_put_task(key)
+        self._record_put_stage(
+            "post_write_finalize",
+            time.perf_counter_ns() - finalize_stage_start_ns,
+        )
 
         # Call the completion callback if provided
         if on_complete_callback is not None:
@@ -653,3 +687,9 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+
+    def _record_put_stage(self, stage: str, latency_ns: int) -> None:
+        if self.put_stage_latency_callback is not None:
+            self.put_stage_latency_callback(
+                "write", stage, latency_ns, threading.get_native_id()
+            )
