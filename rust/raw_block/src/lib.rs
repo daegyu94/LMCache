@@ -18,6 +18,7 @@ use pyo3::types::PyAny;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::slice;
+use std::time::Instant;
 
 // Linux ioctl for block device size in bytes.
 // Defined in <linux/fs.h>: BLKGETSIZE64 _IOR(0x12,114,size_t)
@@ -58,6 +59,18 @@ fn errno() -> i32 {
 // Convert errno to a Python OSError with a message.
 fn os_err(msg: &str) -> PyErr {
     PyOSError::new_err((errno(), msg.to_string()))
+}
+
+fn native_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as u64
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        unsafe { libc::pthread_self() as usize as u64 }
+    }
 }
 
 // Low-level write loop that retries until all bytes are written.
@@ -280,6 +293,20 @@ impl RawBlockDevice {
         payload_len: Option<usize>,
         total_len: Option<usize>,
     ) -> PyResult<()> {
+        self.pwrite_from_buffer_timed(py, offset, data, payload_len, total_len)
+            .map(|_| ())
+    }
+
+    /// Same as `pwrite_from_buffer`, but returns `(latency_ns, native_thread_id)`.
+    #[pyo3(signature=(offset, data, payload_len=None, total_len=None))]
+    fn pwrite_from_buffer_timed(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+        data: &Bound<'_, PyAny>,
+        payload_len: Option<usize>,
+        total_len: Option<usize>,
+    ) -> PyResult<(u64, u64)> {
         if self.closed {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
@@ -326,17 +353,20 @@ impl RawBlockDevice {
         // We still keep `view` alive until I/O finishes, then release it below.
         let ptr_usize = ptr as usize;
         let res = py.allow_threads(move || {
+            let start = Instant::now();
             let src = ptr_usize as *const u8;
             let src_aligned = (src as usize).is_multiple_of(align);
             if total_len == payload_len && !self.use_odirect {
                 // direct write without padding
-                return pwrite_from_ptr(fd, offset, src, payload_len);
+                pwrite_from_ptr(fd, offset, src, payload_len)?;
+                return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
             }
 
             if self.use_odirect && src_aligned {
                 if total_len == payload_len {
                     // Fully aligned fast path: no copies.
-                    return pwrite_from_ptr(fd, offset, src, total_len);
+                    pwrite_from_ptr(fd, offset, src, total_len)?;
+                    return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
                 }
 
                 // Hybrid path for O_DIRECT with padding:
@@ -375,7 +405,7 @@ impl RawBlockDevice {
                     }
                     pwrite_from_ptr(fd, tail_offset, bounce.as_ptr(), tail_total)?;
                 }
-                return Ok(());
+                return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
             }
 
             // Full bounce path:
@@ -396,13 +426,13 @@ impl RawBlockDevice {
                     );
                 }
             }
-            pwrite_from_ptr(fd, offset, bounce.as_ptr(), total_len)
+            pwrite_from_ptr(fd, offset, bounce.as_ptr(), total_len)?;
+            Ok((start.elapsed().as_nanos() as u64, native_thread_id()))
         });
         // Always release the CPython buffer view once the blocking I/O closure
         // completes. This decrements exporter-side view count correctly.
         release_pybuffer(view);
-        res?;
-        Ok(())
+        res
     }
 
     /// Read exactly `payload_len` bytes into a writable Python buffer.
@@ -417,6 +447,20 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
+        self.pread_into_timed(py, offset, out, payload_len, total_len)
+            .map(|_| ())
+    }
+
+    /// Same as `pread_into`, but returns `(latency_ns, native_thread_id)`.
+    #[pyo3(signature=(offset, out, payload_len, total_len=None))]
+    fn pread_into_timed(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+        out: &Bound<'_, PyAny>,
+        payload_len: usize,
+        total_len: Option<usize>,
+    ) -> PyResult<(u64, u64)> {
         if self.closed {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
@@ -466,16 +510,19 @@ impl RawBlockDevice {
         // while retaining `view` lifetime until closure completion.
         let dst_usize = ptr as usize;
         let res = py.allow_threads(move || {
+            let start = Instant::now();
             let dst = dst_usize as *mut u8;
             let dst_aligned = (dst as usize).is_multiple_of(align);
             if total_len == payload_len && !self.use_odirect {
-                return pread_into(fd, offset, dst, payload_len);
+                pread_into(fd, offset, dst, payload_len)?;
+                return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
             }
 
             if self.use_odirect && dst_aligned {
                 if cap >= total_len {
                     // Fully aligned fast path: no copies.
-                    return pread_into(fd, offset, dst, total_len);
+                    pread_into(fd, offset, dst, total_len)?;
+                    return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
                 }
 
                 // Hybrid path for O_DIRECT with smaller destination capacity:
@@ -507,7 +554,7 @@ impl RawBlockDevice {
                         }
                     }
                 }
-                return Ok(());
+                return Ok((start.elapsed().as_nanos() as u64, native_thread_id()));
             }
 
             // Full bounce read path:
@@ -522,11 +569,10 @@ impl RawBlockDevice {
                     payload_len,
                 );
             }
-            Ok(())
+            Ok((start.elapsed().as_nanos() as u64, native_thread_id()))
         });
         release_pybuffer(view);
-        res?;
-        Ok(())
+        res
     }
 
     // Explicit close from Python. Drop also closes if needed.

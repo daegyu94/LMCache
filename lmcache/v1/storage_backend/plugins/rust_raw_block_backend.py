@@ -12,7 +12,6 @@ import ctypes
 import json
 import os
 import threading
-import time
 
 # Third Party
 import torch
@@ -517,22 +516,34 @@ class RustRawBlockBackend(StoragePluginInterface):
             def _do_write():
                 try:
                     raw_dev = self._rawdev()
-                    io_start_ns = time.perf_counter_ns()
                     # Write header
                     hdr_total = (
                         _round_up(len(header), self.block_align)
                         if self.use_odirect
                         else len(header)
                     )
-                    raw_dev.pwrite_from_buffer(offset, header, len(header), hdr_total)
-                    # Write payload
-                    raw_dev.pwrite_from_buffer(
-                        offset + self.header_bytes, buf, payload_len, total_len
+                    header_latency_ns, header_thread_id = (
+                        raw_dev.pwrite_from_buffer_timed(
+                            offset, header, len(header), hdr_total
+                        )
                     )
-                    io_elapsed_ns = time.perf_counter_ns() - io_start_ns
+                    # Write payload
+                    payload_latency_ns, payload_thread_id = (
+                        raw_dev.pwrite_from_buffer_timed(
+                            offset + self.header_bytes, buf, payload_len, total_len
+                        )
+                    )
                     if self.io_latency_callback is not None:
+                        io_elapsed_ns = header_latency_ns + payload_latency_ns
+                        thread_id = payload_thread_id
+                        if header_thread_id != payload_thread_id:
+                            logger.debug(
+                                "Rust raw write timing thread changed: header=%s payload=%s",
+                                header_thread_id,
+                                payload_thread_id,
+                            )
                         self.io_latency_callback(
-                            "write", io_elapsed_ns, threading.get_native_id()
+                            "write", io_elapsed_ns, thread_id
                         )
                 except Exception as e:
                     logger.error(
@@ -622,7 +633,6 @@ class RustRawBlockBackend(StoragePluginInterface):
             pass
 
         try:
-            io_start_ns = time.perf_counter_ns()
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,
@@ -634,21 +644,15 @@ class RustRawBlockBackend(StoragePluginInterface):
                 read_payload_len = (
                     total_len if len(direct_view) >= total_len else payload_len
                 )
-                self._rawdev().pread_into(
-                    entry.offset + self.header_bytes,
-                    direct_view,
-                    read_payload_len,
-                    total_len,
+                io_elapsed_ns, thread_id = self._rawdev().pread_into_timed(
+                    entry.offset + self.header_bytes, direct_view, read_payload_len, total_len
                 )
             else:
-                self._rawdev().pread_into(
+                io_elapsed_ns, thread_id = self._rawdev().pread_into_timed(
                     entry.offset + self.header_bytes, buf, payload_len, total_len
                 )
-            io_elapsed_ns = time.perf_counter_ns() - io_start_ns
             if self.io_latency_callback is not None:
-                self.io_latency_callback(
-                    "read", io_elapsed_ns, threading.get_native_id()
-                )
+                self.io_latency_callback("read", io_elapsed_ns, thread_id)
         except Exception as e:
             logger.error(f"Read failed for key {self._dbg_key_short(key)}: {e}")
             raise

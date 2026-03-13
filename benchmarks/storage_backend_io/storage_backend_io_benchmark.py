@@ -800,18 +800,6 @@ def main() -> None:
                 f"(samples_e2e={op_stats['samples_e2e']}, "
                 f"samples_io={op_stats['samples_io_syscall']})"
             )
-            io_by_thread = op_stats.get("io_syscall_by_thread", {})
-            e2e_by_thread = op_stats.get("e2e_by_thread", {})
-            if e2e_by_thread:
-                print(
-                    f"{result['backend']} [{op}-e2e-thread-breakdown]: "
-                    f"{json.dumps(e2e_by_thread, sort_keys=True)}"
-                )
-            if io_by_thread:
-                print(
-                    f"{result['backend']} [{op}-io-thread-breakdown]: "
-                    f"{json.dumps(io_by_thread, sort_keys=True)}"
-                )
 
     if args.output_json:
         output_path = args.output_json
