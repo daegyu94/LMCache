@@ -188,6 +188,19 @@ def _stop_loop(loop: asyncio.AbstractEventLoop, t: threading.Thread) -> None:
     loop.close()
 
 
+def _start_loops(
+    num_loops: int,
+) -> list[tuple[asyncio.AbstractEventLoop, threading.Thread]]:
+    return [_start_loop() for _ in range(max(1, num_loops))]
+
+
+def _stop_loops(
+    loops: list[tuple[asyncio.AbstractEventLoop, threading.Thread]],
+) -> None:
+    for loop, t in loops:
+        _stop_loop(loop, t)
+
+
 def _build_metadata() -> LMCacheMetadata:
     return LMCacheMetadata(
         model_name="benchmark_model",
@@ -220,6 +233,10 @@ def _resolve_payload_shape(payload_size_kb: float) -> torch.Size:
             "(for bfloat16 with layout [2,16,8,X])"
         )
     return torch.Size([2, 16, 8, numel // base])
+
+
+def _payload_mb_per_op(payload_size_kb: float) -> float:
+    return payload_size_kb / 1024.0
 
 
 def _make_memory_objs(
@@ -473,10 +490,20 @@ def _bench_local_disk(
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
         result["put_ops_per_sec"] = num_ops / put_elapsed if put_elapsed > 0 else 0.0
+        result["put_mb_per_sec"] = (
+            num_ops * _payload_mb_per_op(payload_size_kb) / put_elapsed
+            if put_elapsed > 0
+            else 0.0
+        )
     if get_phase_elapsed is not None:
         result["get_elapsed_sec"] = get_phase_elapsed
         result["get_ops_per_sec"] = (
             num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
+        )
+        result["get_mb_per_sec"] = (
+            num_ops * _payload_mb_per_op(payload_size_kb) / get_phase_elapsed
+            if get_phase_elapsed > 0
+            else 0.0
         )
         result["get_buffered_io_fallback"] = get_with_buffered_io
     if latency is not None:
@@ -501,11 +528,15 @@ def _bench_rust_raw_block(
     submit_mode: str,
     raw_submit_mode: str,
     raw_submit_workers: int,
+    raw_submit_loops: int,
 ) -> dict:
+    loop_pairs: list[tuple[asyncio.AbstractEventLoop, threading.Thread]] = []
     loop: Optional[asyncio.AbstractEventLoop] = None
-    t: Optional[threading.Thread] = None
+    submit_loops: Optional[list[asyncio.AbstractEventLoop]] = None
     if raw_submit_mode == "async_loop":
-        loop, t = _start_loop()
+        loop_pairs = _start_loops(raw_submit_loops)
+        submit_loops = [lp[0] for lp in loop_pairs]
+        loop = submit_loops[0]
     metadata = _build_metadata()
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=256,
@@ -559,6 +590,7 @@ def _bench_rust_raw_block(
         metadata=metadata,
         local_cpu_backend=local_cpu,
         loop=loop,
+        submit_loops=submit_loops,
         dst_device="cpu",
     )
     latency = _LatencyBreakdownCollector() if measure_latency_breakdown else None
@@ -685,8 +717,8 @@ def _bench_rust_raw_block(
         get_phase_elapsed = _bench_get_phase(backend, keys, concurrency, latency)
 
     backend.close()
-    if loop is not None and t is not None:
-        _stop_loop(loop, t)
+    if loop_pairs:
+        _stop_loops(loop_pairs)
 
     # Best-effort cleanup for temp file or requested cleanup.
     if cleanup_raw_device or temp_dir:
@@ -716,14 +748,25 @@ def _bench_rust_raw_block(
         "submit_mode": submit_mode,
         "raw_submit_mode": raw_submit_mode,
         "raw_submit_workers": raw_submit_workers,
+        "raw_submit_loops": raw_submit_loops,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
         result["put_ops_per_sec"] = num_ops / put_elapsed if put_elapsed > 0 else 0.0
+        result["put_mb_per_sec"] = (
+            num_ops * _payload_mb_per_op(payload_size_kb) / put_elapsed
+            if put_elapsed > 0
+            else 0.0
+        )
     if get_phase_elapsed is not None:
         result["get_elapsed_sec"] = get_phase_elapsed
         result["get_ops_per_sec"] = (
             num_ops / get_phase_elapsed if get_phase_elapsed > 0 else 0.0
+        )
+        result["get_mb_per_sec"] = (
+            num_ops * _payload_mb_per_op(payload_size_kb) / get_phase_elapsed
+            if get_phase_elapsed > 0
+            else 0.0
         )
     if latency is not None:
         result["latency_breakdown"] = latency.to_result_dict()
@@ -801,7 +844,8 @@ def main() -> None:
         default="async_loop",
         help=(
             "Rust raw-block submit path: "
-            "'async_loop' uses run_coroutine_threadsafe()+asyncio.to_thread, "
+            "'async_loop' uses run_coroutine_threadsafe()+asyncio.to_thread "
+            "and shards keys across --raw-submit-loops by chunk_hash %% num_loops, "
             "'threadpool' submits directly to a backend ThreadPoolExecutor, "
             "'sync' executes writes on the caller thread."
         ),
@@ -813,6 +857,15 @@ def main() -> None:
         help=(
             "Worker count for rust raw-block 'threadpool' submit mode. "
             "Ignored by other modes."
+        ),
+    )
+    parser.add_argument(
+        "--raw-submit-loops",
+        type=int,
+        default=1,
+        help=(
+            "Number of asyncio loops for rust raw-block 'async_loop' submit mode. "
+            "Keys are assigned by chunk_hash %% num_loops. Ignored by other modes."
         ),
     )
     parser.add_argument(
@@ -890,6 +943,7 @@ def main() -> None:
                 submit_mode=args.submit_mode,
                 raw_submit_mode=args.raw_submit_mode,
                 raw_submit_workers=args.raw_submit_workers,
+                raw_submit_loops=args.raw_submit_loops,
             )
         )
 
@@ -900,7 +954,8 @@ def main() -> None:
                 f"concurrency={result['concurrency']} "
                 f"payload={result['payload_size_kb']}KB "
                 f"elapsed={result['put_elapsed_sec']:.3f}s "
-                f"ops/sec={result['put_ops_per_sec']:.2f}"
+                f"ops/sec={result['put_ops_per_sec']:.2f} "
+                f"MB/s={result['put_mb_per_sec']:.2f}"
             )
         if "get_elapsed_sec" in result:
             print(
@@ -908,7 +963,8 @@ def main() -> None:
                 f"concurrency={result['concurrency']} "
                 f"payload={result['payload_size_kb']}KB "
                 f"elapsed={result['get_elapsed_sec']:.3f}s "
-                f"ops/sec={result['get_ops_per_sec']:.2f}"
+                f"ops/sec={result['get_ops_per_sec']:.2f} "
+                f"MB/s={result['get_mb_per_sec']:.2f}"
             )
         latency_breakdown = result.get("latency_breakdown", {})
         for op in ("write", "read"):

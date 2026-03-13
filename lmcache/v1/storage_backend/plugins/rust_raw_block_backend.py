@@ -83,6 +83,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         metadata=None,
         local_cpu_backend=None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        submit_loops: Optional[Sequence[asyncio.AbstractEventLoop]] = None,
         dst_device: str = "cpu",
     ):
         super().__init__(
@@ -103,7 +104,10 @@ class RustRawBlockBackend(StoragePluginInterface):
                 "rust_raw_block.submit_mode must be one of "
                 "'async_loop', 'sync', 'threadpool'"
             )
-        if self.loop is None and self.submit_mode == "async_loop":
+        self._submit_loops: list[asyncio.AbstractEventLoop] = list(submit_loops or [])
+        if loop is not None and not self._submit_loops:
+            self._submit_loops = [loop]
+        if not self._submit_loops and self.submit_mode == "async_loop":
             raise ValueError(
                 "RustRawBlockBackend requires an asyncio event loop "
                 "when rust_raw_block.submit_mode='async_loop'"
@@ -524,7 +528,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                     on_complete_callback,
                 )
             else:
-                assert self.loop is not None
+                submit_loop = self._select_submit_loop(key)
                 fut = asyncio.run_coroutine_threadsafe(
                     self._submit_write(
                         key=key,
@@ -534,7 +538,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                         enqueued_ns=time.perf_counter_ns(),
                         on_complete_callback=on_complete_callback,
                     ),
-                    self.loop,
+                    submit_loop,
                 )
             futures.append(fut)
             self._record_put_stage(
@@ -841,6 +845,15 @@ class RustRawBlockBackend(StoragePluginInterface):
             self.put_stage_latency_callback(
                 "write", stage, latency_ns, threading.get_native_id()
             )
+
+    def _select_submit_loop(self, key: CacheEngineKey) -> asyncio.AbstractEventLoop:
+        if not self._submit_loops:
+            raise RuntimeError("No submit loops configured for async_loop mode")
+        try:
+            loop_idx = int(key.chunk_hash) % len(self._submit_loops)
+        except Exception:
+            loop_idx = 0
+        return self._submit_loops[loop_idx]
 
     def _maybe_save_manifest(self) -> None:
         """Save manifest periodically (every N writes) for crash recovery."""
