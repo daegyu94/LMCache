@@ -174,7 +174,6 @@ class _LatencyBreakdownCollector:
             }
         return serialized
 
-
 def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
     loop = asyncio.new_event_loop()
     t = threading.Thread(target=loop.run_forever, name="bench-loop", daemon=True)
@@ -349,6 +348,7 @@ def _bench_local_disk(
     payload_size_kb: float,
     measure_latency_breakdown: bool,
     submit_mode: str,
+    put_completion_check_interval: int,
 ) -> dict:
     loop, t = _start_loop()
     metadata = _build_metadata()
@@ -387,6 +387,7 @@ def _bench_local_disk(
     )
 
     completed = 0
+    submitted = 0
     lock = threading.Lock()
     done = threading.Event()
     submit_start_ns: dict[CacheEngineKey, int] = {}
@@ -404,7 +405,22 @@ def _bench_local_disk(
             if completed >= num_ops:
                 done.set()
 
-    def submit_slice(start: int, end: int) -> None:
+    def wait_for_callback_target(target_completed: int, start: float) -> None:
+        timeout_sec = max(300.0, float(num_ops) / 100.0)
+        while True:
+            with lock:
+                if completed >= target_completed:
+                    return
+            if (time.perf_counter() - start) >= timeout_sec:
+                raise TimeoutError(
+                    "LocalDisk benchmark timed out: "
+                    f"completed={completed}, expected_at_least={target_completed}"
+                )
+            done.wait(timeout=0.01)
+
+    def submit_slice(start: int, end: int, phase_start: float) -> None:
+        nonlocal submitted
+        since_last_check = 0
         if submit_mode == "single_key":
             for key, obj in zip(keys[start:end], objs[start:end], strict=False):
                 if latency is not None:
@@ -415,6 +431,15 @@ def _bench_local_disk(
                     [obj],
                     on_complete_callback=on_complete,
                 )
+                with lock:
+                    submitted += 1
+                    target_completed = submitted
+                since_last_check += 1
+                if since_last_check >= put_completion_check_interval:
+                    wait_for_callback_target(target_completed, phase_start)
+                    since_last_check = 0
+            if since_last_check > 0:
+                wait_for_callback_target(target_completed, phase_start)
             return
 
         if latency is not None:
@@ -427,6 +452,16 @@ def _bench_local_disk(
             objs[start:end],
             on_complete_callback=on_complete,
         )
+        with lock:
+            submitted += end - start
+            target_completed = submitted
+        since_last_check += end - start
+        if since_last_check > 0:
+            while since_last_check >= put_completion_check_interval:
+                wait_for_callback_target(target_completed, phase_start)
+                since_last_check -= put_completion_check_interval
+            if since_last_check > 0:
+                wait_for_callback_target(target_completed, phase_start)
 
     slice_size = max(1, num_ops // concurrency)
     slices = []
@@ -435,13 +470,15 @@ def _bench_local_disk(
 
     def run_put_phase(measure: bool) -> float:
         nonlocal completed
+        nonlocal submitted
         completed = 0
+        submitted = 0
         done.clear()
 
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
             for s in slices:
-                ex.submit(submit_slice, s[0], s[1])
+                ex.submit(submit_slice, s[0], s[1], start)
 
         # Keep a floor for normal runs but scale for large-op runs.
         # This avoids premature timeout for long single-shot benchmarks.
@@ -486,6 +523,7 @@ def _bench_local_disk(
         "operation": operation,
         "payload_size_kb": payload_size_kb,
         "submit_mode": submit_mode,
+        "put_completion_check_interval": put_completion_check_interval,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -530,6 +568,7 @@ def _bench_rust_raw_block(
     raw_submit_workers: int,
     raw_submit_loops: int,
     raw_submit_pools: int,
+    put_completion_check_interval: int,
 ) -> dict:
     loop_pairs: list[tuple[asyncio.AbstractEventLoop, threading.Thread]] = []
     loop: Optional[asyncio.AbstractEventLoop] = None
@@ -607,12 +646,10 @@ def _bench_rust_raw_block(
     )
 
     completed = 0
+    submitted = 0
     lock = threading.Lock()
     done = threading.Event()
     submit_start_ns: dict[CacheEngineKey, int] = {}
-
-    futures: list[tuple[Future, CacheEngineKey]] = []
-    fut_lock = threading.Lock()
 
     def on_complete(_key: CacheEngineKey) -> None:
         nonlocal completed
@@ -627,7 +664,49 @@ def _bench_rust_raw_block(
             if completed >= num_ops:
                 done.set()
 
-    def submit_slice(start: int, end: int) -> None:
+    def wait_for_callback_target(target_completed: int, start: float) -> None:
+        timeout_sec = max(300.0, float(num_ops) / 100.0)
+        while True:
+            with lock:
+                if completed >= target_completed:
+                    return
+            if (time.perf_counter() - start) >= timeout_sec:
+                raise TimeoutError(
+                    "RustRaw benchmark timed out: "
+                    f"completed={completed}, expected_at_least={target_completed}"
+                )
+            done.wait(timeout=0.01)
+
+    def complete_future(
+        future_entry: tuple[Future, CacheEngineKey],
+    ) -> None:
+        nonlocal completed
+        fut, key = future_entry
+        fut.result(timeout=120)
+        end_ns = time.perf_counter_ns() if latency is not None else 0
+        with lock:
+            started = submit_start_ns.pop(key, None) if latency is not None else None
+            completed += 1
+            if completed >= num_ops:
+                done.set()
+        if started is not None and latency is not None:
+            latency.record_e2e("write", end_ns - started, threading.get_native_id())
+
+    def wait_for_futures(
+        pending_futures: collections.deque[tuple[Future, CacheEngineKey]],
+        min_count: int,
+    ) -> None:
+        checked = 0
+        while pending_futures and checked < min_count:
+            complete_future(pending_futures.popleft())
+            checked += 1
+
+    def submit_slice(start: int, end: int, phase_start: float) -> None:
+        nonlocal submitted
+        since_last_check = 0
+        pending_futures: collections.deque[tuple[Future, CacheEngineKey]] = (
+            collections.deque()
+        )
         if submit_mode == "single_key":
             for key, obj in zip(keys[start:end], objs[start:end], strict=False):
                 if latency is not None:
@@ -642,9 +721,21 @@ def _bench_rust_raw_block(
                 else:
                     futs = backend.batched_submit_put_task([key], [obj])
                     if futs:
-                        with fut_lock:
-                            for fut in futs:
-                                futures.append((fut, key))
+                        pending_futures.extend((fut, key) for fut in futs)
+                with lock:
+                    submitted += 1
+                    target_completed = submitted
+                since_last_check += 1
+                if since_last_check >= put_completion_check_interval:
+                    if use_callback:
+                        wait_for_callback_target(target_completed, phase_start)
+                    else:
+                        wait_for_futures(pending_futures, since_last_check)
+                    since_last_check = 0
+            if since_last_check > 0 and not use_callback:
+                wait_for_futures(pending_futures, since_last_check)
+            if since_last_check > 0 and use_callback:
+                wait_for_callback_target(target_completed, phase_start)
             return
 
         if latency is not None:
@@ -661,9 +752,25 @@ def _bench_rust_raw_block(
         else:
             futs = backend.batched_submit_put_task(keys[start:end], objs[start:end])
             if futs:
-                with fut_lock:
-                    for key, fut in zip(keys[start:end], futs, strict=False):
-                        futures.append((fut, key))
+                pending_futures.extend(
+                    (fut, key) for key, fut in zip(keys[start:end], futs, strict=False)
+                )
+        with lock:
+            submitted += end - start
+            target_completed = submitted
+        since_last_check += end - start
+        if use_callback and since_last_check > 0:
+            while since_last_check >= put_completion_check_interval:
+                wait_for_callback_target(target_completed, phase_start)
+                since_last_check -= put_completion_check_interval
+            if since_last_check > 0:
+                wait_for_callback_target(target_completed, phase_start)
+        if not use_callback and since_last_check > 0:
+            while since_last_check >= put_completion_check_interval:
+                wait_for_futures(pending_futures, put_completion_check_interval)
+                since_last_check -= put_completion_check_interval
+            if since_last_check > 0:
+                wait_for_futures(pending_futures, since_last_check)
 
     slice_size = max(1, num_ops // concurrency)
     slices = []
@@ -672,15 +779,15 @@ def _bench_rust_raw_block(
 
     def run_put_phase(measure: bool) -> float:
         nonlocal completed
+        nonlocal submitted
         completed = 0
         done.clear()
-        with fut_lock:
-            futures.clear()
+        submitted = 0
 
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
             for s in slices:
-                ex.submit(submit_slice, s[0], s[1])
+                ex.submit(submit_slice, s[0], s[1], start)
 
         if use_callback:
             timeout_sec = max(300.0, float(num_ops) / 100.0)
@@ -691,18 +798,6 @@ def _bench_rust_raw_block(
                     raise TimeoutError(
                         "RustRaw benchmark timed out: "
                         f"completed={completed}, expected={num_ops}"
-                    )
-        else:
-            for fut, key in futures:
-                fut.result(timeout=120)
-                end_ns = time.perf_counter_ns() if latency is not None else 0
-                with lock:
-                    started = (
-                        submit_start_ns.pop(key, None) if latency is not None else None
-                    )
-                if started is not None and latency is not None:
-                    latency.record_e2e(
-                        "write", end_ns - started, threading.get_native_id()
                     )
         elapsed = time.perf_counter() - start
         return elapsed if measure else 0.0
@@ -752,6 +847,7 @@ def _bench_rust_raw_block(
         "raw_submit_workers": raw_submit_workers,
         "raw_submit_loops": raw_submit_loops,
         "raw_submit_pools": raw_submit_pools,
+        "put_completion_check_interval": put_completion_check_interval,
     }
     if put_elapsed is not None:
         result["put_elapsed_sec"] = put_elapsed
@@ -910,8 +1006,19 @@ def main() -> None:
             "'batch_slice' submits one slice per worker thread."
         ),
     )
+    parser.add_argument(
+        "--put-completion-check-interval",
+        type=int,
+        default=1,
+        help=(
+            "Check put callback/future completion every N submitted objects. "
+            "Default: 1."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.put_completion_check_interval <= 0:
+        raise ValueError("--put-completion-check-interval must be > 0")
     payload_shape = _resolve_payload_shape(args.payload_size_kb)
 
     results = []
@@ -929,6 +1036,7 @@ def main() -> None:
                 payload_size_kb=args.payload_size_kb,
                 measure_latency_breakdown=args.latency_breakdown,
                 submit_mode=args.submit_mode,
+                put_completion_check_interval=args.put_completion_check_interval,
             )
         )
 
@@ -959,6 +1067,7 @@ def main() -> None:
                 raw_submit_workers=args.raw_submit_workers,
                 raw_submit_loops=args.raw_submit_loops,
                 raw_submit_pools=args.raw_submit_pools,
+                put_completion_check_interval=args.put_completion_check_interval,
             )
         )
 
