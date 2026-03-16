@@ -5,6 +5,9 @@ import importlib.util
 from pathlib import Path
 import sys
 
+# First Party
+from lmcache.utils import CacheEngineKey
+
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -67,3 +70,66 @@ def test_is_device_mounted_ignores_non_device_sources(tmp_path) -> None:
         )
         is False
     )
+
+
+def test_latency_breakdown_collector_summarizes_per_key_samples() -> None:
+    """Latency breakdown collector should summarize per-key put/get samples."""
+    collector = storage_backend_io_benchmark._LatencyBreakdownCollector()
+    put_key0 = CacheEngineKey(
+        "benchmark_model",
+        1,
+        0,
+        0,
+        storage_backend_io_benchmark.DEFAULT_DTYPE,
+    )
+    put_key1 = CacheEngineKey(
+        "benchmark_model",
+        1,
+        0,
+        1,
+        storage_backend_io_benchmark.DEFAULT_DTYPE,
+    )
+    get_key0 = CacheEngineKey(
+        "benchmark_model",
+        1,
+        0,
+        2,
+        storage_backend_io_benchmark.DEFAULT_DTYPE,
+    )
+    get_key1 = CacheEngineKey(
+        "benchmark_model",
+        1,
+        0,
+        3,
+        storage_backend_io_benchmark.DEFAULT_DTYPE,
+    )
+
+    collector.record_stage("put", put_key0, "queue_wait", 10_000, 1)
+    collector.record_io("put", put_key0, 30_000, 1)
+    collector.record_e2e("put", put_key0, 100_000, 1)
+    collector.record_stage("put", put_key1, "queue_wait", 20_000, 1)
+    collector.record_io("put", put_key1, 40_000, 1)
+    collector.record_e2e("put", put_key1, 110_000, 1)
+
+    collector.record_io("get", get_key0, 50_000, 1)
+    collector.record_e2e("get", get_key0, 150_000, 1)
+    collector.record_io("get", get_key1, 60_000, 1)
+    collector.record_e2e("get", get_key1, 170_000, 1)
+
+    result = collector.to_result_dict()
+
+    assert result["put"]["samples"] == 2
+    assert result["put"]["e2e_us"]["avg"] == 105.0
+    assert result["put"]["queue_wait_us"]["avg"] == 15.0
+    assert result["put"]["io_us"]["avg"] == 35.0
+    assert result["put"]["other_us"]["avg"] == 55.0
+
+    assert result["get"]["samples"] == 2
+    assert result["get"]["queue_wait_us"]["samples"] == 0
+    assert result["get"]["io_us"]["avg"] == 55.0
+    assert result["get"]["other_us"]["avg"] == 105.0
+
+    put_key0_stats = result["put"]["per_key"][put_key0.to_string()]
+    assert put_key0_stats["queue_wait_us"] == 10.0
+    assert put_key0_stats["io_us"] == 30.0
+    assert put_key0_stats["other_us"] == 60.0

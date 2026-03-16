@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import collections
 import json
+import math
 import os
 import stat
 import tempfile
@@ -42,137 +43,146 @@ DEFAULT_DTYPE = torch.bfloat16
 
 
 @dataclass
-class _ThreadLatencyStats:
-    ops: int = 0
-    total_ns: int = 0
+class _PerKeyLatencyBreakdown:
+    e2e_ns: Optional[int] = None
+    queue_wait_ns: Optional[int] = None
+    io_ns: Optional[int] = None
 
 
 @dataclass
 class _LatencyBreakdownCollector:
-    e2e_total_ns: dict[str, int] = field(
-        default_factory=lambda: collections.defaultdict(int)
-    )
-    e2e_ops: dict[str, int] = field(
-        default_factory=lambda: collections.defaultdict(int)
-    )
-    e2e_by_thread: dict[str, dict[int, _ThreadLatencyStats]] = field(
-        default_factory=lambda: collections.defaultdict(
-            lambda: collections.defaultdict(_ThreadLatencyStats)
-        )
-    )
-    io_total_ns: dict[str, int] = field(
-        default_factory=lambda: collections.defaultdict(int)
-    )
-    io_ops: dict[str, int] = field(default_factory=lambda: collections.defaultdict(int))
-    io_by_thread: dict[str, dict[int, _ThreadLatencyStats]] = field(
-        default_factory=lambda: collections.defaultdict(
-            lambda: collections.defaultdict(_ThreadLatencyStats)
-        )
-    )
-    stage_total_ns: dict[str, dict[str, int]] = field(
-        default_factory=lambda: collections.defaultdict(
-            lambda: collections.defaultdict(int)
-        )
-    )
-    stage_ops: dict[str, dict[str, int]] = field(
-        default_factory=lambda: collections.defaultdict(
-            lambda: collections.defaultdict(int)
-        )
-    )
-    stage_by_thread: dict[str, dict[str, dict[int, _ThreadLatencyStats]]] = field(
-        default_factory=lambda: collections.defaultdict(
-            lambda: collections.defaultdict(
-                lambda: collections.defaultdict(_ThreadLatencyStats)
-            )
-        )
+    per_key: dict[str, dict[str, _PerKeyLatencyBreakdown]] = field(
+        default_factory=lambda: collections.defaultdict(dict)
     )
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def record_e2e(self, op: str, latency_ns: int, thread_id: int) -> None:
-        with self._lock:
-            self.e2e_total_ns[op] += latency_ns
-            self.e2e_ops[op] += 1
-            thread_stats = self.e2e_by_thread[op][thread_id]
-            thread_stats.ops += 1
-            thread_stats.total_ns += latency_ns
-
-    def record_io(self, op: str, latency_ns: int, thread_id: int) -> None:
-        with self._lock:
-            self.io_total_ns[op] += latency_ns
-            self.io_ops[op] += 1
-            thread_stats = self.io_by_thread[op][thread_id]
-            thread_stats.ops += 1
-            thread_stats.total_ns += latency_ns
-
-    def record_stage(
-        self, op: str, stage: str, latency_ns: int, thread_id: int
+    def record_e2e(
+        self,
+        op: str,
+        key: CacheEngineKey,
+        latency_ns: int,
+        thread_id: int,  # noqa: ARG002
     ) -> None:
         with self._lock:
-            self.stage_total_ns[op][stage] += latency_ns
-            self.stage_ops[op][stage] += 1
-            thread_stats = self.stage_by_thread[op][stage][thread_id]
-            thread_stats.ops += 1
-            thread_stats.total_ns += latency_ns
+            self._entry(op, key).e2e_ns = latency_ns
+
+    def record_io(
+        self,
+        op: str,
+        key: CacheEngineKey,
+        latency_ns: int,
+        thread_id: int,  # noqa: ARG002
+    ) -> None:
+        with self._lock:
+            self._entry(op, key).io_ns = latency_ns
+
+    def record_stage(
+        self,
+        op: str,
+        key: CacheEngineKey,
+        stage: str,
+        latency_ns: int,
+        thread_id: int,  # noqa: ARG002
+    ) -> None:
+        if stage != "queue_wait":
+            return
+        with self._lock:
+            self._entry(op, key).queue_wait_ns = latency_ns
 
     def to_result_dict(self) -> dict[str, dict]:
         result: dict[str, dict] = {}
-        for op in sorted(set(self.e2e_ops.keys()) | set(self.io_ops.keys())):
-            e2e_ops = int(self.e2e_ops.get(op, 0))
-            io_ops = int(self.io_ops.get(op, 0))
-            e2e_total_ns = int(self.e2e_total_ns.get(op, 0))
-            io_total_ns = int(self.io_total_ns.get(op, 0))
-            lmcache_total_ns = max(0, e2e_total_ns - io_total_ns)
-            ref_ops = e2e_ops if e2e_ops > 0 else io_ops
-
+        for op, samples_by_key in sorted(self.per_key.items()):
+            per_key_result: dict[str, dict[str, float | None]] = {}
+            e2e_samples_ns: list[int] = []
+            queue_wait_samples_ns: list[int] = []
+            io_samples_ns: list[int] = []
+            other_samples_ns: list[int] = []
+            for key_str, sample in sorted(samples_by_key.items()):
+                queue_wait_ns = sample.queue_wait_ns if op == "put" else None
+                other_ns = self._compute_other_ns(
+                    e2e_ns=sample.e2e_ns,
+                    queue_wait_ns=queue_wait_ns,
+                    io_ns=sample.io_ns,
+                )
+                per_key_result[key_str] = {
+                    "e2e_us": self._ns_to_us(sample.e2e_ns),
+                    "queue_wait_us": self._ns_to_us(queue_wait_ns),
+                    "io_us": self._ns_to_us(sample.io_ns),
+                    "other_us": self._ns_to_us(other_ns),
+                }
+                if sample.e2e_ns is not None:
+                    e2e_samples_ns.append(sample.e2e_ns)
+                if queue_wait_ns is not None:
+                    queue_wait_samples_ns.append(queue_wait_ns)
+                if sample.io_ns is not None:
+                    io_samples_ns.append(sample.io_ns)
+                if other_ns is not None:
+                    other_samples_ns.append(other_ns)
             result[op] = {
-                "samples_e2e": e2e_ops,
-                "samples_io_syscall": io_ops,
-                "e2e_total_us": e2e_total_ns / 1e3,
-                "e2e_avg_us": (e2e_total_ns / e2e_ops / 1e3) if e2e_ops > 0 else 0.0,
-                "io_syscall_total_us": io_total_ns / 1e3,
-                "io_syscall_avg_us": (io_total_ns / io_ops / 1e3)
-                if io_ops > 0
-                else 0.0,
-                "lmcache_total_us": lmcache_total_ns / 1e3,
-                "lmcache_avg_us": (lmcache_total_ns / ref_ops / 1e3)
-                if ref_ops > 0
-                else 0.0,
-                "e2e_by_thread": self._serialize_thread_stats(self.e2e_by_thread[op]),
-                "io_syscall_by_thread": self._serialize_thread_stats(
-                    self.io_by_thread[op]
-                ),
-                "stages": self._serialize_stage_stats(op),
+                "samples": len(per_key_result),
+                "per_key": per_key_result,
+                "e2e_us": self._summarize_ns_samples(e2e_samples_ns),
+                "queue_wait_us": self._summarize_ns_samples(queue_wait_samples_ns),
+                "io_us": self._summarize_ns_samples(io_samples_ns),
+                "other_us": self._summarize_ns_samples(other_samples_ns),
             }
         return result
 
-    def _serialize_stage_stats(self, op: str) -> dict[str, dict]:
-        serialized: dict[str, dict] = {}
-        for stage, total_ns in sorted(self.stage_total_ns[op].items()):
-            stage_ops = int(self.stage_ops[op][stage])
-            serialized[stage] = {
-                "samples": stage_ops,
-                "total_us": total_ns / 1e3,
-                "avg_us": (total_ns / stage_ops / 1e3) if stage_ops > 0 else 0.0,
-                "by_thread": self._serialize_thread_stats(
-                    self.stage_by_thread[op][stage]
-                ),
-            }
-        return serialized
+    @staticmethod
+    def _key_str(key: CacheEngineKey) -> str:
+        return key.to_string()
+
+    def _entry(self, op: str, key: CacheEngineKey) -> _PerKeyLatencyBreakdown:
+        key_str = self._key_str(key)
+        if key_str not in self.per_key[op]:
+            self.per_key[op][key_str] = _PerKeyLatencyBreakdown()
+        return self.per_key[op][key_str]
 
     @staticmethod
-    def _serialize_thread_stats(
-        thread_stats: dict[int, _ThreadLatencyStats],
-    ) -> dict[str, dict[str, float | int]]:
-        serialized: dict[str, dict[str, float | int]] = {}
-        for tid, stats in sorted(thread_stats.items()):
-            serialized[str(tid)] = {
-                "ops": int(stats.ops),
-                "total_us": stats.total_ns / 1e3,
-                "avg_us": (stats.total_ns / stats.ops / 1e3)
-                if stats.ops > 0
-                else 0.0,
-            }
-        return serialized
+    def _compute_other_ns(
+        e2e_ns: Optional[int],
+        queue_wait_ns: Optional[int],
+        io_ns: Optional[int],
+    ) -> Optional[int]:
+        if e2e_ns is None or io_ns is None:
+            return None
+        return max(0, e2e_ns - (queue_wait_ns or 0) - io_ns)
+
+    @staticmethod
+    def _ns_to_us(value_ns: Optional[int]) -> Optional[float]:
+        if value_ns is None:
+            return None
+        return value_ns / 1e3
+
+    def _summarize_ns_samples(self, values_ns: list[int]) -> dict[str, float | int]:
+        if not values_ns:
+            return {"samples": 0, "avg": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0}
+        values_us = [value / 1e3 for value in values_ns]
+        return {
+            "samples": len(values_us),
+            "avg": sum(values_us) / len(values_us),
+            "p90": self._percentile(values_us, 90),
+            "p95": self._percentile(values_us, 95),
+            "p99": self._percentile(values_us, 99),
+        }
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        sorted_values = sorted(values)
+        rank = (len(sorted_values) - 1) * (percentile / 100.0)
+        lower_idx = math.floor(rank)
+        upper_idx = math.ceil(rank)
+        lower = sorted_values[lower_idx]
+        upper = sorted_values[upper_idx]
+        if lower_idx == upper_idx:
+            return lower
+        weight = rank - lower_idx
+        return lower + (upper - lower) * weight
+
 
 def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
     loop = asyncio.new_event_loop()
@@ -236,6 +246,16 @@ def _resolve_payload_shape(payload_size_kb: float) -> torch.Size:
 
 def _payload_mb_per_op(payload_size_kb: float) -> float:
     return payload_size_kb / 1024.0
+
+
+def _format_latency_summary(label: str, stats: dict[str, float | int]) -> str:
+    return (
+        f"{label}: avg={stats['avg']:.3f}us "
+        f"p90={stats['p90']:.3f}us "
+        f"p95={stats['p95']:.3f}us "
+        f"p99={stats['p99']:.3f}us "
+        f"(samples={stats['samples']})"
+    )
 
 
 def _is_device_mounted(
@@ -338,7 +358,8 @@ def _bench_get_phase(
                 raise RuntimeError(f"get miss for key={key}")
             if latency is not None:
                 latency.record_e2e(
-                    "read",
+                    "get",
+                    key,
                     time.perf_counter_ns() - e2e_start_ns,
                     threading.get_native_id(),
                 )
@@ -421,7 +442,10 @@ def _bench_local_disk(
             started = submit_start_ns.pop(_key, None) if latency is not None else None
             if started is not None and latency is not None:
                 latency.record_e2e(
-                    "write", end_ns - started, threading.get_native_id()
+                    "put",
+                    _key,
+                    end_ns - started,
+                    threading.get_native_id(),
                 )
             completed += 1
             if completed >= num_ops:
@@ -684,7 +708,10 @@ def _bench_rust_raw_block(
             started = submit_start_ns.pop(_key, None) if latency is not None else None
             if started is not None and latency is not None:
                 latency.record_e2e(
-                    "write", end_ns - started, threading.get_native_id()
+                    "put",
+                    _key,
+                    end_ns - started,
+                    threading.get_native_id(),
                 )
             completed += 1
             if completed >= num_ops:
@@ -716,7 +743,7 @@ def _bench_rust_raw_block(
             if completed >= num_ops:
                 done.set()
         if started is not None and latency is not None:
-            latency.record_e2e("write", end_ns - started, threading.get_native_id())
+            latency.record_e2e("put", key, end_ns - started, threading.get_native_id())
 
     def wait_for_futures(
         pending_futures: collections.deque[tuple[Future, CacheEngineKey]],
@@ -1117,28 +1144,21 @@ def main() -> None:
                 f"MB/s={result['get_mb_per_sec']:.2f}"
             )
         latency_breakdown = result.get("latency_breakdown", {})
-        for op in ("write", "read"):
+        for op in ("put", "get"):
             op_stats = latency_breakdown.get(op)
             if op_stats is None:
                 continue
-            print(
-                f"{result['backend']} [{op}-latency]: "
-                f"e2e_avg={op_stats['e2e_avg_us']:.3f}us "
-                f"lmcache_avg={op_stats['lmcache_avg_us']:.3f}us "
-                f"io_syscall_avg={op_stats['io_syscall_avg_us']:.3f}us "
-                f"(samples_e2e={op_stats['samples_e2e']}, "
-                f"samples_io={op_stats['samples_io_syscall']})"
-            )
-            stage_stats = op_stats.get("stages", {})
-            if stage_stats:
-                stage_summary = ", ".join(
-                    f"{stage}={stats['avg_us']:.3f}us"
-                    for stage, stats in sorted(stage_stats.items())
-                )
+            print(f"{result['backend']} [{op}-latency]")
+            print(_format_latency_summary("  e2e", op_stats["e2e_us"]))
+            if op == "put" and op_stats["queue_wait_us"]["samples"] > 0:
                 print(
-                    f"{result['backend']} [{op}-stages]: "
-                    f"{stage_summary}"
+                    _format_latency_summary(
+                        "  queue_wait",
+                        op_stats["queue_wait_us"],
+                    )
                 )
+            print(_format_latency_summary("  io", op_stats["io_us"]))
+            print(_format_latency_summary("  other", op_stats["other_us"]))
 
     if args.output_json:
         output_path = args.output_json

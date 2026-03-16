@@ -153,9 +153,11 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
-        self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
+        self.io_latency_callback: Optional[
+            Callable[[str, CacheEngineKey, int, int], None]
+        ] = None
         self.put_stage_latency_callback: Optional[
-            Callable[[str, str, int, int], None]
+            Callable[[str, CacheEngineKey, str, int, int], None]
         ] = None
 
         # Batched message sender for controller communication
@@ -176,20 +178,25 @@ class LocalDiskBackend(StorageBackendInterface):
         return "LocalDiskBackend"
 
     def set_io_latency_callback(
-        self, callback: Optional[Callable[[str, int, int], None]]
+        self,
+        callback: Optional[Callable[[str, CacheEngineKey, int, int], None]],
     ) -> None:
         """Set optional callback invoked on disk read/write syscall timing.
 
-        The callback receives `(operation, latency_ns, native_thread_id)`.
+        The callback receives `(operation, key, latency_ns, native_thread_id)`.
         """
         self.io_latency_callback = callback
 
     def set_put_stage_latency_callback(
-        self, callback: Optional[Callable[[str, str, int, int], None]]
+        self,
+        callback: Optional[
+            Callable[[str, CacheEngineKey, str, int, int], None]
+        ],
     ) -> None:
         """Set optional callback for write-path stage timing.
 
-        The callback receives `(operation, stage, latency_ns, native_thread_id)`.
+        The callback receives
+        `(operation, key, stage, latency_ns, native_thread_id)`.
         """
         self.put_stage_latency_callback = callback
 
@@ -378,6 +385,7 @@ class LocalDiskBackend(StorageBackendInterface):
             self.loop,
         )
         self._record_put_stage(
+            key,
             "submit_dispatch",
             time.perf_counter_ns() - submit_stage_start_ns,
         )
@@ -524,6 +532,7 @@ class LocalDiskBackend(StorageBackendInterface):
         assert kv_chunk is not None
         if enqueued_ns is not None:
             self._record_put_stage(
+                key,
                 "queue_wait",
                 time.perf_counter_ns() - enqueued_ns,
             )
@@ -536,8 +545,9 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # TODO(Jiayi): need to add ref count in disk memory object
         write_stage_start_ns = time.perf_counter_ns()
-        self.write_file(buffer, path)
+        self.write_file(key, buffer, path)
         self._record_put_stage(
+            key,
             "write_file_total",
             time.perf_counter_ns() - write_stage_start_ns,
         )
@@ -560,6 +570,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_worker.remove_put_task(key)
         self._record_put_stage(
+            key,
             "post_write_finalize",
             time.perf_counter_ns() - finalize_stage_start_ns,
         )
@@ -624,7 +635,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
-    def write_file(self, buffer, path):
+    def write_file(self, key: CacheEngineKey, buffer, path):
         start_time = time.time()
         io_start_ns = time.perf_counter_ns()
         size = len(buffer)
@@ -637,7 +648,9 @@ class LocalDiskBackend(StorageBackendInterface):
             os.close(fd)
         io_elapsed_ns = time.perf_counter_ns() - io_start_ns
         if self.io_latency_callback is not None:
-            self.io_latency_callback("write", io_elapsed_ns, threading.get_native_id())
+            self.io_latency_callback(
+                "put", key, io_elapsed_ns, threading.get_native_id()
+            )
         disk_write_time = time.time() - start_time
         logger.debug(
             f"Disk write size: {size} bytes, "
@@ -666,7 +679,7 @@ class LocalDiskBackend(StorageBackendInterface):
             io_elapsed_ns = time.perf_counter_ns() - io_start_ns
             if self.io_latency_callback is not None:
                 self.io_latency_callback(
-                    "read", io_elapsed_ns, threading.get_native_id()
+                    "get", key, io_elapsed_ns, threading.get_native_id()
                 )
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
@@ -688,8 +701,13 @@ class LocalDiskBackend(StorageBackendInterface):
             self.batched_msg_sender.close()
         self.disk_worker.close()
 
-    def _record_put_stage(self, stage: str, latency_ns: int) -> None:
+    def _record_put_stage(
+        self,
+        key: CacheEngineKey,
+        stage: str,
+        latency_ns: int,
+    ) -> None:
         if self.put_stage_latency_callback is not None:
             self.put_stage_latency_callback(
-                "write", stage, latency_ns, threading.get_native_id()
+                "put", key, stage, latency_ns, threading.get_native_id()
             )

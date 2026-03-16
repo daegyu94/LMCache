@@ -205,9 +205,11 @@ class RustRawBlockBackend(StoragePluginInterface):
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
         self._submit_executors: list[ThreadPoolExecutor] = []
-        self.io_latency_callback: Optional[Callable[[str, int, int], None]] = None
+        self.io_latency_callback: Optional[
+            Callable[[str, CacheEngineKey, int, int], None]
+        ] = None
         self.put_stage_latency_callback: Optional[
-            Callable[[str, str, int, int], None]
+            Callable[[str, CacheEngineKey, str, int, int], None]
         ] = None
         if self.submit_mode == "threadpool":
             submit_pools = max(1, int(extra.get("rust_raw_block.submit_pools", 1)))
@@ -266,20 +268,25 @@ class RustRawBlockBackend(StoragePluginInterface):
         return "RustRawBlockBackend"
 
     def set_io_latency_callback(
-        self, callback: Optional[Callable[[str, int, int], None]]
+        self,
+        callback: Optional[Callable[[str, CacheEngineKey, int, int], None]],
     ) -> None:
         """Set optional callback invoked on raw-device read/write timing.
 
-        The callback receives `(operation, latency_ns, native_thread_id)`.
+        The callback receives `(operation, key, latency_ns, native_thread_id)`.
         """
         self.io_latency_callback = callback
 
     def set_put_stage_latency_callback(
-        self, callback: Optional[Callable[[str, str, int, int], None]]
+        self,
+        callback: Optional[
+            Callable[[str, CacheEngineKey, str, int, int], None]
+        ],
     ) -> None:
         """Set optional callback for write-path stage timing.
 
-        The callback receives `(operation, stage, latency_ns, native_thread_id)`.
+        The callback receives
+        `(operation, key, stage, latency_ns, native_thread_id)`.
         """
         self.put_stage_latency_callback = callback
 
@@ -545,6 +552,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 )
             futures.append(fut)
             self._record_put_stage(
+                key,
                 "submit_dispatch",
                 time.perf_counter_ns() - submit_stage_start_ns,
             )
@@ -585,6 +593,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         try:
             if enqueued_ns is not None:
                 self._record_put_stage(
+                    key,
                     "queue_wait",
                     time.perf_counter_ns() - enqueued_ns,
                 )
@@ -622,6 +631,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         try:
             if enqueued_ns is not None:
                 self._record_put_stage(
+                    key,
                     "queue_wait",
                     time.perf_counter_ns() - enqueued_ns,
                 )
@@ -671,7 +681,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                         header_thread_id,
                         payload_thread_id,
                     )
-                self.io_latency_callback("write", io_elapsed_ns, thread_id)
+                self.io_latency_callback("put", key, io_elapsed_ns, thread_id)
         except Exception as e:
             logger.error(f"Write failed for key {self._dbg_key_short(key)}: {e}")
             raise
@@ -707,6 +717,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         else:
             raise write_error
         self._record_put_stage(
+            key,
             "post_write_finalize",
             time.perf_counter_ns() - finalize_stage_start_ns,
         )
@@ -778,7 +789,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                     entry.offset + self.header_bytes, buf, payload_len, total_len
                 )
             if self.io_latency_callback is not None:
-                self.io_latency_callback("read", io_elapsed_ns, thread_id)
+                self.io_latency_callback("get", key, io_elapsed_ns, thread_id)
         except Exception as e:
             logger.error(f"Read failed for key {self._dbg_key_short(key)}: {e}")
             raise
@@ -843,10 +854,15 @@ class RustRawBlockBackend(StoragePluginInterface):
             submit_executor.shutdown(wait=True)
         self._submit_executors = []
 
-    def _record_put_stage(self, stage: str, latency_ns: int) -> None:
+    def _record_put_stage(
+        self,
+        key: CacheEngineKey,
+        stage: str,
+        latency_ns: int,
+    ) -> None:
         if self.put_stage_latency_callback is not None:
             self.put_stage_latency_callback(
-                "write", stage, latency_ns, threading.get_native_id()
+                "put", key, stage, latency_ns, threading.get_native_id()
             )
 
     def _select_submit_loop(self, key: CacheEngineKey) -> asyncio.AbstractEventLoop:
