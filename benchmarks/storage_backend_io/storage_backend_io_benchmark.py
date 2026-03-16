@@ -238,6 +238,28 @@ def _payload_mb_per_op(payload_size_kb: float) -> float:
     return payload_size_kb / 1024.0
 
 
+def _is_device_mounted(
+    device_path: str,
+    mounts_path: str = "/proc/self/mounts",
+) -> bool:
+    """Return True if the block device path is already mounted."""
+    normalized_device = os.path.realpath(device_path)
+    try:
+        with open(mounts_path) as mounts_file:
+            for line in mounts_file:
+                fields = line.split()
+                if not fields:
+                    continue
+                source = fields[0]
+                if not source.startswith("/"):
+                    continue
+                if os.path.realpath(source) == normalized_device:
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
 def _make_memory_objs(
     num_ops: int,
     use_aligned: bool,
@@ -597,6 +619,10 @@ def _bench_rust_raw_block(
             is_block_device = stat.S_ISBLK(st_mode)
         except FileNotFoundError:
             is_block_device = False
+    if is_block_device and _is_device_mounted(raw_device):
+        raise RuntimeError(
+            f"Refusing to use mounted raw device: {raw_device}. Unmount it first."
+        )
 
     if raw_device and not is_block_device:
         with open(raw_device, "wb") as f:
