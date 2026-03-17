@@ -9,6 +9,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 
 # Third Party
 import pytest
@@ -285,3 +286,91 @@ def test_rust_raw_block_backend_manifest_roundtrip(memory_allocator, loop_in_thr
             assert bytes(out.byte_array) == expected
         finally:
             backend2.close()
+
+
+def test_submit_completion_check_interval_applies_backpressure(
+    memory_allocator,
+    monkeypatch,
+) -> None:
+    """Submit completion check interval should block submit in configured chunks."""
+
+    def run_once(interval: int) -> float:
+        with tempfile.TemporaryDirectory() as td:
+            dev_path = os.path.join(td, "dev.bin")
+            with open(dev_path, "wb") as f:
+                f.truncate(64 * 1024 * 1024)
+
+            config = LMCacheEngineConfig.from_defaults(
+                chunk_size=256,
+                local_cpu=True,
+                max_local_cpu_size=0.1,
+                lmcache_instance_id=(
+                    "test_rust_raw_block_backend_submit_completion_check_interval"
+                ),
+            )
+            config.extra_config = {
+                "rust_raw_block.device_path": dev_path,
+                "rust_raw_block.block_align": 4096,
+                "rust_raw_block.header_bytes": 4096,
+                "rust_raw_block.submit_mode": "threadpool",
+                "rust_raw_block.submit_pools": 1,
+                "rust_raw_block.submit_workers": 1,
+                "rust_raw_block.submit_completion_check_interval": interval,
+            }
+            metadata = LMCacheMetadata(
+                model_name="test_model",
+                world_size=1,
+                local_world_size=1,
+                worker_id=0,
+                local_worker_id=0,
+                kv_dtype=torch.bfloat16,
+                kv_shape=(4, 2, 256, 8, 128),
+            )
+            local_cpu = LocalCPUBackend(
+                config=config,
+                metadata=metadata,
+                dst_device="cpu",
+                memory_allocator=memory_allocator,
+            )
+            backend = RustRawBlockBackend(
+                config=config,
+                metadata=metadata,
+                local_cpu_backend=local_cpu,
+                dst_device="cpu",
+            )
+            monkeypatch.setattr(
+                backend,
+                "_write_payload_sync",
+                lambda *_args, **_kwargs: time.sleep(0.03),
+            )
+            alloc = AdHocMemoryAllocator(device="cpu")
+            keys = [
+                CacheEngineKey("test_model", 1, 0, i, torch.bfloat16)
+                for i in range(100, 104)
+            ]
+            objs = []
+            for _ in keys:
+                obj = alloc.allocate(
+                    [torch.Size([2, 16, 8, 128])],
+                    [torch.bfloat16],
+                    fmt=MemoryFormat.KV_T2D,
+                )
+                assert obj is not None
+                objs.append(obj)
+
+            try:
+                start = time.perf_counter()
+                futures = backend.batched_submit_put_task(keys, objs)
+                elapsed = time.perf_counter() - start
+                assert futures is not None
+                for fut in futures:
+                    fut.result(timeout=10)
+                return elapsed
+            finally:
+                for obj in objs:
+                    obj.ref_count_down()
+                backend.close()
+
+    elapsed_without_check = run_once(interval=0)
+    elapsed_with_check = run_once(interval=2)
+    assert elapsed_with_check > elapsed_without_check + 0.05

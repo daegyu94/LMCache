@@ -483,10 +483,13 @@ def _bench_local_disk(
                     submitted += 1
                     target_completed = submitted
                 since_last_check += 1
-                if since_last_check >= put_completion_check_interval:
+                if (
+                    put_completion_check_interval > 0
+                    and since_last_check >= put_completion_check_interval
+                ):
                     wait_for_callback_target(target_completed, phase_start)
                     since_last_check = 0
-            if since_last_check > 0:
+            if put_completion_check_interval > 0 and since_last_check > 0:
                 wait_for_callback_target(target_completed, phase_start)
             return
 
@@ -504,7 +507,7 @@ def _bench_local_disk(
             submitted += end - start
             target_completed = submitted
         since_last_check += end - start
-        if since_last_check > 0:
+        if put_completion_check_interval > 0 and since_last_check > 0:
             while since_last_check >= put_completion_check_interval:
                 wait_for_callback_target(target_completed, phase_start)
                 since_last_check -= put_completion_check_interval
@@ -616,6 +619,7 @@ def _bench_rust_raw_block(
     raw_submit_workers: int,
     raw_submit_loops: int,
     raw_submit_pools: int,
+    raw_submit_completion_check_interval: int,
     put_completion_check_interval: int,
 ) -> dict:
     loop_pairs: list[tuple[asyncio.AbstractEventLoop, threading.Thread]] = []
@@ -668,6 +672,9 @@ def _bench_rust_raw_block(
         "rust_raw_block.submit_mode": raw_submit_mode,
         "rust_raw_block.submit_workers": raw_submit_workers,
         "rust_raw_block.submit_pools": raw_submit_pools,
+        "rust_raw_block.submit_completion_check_interval": (
+            raw_submit_completion_check_interval
+        ),
     }
     if raw_slot_bytes > 0:
         config.extra_config["rust_raw_block.slot_bytes"] = raw_slot_bytes
@@ -781,16 +788,22 @@ def _bench_rust_raw_block(
                     submitted += 1
                     target_completed = submitted
                 since_last_check += 1
-                if since_last_check >= put_completion_check_interval:
+                if (
+                    put_completion_check_interval > 0
+                    and since_last_check >= put_completion_check_interval
+                ):
                     if use_callback:
                         wait_for_callback_target(target_completed, phase_start)
                     else:
                         wait_for_futures(pending_futures, since_last_check)
                     since_last_check = 0
-            if since_last_check > 0 and not use_callback:
-                wait_for_futures(pending_futures, since_last_check)
-            if since_last_check > 0 and use_callback:
-                wait_for_callback_target(target_completed, phase_start)
+            if put_completion_check_interval > 0 and since_last_check > 0:
+                if use_callback:
+                    wait_for_callback_target(target_completed, phase_start)
+                else:
+                    wait_for_futures(pending_futures, since_last_check)
+            if put_completion_check_interval <= 0 and not use_callback:
+                wait_for_futures(pending_futures, len(pending_futures))
             return
 
         if latency is not None:
@@ -814,18 +827,28 @@ def _bench_rust_raw_block(
             submitted += end - start
             target_completed = submitted
         since_last_check += end - start
-        if use_callback and since_last_check > 0:
+        if (
+            use_callback
+            and put_completion_check_interval > 0
+            and since_last_check > 0
+        ):
             while since_last_check >= put_completion_check_interval:
                 wait_for_callback_target(target_completed, phase_start)
                 since_last_check -= put_completion_check_interval
             if since_last_check > 0:
                 wait_for_callback_target(target_completed, phase_start)
-        if not use_callback and since_last_check > 0:
+        if (
+            not use_callback
+            and put_completion_check_interval > 0
+            and since_last_check > 0
+        ):
             while since_last_check >= put_completion_check_interval:
                 wait_for_futures(pending_futures, put_completion_check_interval)
                 since_last_check -= put_completion_check_interval
             if since_last_check > 0:
                 wait_for_futures(pending_futures, since_last_check)
+        if not use_callback and put_completion_check_interval <= 0:
+            wait_for_futures(pending_futures, len(pending_futures))
 
     slice_size = max(1, num_ops // concurrency)
     slices = []
@@ -902,6 +925,7 @@ def _bench_rust_raw_block(
         "raw_submit_workers": raw_submit_workers,
         "raw_submit_loops": raw_submit_loops,
         "raw_submit_pools": raw_submit_pools,
+        "raw_submit_completion_check_interval": raw_submit_completion_check_interval,
         "put_completion_check_interval": put_completion_check_interval,
     }
     if put_elapsed is not None:
@@ -1034,6 +1058,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--raw-submit-completion-check-interval",
+        type=int,
+        default=0,
+        help=(
+            "Rust raw backend internal completion check interval used by "
+            "batched_submit_put_task. 0 disables internal chunked waiting."
+        ),
+    )
+    parser.add_argument(
         "--latency-breakdown",
         action="store_true",
         help=(
@@ -1064,16 +1097,19 @@ def main() -> None:
     parser.add_argument(
         "--put-completion-check-interval",
         type=int,
-        default=1,
+        default=0,
         help=(
             "Check put callback/future completion every N submitted objects. "
+            "Set 0 to submit all writes first and wait for completion at the end. "
             "Default: 1."
         ),
     )
 
     args = parser.parse_args()
-    if args.put_completion_check_interval <= 0:
-        raise ValueError("--put-completion-check-interval must be > 0")
+    if args.put_completion_check_interval < 0:
+        raise ValueError("--put-completion-check-interval must be >= 0")
+    if args.raw_submit_completion_check_interval < 0:
+        raise ValueError("--raw-submit-completion-check-interval must be >= 0")
     payload_shape = _resolve_payload_shape(args.payload_size_kb)
 
     results = []
@@ -1122,6 +1158,9 @@ def main() -> None:
                 raw_submit_workers=args.raw_submit_workers,
                 raw_submit_loops=args.raw_submit_loops,
                 raw_submit_pools=args.raw_submit_pools,
+                raw_submit_completion_check_interval=(
+                    args.raw_submit_completion_check_interval
+                ),
                 put_completion_check_interval=args.put_completion_check_interval,
             )
         )

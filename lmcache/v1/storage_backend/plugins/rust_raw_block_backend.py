@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 # Standard
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence
@@ -205,6 +205,13 @@ class RustRawBlockBackend(StoragePluginInterface):
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
         self._submit_executors: list[ThreadPoolExecutor] = []
+        self.submit_completion_check_interval: int = int(
+            extra.get("rust_raw_block.submit_completion_check_interval", 0)
+        )
+        if self.submit_completion_check_interval < 0:
+            raise ValueError(
+                "rust_raw_block.submit_completion_check_interval must be >= 0"
+            )
         self.io_latency_callback: Optional[
             Callable[[str, CacheEngineKey, int, int], None]
         ] = None
@@ -228,9 +235,11 @@ class RustRawBlockBackend(StoragePluginInterface):
             self.header_bytes,
         )
         logger.info(
-            "RustRawBlockBackend config: zero_copy=%s submit_mode=%s",
+            "RustRawBlockBackend config: zero_copy=%s submit_mode=%s "
+            "submit_completion_check_interval=%d",
             self.enable_zero_copy,
             self.submit_mode,
+            self.submit_completion_check_interval,
         )
         logger.warning(
             "RustRawBlockBackend: Currently only TP=1 is supported. "
@@ -475,6 +484,8 @@ class RustRawBlockBackend(StoragePluginInterface):
                 )
 
         futures = []
+        pending_futures: deque[Future] = deque()
+        submitted_since_check = 0
         for key, obj in zip(keys, objs, strict=False):
             submit_stage_start_ns = time.perf_counter_ns()
             with self._put_lock:
@@ -551,12 +562,25 @@ class RustRawBlockBackend(StoragePluginInterface):
                     submit_loop,
                 )
             futures.append(fut)
+            pending_futures.append(fut)
+            if self.submit_completion_check_interval > 0:
+                submitted_since_check += 1
+                if submitted_since_check >= self.submit_completion_check_interval:
+                    self._wait_for_submitted_futures(pending_futures)
+                    submitted_since_check = 0
             self._record_put_stage(
                 key,
                 "submit_dispatch",
                 time.perf_counter_ns() - submit_stage_start_ns,
             )
+        if self.submit_completion_check_interval > 0 and submitted_since_check > 0:
+            self._wait_for_submitted_futures(pending_futures)
         return futures or None
+
+    @staticmethod
+    def _wait_for_submitted_futures(pending_futures: deque[Future]) -> None:
+        while pending_futures:
+            pending_futures.popleft().result()
 
     def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
         """Prepare payload view and aligned lengths for write path."""
