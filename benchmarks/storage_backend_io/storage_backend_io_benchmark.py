@@ -249,12 +249,14 @@ def _payload_mb_per_op(payload_size_kb: float) -> float:
 
 
 def _format_latency_summary(label: str, stats: dict[str, float | int]) -> str:
+    samples = int(stats["samples"])
     return (
-        f"{label}: avg={stats['avg']:.3f}us "
-        f"p90={stats['p90']:.3f}us "
-        f"p95={stats['p95']:.3f}us "
-        f"p99={stats['p99']:.3f}us "
-        f"(samples={stats['samples']})"
+        f"{label:<12} "
+        f"avg={stats['avg']:>10.3f}us "
+        f"p90={stats['p90']:>10.3f}us "
+        f"p95={stats['p95']:>10.3f}us "
+        f"p99={stats['p99']:>10.3f}us "
+        f"(samples={samples:>6})"
     )
 
 

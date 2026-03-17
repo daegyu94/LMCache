@@ -133,3 +133,23 @@ def test_latency_breakdown_collector_summarizes_per_key_samples() -> None:
     assert put_key0_stats["queue_wait_us"] == 10.0
     assert put_key0_stats["io_us"] == 30.0
     assert put_key0_stats["other_us"] == 60.0
+
+
+def test_format_latency_summary_uses_fixed_width_columns() -> None:
+    """Latency summary output should keep aligned columns for readability."""
+    summary = storage_backend_io_benchmark._format_latency_summary(
+        "  queue_wait",
+        {
+            "avg": 12.3,
+            "p90": 456.789,
+            "p95": 3456.7,
+            "p99": 78901.2,
+            "samples": 42,
+        },
+    )
+
+    assert (
+        summary
+        == "  queue_wait avg=    12.300us p90=   456.789us "
+        "p95=  3456.700us p99= 78901.200us (samples=    42)"
+    )
