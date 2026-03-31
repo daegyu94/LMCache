@@ -33,6 +33,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _time_latency_buckets_ms() -> List[float]:
+    """Return default latency buckets in milliseconds for storage timings."""
+    return [
+        1,
+        5,
+        10,
+        20,
+        40,
+        60,
+        80,
+        100,
+        250,
+        500,
+        750,
+        1000,
+        2500,
+        5000,
+        7500,
+        10000,
+    ]
+
+
 @dataclass
 class LMCacheStats:
     # Counter (Note that these are incremental values,
@@ -59,6 +81,8 @@ class LMCacheStats:
     interval_remote_time_to_get: List[float]
     interval_remote_time_to_put: List[float]
     interval_remote_time_to_get_sync: List[float]
+    interval_local_disk_time_to_read: List[float]
+    interval_local_disk_time_to_write: List[float]
 
     interval_remote_ping_latency: float  # Ping latency in milliseconds
     interval_remote_ping_errors: int  # Number of ping errors
@@ -283,6 +307,8 @@ class LMCStatsMonitor:
         # the time of get value from remote backends synchronously,
         # which includes rpc and schedule time
         self.interval_remote_time_to_get_sync: List[float] = []
+        self.interval_local_disk_time_to_read: List[float] = []
+        self.interval_local_disk_time_to_write: List[float] = []
 
         self.interval_remote_ping_latency = 0
         self.interval_remote_ping_errors = 0
@@ -549,6 +575,14 @@ class LMCStatsMonitor:
         self.interval_remote_time_to_get_sync.append(get_time_sync)
 
     @thread_safe
+    def update_interval_local_disk_time_to_read(self, read_time: float):
+        self.interval_local_disk_time_to_read.append(read_time)
+
+    @thread_safe
+    def update_interval_local_disk_time_to_write(self, write_time: float):
+        self.interval_local_disk_time_to_write.append(write_time)
+
+    @thread_safe
     def update_remote_ping_latency(self, latency: float):
         self.interval_remote_ping_latency = latency
 
@@ -617,6 +651,8 @@ class LMCStatsMonitor:
         self.interval_remote_time_to_get.clear()
         self.interval_remote_time_to_put.clear()
         self.interval_remote_time_to_get_sync.clear()
+        self.interval_local_disk_time_to_read.clear()
+        self.interval_local_disk_time_to_write.clear()
 
         self.interval_remote_ping_latency = 0
         self.interval_remote_ping_errors = 0
@@ -782,6 +818,8 @@ class LMCStatsMonitor:
             interval_remote_time_to_get=self.interval_remote_time_to_get.copy(),
             interval_remote_time_to_put=self.interval_remote_time_to_put.copy(),
             interval_remote_time_to_get_sync=self.interval_remote_time_to_get_sync.copy(),
+            interval_local_disk_time_to_read=self.interval_local_disk_time_to_read.copy(),
+            interval_local_disk_time_to_write=self.interval_local_disk_time_to_write.copy(),
             interval_remote_ping_latency=self.interval_remote_ping_latency,
             interval_remote_ping_errors=self.interval_remote_ping_errors,
             interval_remote_ping_success=self.interval_remote_ping_success,
@@ -1311,24 +1349,7 @@ class PrometheusLogger:
             buckets=p2p_speed_buckets,
         )
 
-        remote_time_to_get = [
-            1,
-            5,
-            10,
-            20,
-            40,
-            60,
-            80,
-            100,
-            250,
-            500,
-            750,
-            1000,
-            2500,
-            5000,
-            7500,
-            10000,
-        ]
+        remote_time_to_get = _time_latency_buckets_ms()
         self.histogram_remote_time_to_get = self._create_histogram(
             name="lmcache:remote_time_to_get",
             documentation="Time to get from remote backends (ms)",
@@ -1336,24 +1357,7 @@ class PrometheusLogger:
             buckets=remote_time_to_get,
         )
 
-        remote_time_to_put = [
-            1,
-            5,
-            10,
-            20,
-            40,
-            60,
-            80,
-            100,
-            250,
-            500,
-            750,
-            1000,
-            2500,
-            5000,
-            7500,
-            10000,
-        ]
+        remote_time_to_put = _time_latency_buckets_ms()
         self.histogram_remote_time_to_put = self._create_histogram(
             name="lmcache:remote_time_to_put",
             documentation="Time to put to remote backends (ms)",
@@ -1361,29 +1365,28 @@ class PrometheusLogger:
             buckets=remote_time_to_put,
         )
 
-        remote_time_to_get_sync = [
-            1,
-            5,
-            10,
-            20,
-            40,
-            60,
-            80,
-            100,
-            250,
-            500,
-            750,
-            1000,
-            2500,
-            5000,
-            7500,
-            10000,
-        ]
+        remote_time_to_get_sync = _time_latency_buckets_ms()
         self.histogram_remote_time_to_get_sync = self._create_histogram(
             name="lmcache:remote_time_to_get_sync",
             documentation="Time to get from remote backends synchronously(ms)",
             labelnames=labelnames,
             buckets=remote_time_to_get_sync,
+        )
+
+        local_disk_time_to_read = _time_latency_buckets_ms()
+        self.histogram_local_disk_time_to_read = self._create_histogram(
+            name="lmcache:local_disk_time_to_read",
+            documentation="Time to read from local disk backend (ms)",
+            labelnames=labelnames,
+            buckets=local_disk_time_to_read,
+        )
+
+        local_disk_time_to_write = _time_latency_buckets_ms()
+        self.histogram_local_disk_time_to_write = self._create_histogram(
+            name="lmcache:local_disk_time_to_write",
+            documentation="Time to write to local disk backend (ms)",
+            labelnames=labelnames,
+            buckets=local_disk_time_to_write,
         )
 
         request_cache_hit_rate = [
@@ -1784,6 +1787,14 @@ class PrometheusLogger:
         self._log_histogram(
             self.histogram_remote_time_to_get_sync,
             stats.interval_remote_time_to_get_sync,
+        )
+        self._log_histogram(
+            self.histogram_local_disk_time_to_read,
+            stats.interval_local_disk_time_to_read,
+        )
+        self._log_histogram(
+            self.histogram_local_disk_time_to_write,
+            stats.interval_local_disk_time_to_write,
         )
         self._log_histogram(
             self.histogram_request_cache_hit_rate, stats.interval_lookup_hit_rates

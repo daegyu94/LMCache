@@ -118,6 +118,14 @@ def test_remote_time_metrics(stats_monitor):
     assert stats.interval_remote_time_to_get_sync == [12.3]
 
 
+def test_local_disk_time_metrics(stats_monitor):
+    stats_monitor.update_interval_local_disk_time_to_read(read_time=3.1)
+    stats_monitor.update_interval_local_disk_time_to_write(write_time=4.2)
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_local_disk_time_to_read == [3.1]
+    assert stats.interval_local_disk_time_to_write == [4.2]
+
+
 def test_remote_ping_metrics(stats_monitor):
     # Test successful ping
     stats_monitor.update_remote_ping_latency(latency=25.5)

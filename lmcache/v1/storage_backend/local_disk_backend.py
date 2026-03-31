@@ -591,6 +591,9 @@ class LocalDiskBackend(StorageBackendInterface):
             os.write(fd, buffer)
             os.close(fd)
         disk_write_time = time.time() - start_time
+        self.stats_monitor.update_interval_local_disk_time_to_write(
+            disk_write_time * 1000.0
+        )
         logger.debug(
             f"Disk write size: {size} bytes, "
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
@@ -621,6 +624,9 @@ class LocalDiskBackend(StorageBackendInterface):
             return
 
         disk_read_time = time.time() - start_time
+        self.stats_monitor.update_interval_local_disk_time_to_read(
+            disk_read_time * 1000.0
+        )
         logger.debug(
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
