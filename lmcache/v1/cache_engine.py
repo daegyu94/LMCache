@@ -535,6 +535,15 @@ class LMCacheEngine:
                 keys, memory_objs, transfer_spec=transfer_spec
             )
 
+        local_disk_enabled = any(
+            backend_name == "LocalDiskBackend"
+            for backend_name, _ in self.storage_manager.get_active_storage_backends()
+        )
+        if local_disk_enabled:
+            self.stats_monitor.update_interval_local_disk_token_metrics(
+                stored_tokens_delta=tot_token_num
+            )
+
         self.stats_monitor.on_store_finished(
             store_stats,
             tot_token_num,
@@ -1612,8 +1621,15 @@ class LMCacheEngine:
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
+        local_disk_requested_tokens = 0
+        local_disk_hit_ranges: list[tuple[int, int]] = []
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
+            if location == "LocalDiskBackend":
+                local_disk_requested_tokens += sum(
+                    end - start for _, start, end in blocks
+                )
+
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
@@ -1631,6 +1647,8 @@ class LMCacheEngine:
                     ):
                         last_failed_block_start = start
                     break
+                if location == "LocalDiskBackend":
+                    local_disk_hit_ranges.append((start, end))
                 reordered_chunks.append((key, memory_obj, start, end))
                 tot_kv_size += memory_obj.get_size()
                 ret_mask[start:end] = True
@@ -1643,6 +1661,19 @@ class LMCacheEngine:
                 for key, memory_obj, start, end in reordered_chunks
                 if end < last_failed_block_start
             ]
+
+        local_disk_hit_tokens = sum(end - start for start, end in local_disk_hit_ranges)
+        if last_failed_block_start is not None:
+            local_disk_hit_tokens = sum(
+                end - start
+                for start, end in local_disk_hit_ranges
+                if end < last_failed_block_start
+            )
+        if local_disk_requested_tokens > 0 or local_disk_hit_tokens > 0:
+            self.stats_monitor.update_interval_local_disk_token_metrics(
+                requested_tokens_delta=local_disk_requested_tokens,
+                hit_tokens_delta=local_disk_hit_tokens,
+            )
         return reordered_chunks, tot_kv_size
 
     def _broadcast_or_receive_memory_objs(

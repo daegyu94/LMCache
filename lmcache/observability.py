@@ -84,6 +84,9 @@ class LMCacheStats:
     interval_requested_tokens: int
     interval_hit_tokens: int
     interval_stored_tokens: int
+    interval_local_disk_requested_tokens: int
+    interval_local_disk_hit_tokens: int
+    interval_local_disk_stored_tokens: int
     interval_lookup_tokens: int
     interval_lookup_hits: int
     interval_vllm_hit_tokens: int
@@ -299,6 +302,9 @@ class LMCStatsMonitor:
         self.interval_requested_tokens = 0  # total requested tokens retrieve
         self.interval_hit_tokens = 0  # total hit tokens retrieve
         self.interval_stored_tokens = 0  # total tokens tored in LMCache
+        self.interval_local_disk_requested_tokens = 0
+        self.interval_local_disk_hit_tokens = 0
+        self.interval_local_disk_stored_tokens = 0
         self.interval_lookup_tokens = 0  # total requested tokens lookup
         self.interval_lookup_hits = 0  # total hit tokens lookup
         self.interval_vllm_hit_tokens = 0  # total hit tokens in vllm
@@ -643,6 +649,24 @@ class LMCStatsMonitor:
     def update_interval_prompt_tokens(self, delta: int):
         self.interval_prompt_tokens += delta
 
+    @thread_safe
+    def update_interval_local_disk_token_metrics(
+        self,
+        requested_tokens_delta: int = 0,
+        hit_tokens_delta: int = 0,
+        stored_tokens_delta: int = 0,
+    ) -> None:
+        """Update local-disk-specific token counters.
+
+        Args:
+            requested_tokens_delta: Increment for requested tokens.
+            hit_tokens_delta: Increment for hit tokens.
+            stored_tokens_delta: Increment for stored tokens.
+        """
+        self.interval_local_disk_requested_tokens += requested_tokens_delta
+        self.interval_local_disk_hit_tokens += hit_tokens_delta
+        self.interval_local_disk_stored_tokens += stored_tokens_delta
+
     def _clear(self):
         """
         Clear all the distribution stats
@@ -654,6 +678,9 @@ class LMCStatsMonitor:
         self.interval_requested_tokens = 0
         self.interval_hit_tokens = 0
         self.interval_stored_tokens = 0
+        self.interval_local_disk_requested_tokens = 0
+        self.interval_local_disk_hit_tokens = 0
+        self.interval_local_disk_stored_tokens = 0
         self.interval_lookup_tokens = 0
         self.interval_lookup_hits = 0
         self.interval_vllm_hit_tokens = 0
@@ -828,6 +855,11 @@ class LMCStatsMonitor:
             interval_requested_tokens=self.interval_requested_tokens,
             interval_hit_tokens=self.interval_hit_tokens,
             interval_stored_tokens=self.interval_stored_tokens,
+            interval_local_disk_requested_tokens=(
+                self.interval_local_disk_requested_tokens
+            ),
+            interval_local_disk_hit_tokens=self.interval_local_disk_hit_tokens,
+            interval_local_disk_stored_tokens=self.interval_local_disk_stored_tokens,
             interval_lookup_tokens=self.interval_lookup_tokens,
             interval_lookup_hits=self.interval_lookup_hits,
             interval_remote_read_requests=self.interval_remote_read_requests,
@@ -1014,6 +1046,24 @@ class PrometheusLogger:
             documentation=(
                 "Total number of tokens stored in lmcache including evicted ones"
             ),
+            labelnames=labelnames,
+        )
+
+        self.counter_local_disk_num_requested_tokens = self._create_counter(
+            name="lmcache:local_disk_num_requested_tokens",
+            documentation="Total requested tokens from LocalDiskBackend",
+            labelnames=labelnames,
+        )
+
+        self.counter_local_disk_num_hit_tokens = self._create_counter(
+            name="lmcache:local_disk_num_hit_tokens",
+            documentation="Total hit tokens from LocalDiskBackend",
+            labelnames=labelnames,
+        )
+
+        self.counter_local_disk_num_stored_tokens = self._create_counter(
+            name="lmcache:local_disk_num_stored_tokens",
+            documentation="Total tokens submitted to LocalDiskBackend",
             labelnames=labelnames,
         )
 
@@ -1694,6 +1744,18 @@ class PrometheusLogger:
         )
         self._log_counter(self.counter_num_hit_tokens, stats.interval_hit_tokens)
         self._log_counter(self.counter_num_stored_tokens, stats.interval_stored_tokens)
+        self._log_counter(
+            self.counter_local_disk_num_requested_tokens,
+            stats.interval_local_disk_requested_tokens,
+        )
+        self._log_counter(
+            self.counter_local_disk_num_hit_tokens,
+            stats.interval_local_disk_hit_tokens,
+        )
+        self._log_counter(
+            self.counter_local_disk_num_stored_tokens,
+            stats.interval_local_disk_stored_tokens,
+        )
         self._log_counter(self.counter_num_lookup_tokens, stats.interval_lookup_tokens)
         self._log_counter(self.counter_num_lookup_hits, stats.interval_lookup_hits)
         self._log_counter(self.counter_num_prompt_tokens, stats.interval_prompt_tokens)

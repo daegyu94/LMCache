@@ -126,6 +126,18 @@ def test_local_disk_time_metrics(stats_monitor):
     assert stats.interval_local_disk_time_to_write == [4.2]
 
 
+def test_local_disk_token_metrics(stats_monitor):
+    stats_monitor.update_interval_local_disk_token_metrics(
+        requested_tokens_delta=100,
+        hit_tokens_delta=80,
+        stored_tokens_delta=120,
+    )
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_local_disk_requested_tokens == 100
+    assert stats.interval_local_disk_hit_tokens == 80
+    assert stats.interval_local_disk_stored_tokens == 120
+
+
 def test_remote_ping_metrics(stats_monitor):
     # Test successful ping
     stats_monitor.update_remote_ping_latency(latency=25.5)
