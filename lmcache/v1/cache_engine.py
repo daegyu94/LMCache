@@ -543,6 +543,7 @@ class LMCacheEngine:
             self.stats_monitor.update_interval_local_disk_token_metrics(
                 stored_tokens_delta=tot_token_num
             )
+            store_stats.local_disk_stored_tokens = tot_token_num
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -1671,6 +1672,10 @@ class LMCacheEngine:
             )
         if local_disk_requested_tokens > 0 or local_disk_hit_tokens > 0:
             self.stats_monitor.update_interval_local_disk_token_metrics(
+                requested_tokens_delta=local_disk_requested_tokens,
+                hit_tokens_delta=local_disk_hit_tokens,
+            )
+            self.stats_monitor.update_current_retrieve_local_disk_metrics(
                 requested_tokens_delta=local_disk_requested_tokens,
                 hit_tokens_delta=local_disk_hit_tokens,
             )

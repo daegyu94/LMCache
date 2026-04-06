@@ -134,6 +134,10 @@ class LMCacheStats:
     time_to_lookup: List[float]
     retrieve_speed: List[float]  # Tokens per second
     store_speed: List[float]  # Tokens per second
+    local_disk_time_to_retrieve: List[float]
+    local_disk_retrieve_speed: List[float]
+    local_disk_time_to_store: List[float]
+    local_disk_store_speed: List[float]
 
     # Granular profiling measurements
     retrieve_process_tokens_time: List[float]
@@ -191,6 +195,8 @@ class RetrieveRequestStats:
     process_tokens_time: float = 0
     broadcast_time: float = 0
     to_gpu_time: float = 0
+    local_disk_requested_tokens: int = 0
+    local_disk_hit_tokens: int = 0
     detailed_metrics: Dict[str, Any] = field(default_factory=dict)
 
     def time_to_retrieve(self):
@@ -204,6 +210,11 @@ class RetrieveRequestStats:
         return (
             self.local_hit_tokens + self.remote_hit_tokens
         ) / self.time_to_retrieve()
+
+    def local_disk_retrieve_speed(self):
+        if self.time_to_retrieve() == 0:
+            return 0
+        return self.local_disk_hit_tokens / self.time_to_retrieve()
 
     @contextmanager
     def profile_process_tokens(self):
@@ -239,6 +250,7 @@ class StoreRequestStats:
     process_tokens_time: float = 0
     from_gpu_time: float = 0
     put_time: float = 0
+    local_disk_stored_tokens: int = 0
 
     def time_to_store(self):
         if self.end_time == 0:
@@ -249,6 +261,11 @@ class StoreRequestStats:
         if self.time_to_store() == 0:
             return 0
         return self.num_tokens / self.time_to_store()
+
+    def local_disk_store_speed(self):
+        if self.time_to_store() == 0:
+            return 0
+        return self.local_disk_stored_tokens / self.time_to_store()
 
     @contextmanager
     def profile_process_tokens(self):
@@ -667,6 +684,19 @@ class LMCStatsMonitor:
         self.interval_local_disk_hit_tokens += hit_tokens_delta
         self.interval_local_disk_stored_tokens += stored_tokens_delta
 
+    @thread_safe
+    def update_current_retrieve_local_disk_metrics(
+        self,
+        requested_tokens_delta: int = 0,
+        hit_tokens_delta: int = 0,
+    ) -> None:
+        """Update local-disk retrieve metrics for the current retrieve request."""
+        retrieve_stats = self.get_current_retrieve_stats()
+        if retrieve_stats is None:
+            return
+        retrieve_stats.local_disk_requested_tokens += requested_tokens_delta
+        retrieve_stats.local_disk_hit_tokens += hit_tokens_delta
+
     def _clear(self):
         """
         Clear all the distribution stats
@@ -804,6 +834,30 @@ class LMCStatsMonitor:
             stats.store_speed() for stats in self.store_requests.values()
         )
 
+        local_disk_time_to_retrieve = filter_out_zeros(
+            stats.time_to_retrieve()
+            for stats in self.retrieve_requests.values()
+            if stats.local_disk_requested_tokens > 0
+        )
+
+        local_disk_retrieve_speed = filter_out_zeros(
+            stats.local_disk_retrieve_speed()
+            for stats in self.retrieve_requests.values()
+            if stats.local_disk_requested_tokens > 0
+        )
+
+        local_disk_time_to_store = filter_out_zeros(
+            stats.time_to_store()
+            for stats in self.store_requests.values()
+            if stats.local_disk_stored_tokens > 0
+        )
+
+        local_disk_store_speed = filter_out_zeros(
+            stats.local_disk_store_speed()
+            for stats in self.store_requests.values()
+            if stats.local_disk_stored_tokens > 0
+        )
+
         # Granular profiling measurements
         retrieve_process_tokens_time = filter_out_zeros(
             stats.process_tokens_time for stats in self.retrieve_requests.values()
@@ -891,6 +945,10 @@ class LMCStatsMonitor:
             time_to_lookup=time_to_lookup,
             retrieve_speed=retrieve_speed,
             store_speed=store_speed,
+            local_disk_time_to_retrieve=local_disk_time_to_retrieve,
+            local_disk_retrieve_speed=local_disk_retrieve_speed,
+            local_disk_time_to_store=local_disk_time_to_store,
+            local_disk_store_speed=local_disk_store_speed,
             retrieve_process_tokens_time=retrieve_process_tokens_time,
             retrieve_broadcast_time=retrieve_broadcast_time,
             retrieve_to_gpu_time=retrieve_to_gpu_time,
@@ -1232,6 +1290,12 @@ class PrometheusLogger:
             labelnames=labelnames,
             buckets=time_to_retrieve_buckets,
         )
+        self.histogram_local_disk_time_to_retrieve = self._create_histogram(
+            name="lmcache:local_disk_time_to_retrieve",
+            documentation="Time to retrieve from LocalDiskBackend (seconds)",
+            labelnames=labelnames,
+            buckets=time_to_retrieve_buckets,
+        )
 
         time_to_store_buckets = [
             0.001,
@@ -1254,6 +1318,12 @@ class PrometheusLogger:
         self.histogram_time_to_store = self._create_histogram(
             name="lmcache:time_to_store",
             documentation="Time to store to lmcache (seconds)",
+            labelnames=labelnames,
+            buckets=time_to_store_buckets,
+        )
+        self.histogram_local_disk_time_to_store = self._create_histogram(
+            name="lmcache:local_disk_time_to_store",
+            documentation="Time to store to LocalDiskBackend (seconds)",
             labelnames=labelnames,
             buckets=time_to_store_buckets,
         )
@@ -1343,6 +1413,12 @@ class PrometheusLogger:
             labelnames=labelnames,
             buckets=retrieve_speed_buckets,
         )
+        self.histogram_local_disk_retrieve_speed = self._create_histogram(
+            name="lmcache:local_disk_retrieve_speed",
+            documentation="Retrieve speed from LocalDiskBackend (tokens per second)",
+            labelnames=labelnames,
+            buckets=retrieve_speed_buckets,
+        )
 
         store_speed_buckets = [
             1,
@@ -1364,6 +1440,12 @@ class PrometheusLogger:
         self.histogram_store_speed = self._create_histogram(
             name="lmcache:store_speed",
             documentation="Store speed of lmcache (tokens per second)",
+            labelnames=labelnames,
+            buckets=store_speed_buckets,
+        )
+        self.histogram_local_disk_store_speed = self._create_histogram(
+            name="lmcache:local_disk_store_speed",
+            documentation="Store speed to LocalDiskBackend (tokens per second)",
             labelnames=labelnames,
             buckets=store_speed_buckets,
         )
@@ -1818,14 +1900,30 @@ class PrometheusLogger:
         self._log_gauge(self.gauge_local_storage_usage, stats.local_storage_usage_bytes)
 
         self._log_histogram(self.histogram_time_to_retrieve, stats.time_to_retrieve)
+        self._log_histogram(
+            self.histogram_local_disk_time_to_retrieve,
+            stats.local_disk_time_to_retrieve,
+        )
 
         self._log_histogram(self.histogram_time_to_store, stats.time_to_store)
+        self._log_histogram(
+            self.histogram_local_disk_time_to_store,
+            stats.local_disk_time_to_store,
+        )
 
         self._log_histogram(self.histogram_time_to_lookup, stats.time_to_lookup)
 
         self._log_histogram(self.histogram_retrieve_speed, stats.retrieve_speed)
+        self._log_histogram(
+            self.histogram_local_disk_retrieve_speed,
+            stats.local_disk_retrieve_speed,
+        )
 
         self._log_histogram(self.histogram_store_speed, stats.store_speed)
+        self._log_histogram(
+            self.histogram_local_disk_store_speed,
+            stats.local_disk_store_speed,
+        )
 
         self._log_histogram(
             self.histogram_retrieve_process_tokens_time,

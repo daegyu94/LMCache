@@ -177,6 +177,29 @@ def test_retrieve_and_store_speed(stats_monitor):
     assert stats.store_speed[0] > 0  # Should be tokens/second
 
 
+def test_local_disk_retrieve_and_store_speed(stats_monitor):
+    stats_obj_retrieve = stats_monitor.on_retrieve_request(num_tokens=1000)
+    stats_monitor.update_current_retrieve_local_disk_metrics(
+        requested_tokens_delta=1000,
+        hit_tokens_delta=800,
+    )
+    stats_monitor.on_retrieve_finished(
+        retrieve_stats=stats_obj_retrieve, num_retrieved_tokens=800
+    )
+
+    stats_obj_store = stats_monitor.on_store_request(num_tokens=500)
+    stats_obj_store.local_disk_stored_tokens = 500
+    stats_monitor.on_store_finished(store_stats=stats_obj_store)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert len(stats.local_disk_time_to_retrieve) == 1
+    assert len(stats.local_disk_retrieve_speed) == 1
+    assert stats.local_disk_retrieve_speed[0] > 0
+    assert len(stats.local_disk_time_to_store) == 1
+    assert len(stats.local_disk_store_speed) == 1
+    assert stats.local_disk_store_speed[0] > 0
+
+
 def test_multiple_lookup_operations(stats_monitor):
     # Test multiple lookup operations
     stats_obj_1 = stats_monitor.on_lookup_request(num_tokens=100)
