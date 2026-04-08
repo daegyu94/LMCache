@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from array import array
 from unittest.mock import MagicMock
 
 # Third Party
@@ -38,6 +39,69 @@ def test_on_retrieve_finished(stats_monitor):
     assert stats.interval_retrieve_requests == 1
     assert stats.retrieve_hit_rate == 1.0
     assert len(stats.time_to_retrieve) == 1
+
+
+def test_record_raw_time_to_retrieve_default_enabled(stats_monitor):
+    stats_obj = stats_monitor.on_retrieve_request(num_tokens=64)
+    stats_monitor.on_retrieve_finished(
+        retrieve_stats=stats_obj,
+        num_retrieved_tokens=64,
+    )
+    raw_latencies = stats_monitor.get_raw_time_to_retrieve()
+    assert len(raw_latencies) == 1
+    assert raw_latencies[0] > 0
+
+
+def test_record_raw_time_to_retrieve_can_be_disabled(stats_monitor):
+    cfg = _make_config({"record_raw_time_to_retrieve": False})
+    stats_monitor.configure(cfg)
+
+    stats_obj = stats_monitor.on_retrieve_request(num_tokens=64)
+    stats_monitor.on_retrieve_finished(
+        retrieve_stats=stats_obj,
+        num_retrieved_tokens=64,
+    )
+    assert len(stats_monitor.get_raw_time_to_retrieve()) == 0
+
+
+def test_clear_raw_time_to_retrieve(stats_monitor):
+    stats_obj = stats_monitor.on_retrieve_request(num_tokens=64)
+    stats_monitor.on_retrieve_finished(
+        retrieve_stats=stats_obj,
+        num_retrieved_tokens=64,
+    )
+    assert len(stats_monitor.get_raw_time_to_retrieve()) == 1
+    stats_monitor.clear_raw_time_to_retrieve()
+    assert len(stats_monitor.get_raw_time_to_retrieve()) == 0
+
+
+def test_get_raw_time_to_retrieve_summary(stats_monitor):
+    stats_monitor.raw_time_to_retrieve = array("d", [0.1, 0.2, 0.3, 0.4, 0.5])
+    summary = stats_monitor.get_raw_time_to_retrieve_summary()
+    assert summary.count == 5
+    assert summary.mean == pytest.approx(0.3)
+    assert summary.p90 == pytest.approx(0.46)
+    assert summary.p95 == pytest.approx(0.48)
+    assert summary.p99 == pytest.approx(0.496)
+
+
+def test_get_raw_time_to_retrieve_summary_empty(stats_monitor):
+    summary = stats_monitor.get_raw_time_to_retrieve_summary()
+    assert summary.count == 0
+    assert summary.mean == 0.0
+    assert summary.p90 == 0.0
+    assert summary.p95 == 0.0
+    assert summary.p99 == 0.0
+
+
+def test_get_stats_and_clear_includes_raw_retrieve_summary(stats_monitor):
+    stats_monitor.raw_time_to_retrieve = array("d", [0.1, 0.2, 0.3, 0.4, 0.5])
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.raw_time_to_retrieve_count == 5
+    assert stats.raw_time_to_retrieve_mean == pytest.approx(0.3)
+    assert stats.raw_time_to_retrieve_p90 == pytest.approx(0.46)
+    assert stats.raw_time_to_retrieve_p95 == pytest.approx(0.48)
+    assert stats.raw_time_to_retrieve_p99 == pytest.approx(0.496)
 
 
 def test_on_store_request_and_finished(stats_monitor):

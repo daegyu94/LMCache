@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import (
@@ -33,6 +34,49 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _parse_extra_config_bool(
+    config: "LMCacheEngineConfig", key: str, default_value: bool
+) -> bool:
+    """Read a bool-like value from config.extra_config with a safe fallback."""
+    value = config.get_extra_config_value(key, default_value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        logger.warning(
+            "Invalid bool value %r for extra_config['%s']; fallback to %s",
+            value,
+            key,
+            default_value,
+        )
+        return default_value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default_value
+
+
+def _percentile_from_sorted_values(
+    values: Sequence[float], percentile: float
+) -> float:
+    """Compute a percentile via linear interpolation on sorted samples."""
+    if len(values) == 0:
+        return 0.0
+    if percentile <= 0:
+        return float(values[0])
+    if percentile >= 100:
+        return float(values[-1])
+
+    rank = (len(values) - 1) * (percentile / 100.0)
+    lower_idx = int(rank)
+    upper_idx = min(lower_idx + 1, len(values) - 1)
+    weight = rank - lower_idx
+    lower = float(values[lower_idx])
+    upper = float(values[upper_idx])
+    return lower + (upper - lower) * weight
 @dataclass
 class LMCacheStats:
     # Counter (Note that these are incremental values,
@@ -88,6 +132,11 @@ class LMCacheStats:
     time_to_lookup: List[float]
     retrieve_speed: List[float]  # Tokens per second
     store_speed: List[float]  # Tokens per second
+    raw_time_to_retrieve_count: int
+    raw_time_to_retrieve_mean: float
+    raw_time_to_retrieve_p90: float
+    raw_time_to_retrieve_p95: float
+    raw_time_to_retrieve_p99: float
 
     # Granular profiling measurements
     retrieve_process_tokens_time: List[float]
@@ -112,6 +161,15 @@ class LMCacheStats:
     interval_lookup_0_hit_requests: int
 
     interval_request_cache_lifespan: List[float]  # cache lifespan in minutes
+
+
+@dataclass
+class RetrieveLatencySummary:
+    count: int
+    mean: float
+    p90: float
+    p95: float
+    p99: float
 
 
 @dataclass
@@ -318,6 +376,10 @@ class LMCStatsMonitor:
         self.retrieve_token_speed_threshold: float = -1.0
         self.last_retrieve_warning_time: float = 0.0
         self.skipped_retrieve_warning_count: int = 0
+        # Benchmark helper: retain all retrieve latencies as compact float64.
+        # Controlled by extra_config["record_raw_time_to_retrieve"] (default: True).
+        self.record_raw_time_to_retrieve: bool = True
+        self.raw_time_to_retrieve: array = array("d")
 
     def set_current_retrieve_stats(self, stats: RetrieveRequestStats):
         self._current_retrieve_stats = stats
@@ -409,6 +471,8 @@ class LMCStatsMonitor:
         self.clear_current_retrieve_stats()
 
         time_to_retrieve = retrieve_stats.time_to_retrieve()
+        if self.record_raw_time_to_retrieve and time_to_retrieve != 0:
+            self.raw_time_to_retrieve.append(time_to_retrieve)
         retrieve_speed = retrieve_stats.retrieve_speed()
         if time_to_retrieve > self.retrieve_time_threshold:
             self.interval_num_slow_retrieval_by_time += 1
@@ -765,6 +829,7 @@ class LMCStatsMonitor:
         )
 
         request_lifespan = list(self.interval_request_cache_lifespan.values())
+        raw_retrieve_summary = self._get_raw_time_to_retrieve_summary_unlocked()
 
         ret = LMCacheStats(
             interval_retrieve_requests=self.interval_retrieve_requests,
@@ -802,6 +867,11 @@ class LMCStatsMonitor:
             time_to_lookup=time_to_lookup,
             retrieve_speed=retrieve_speed,
             store_speed=store_speed,
+            raw_time_to_retrieve_count=raw_retrieve_summary.count,
+            raw_time_to_retrieve_mean=raw_retrieve_summary.mean,
+            raw_time_to_retrieve_p90=raw_retrieve_summary.p90,
+            raw_time_to_retrieve_p95=raw_retrieve_summary.p95,
+            raw_time_to_retrieve_p99=raw_retrieve_summary.p99,
             retrieve_process_tokens_time=retrieve_process_tokens_time,
             retrieve_broadcast_time=retrieve_broadcast_time,
             retrieve_to_gpu_time=retrieve_to_gpu_time,
@@ -828,10 +898,56 @@ class LMCStatsMonitor:
     _instance = None
 
     @staticmethod
-    def GetOrCreate() -> "LMCStatsMonitor":
+    def GetOrCreate(
+        config: Optional["LMCacheEngineConfig"] = None,
+    ) -> "LMCStatsMonitor":
         if LMCStatsMonitor._instance is None:
             LMCStatsMonitor._instance = LMCStatsMonitor()
+        if config is not None:
+            LMCStatsMonitor._instance.configure(config)
         return LMCStatsMonitor._instance
+
+    @thread_safe
+    def configure(self, config: "LMCacheEngineConfig") -> None:
+        """Apply monitor options from config.extra_config."""
+        self.record_raw_time_to_retrieve = _parse_extra_config_bool(
+            config=config,
+            key="record_raw_time_to_retrieve",
+            default_value=True,
+        )
+
+    @thread_safe
+    def get_raw_time_to_retrieve(self) -> array:
+        """Return a copy of all recorded retrieve latencies."""
+        return array("d", self.raw_time_to_retrieve)
+
+    @thread_safe
+    def clear_raw_time_to_retrieve(self) -> None:
+        """Clear all recorded retrieve latencies."""
+        self.raw_time_to_retrieve = array("d")
+
+    @thread_safe
+    def get_raw_time_to_retrieve_summary(self) -> RetrieveLatencySummary:
+        """Return summary stats (mean/p90/p95/p99) for retrieve latencies."""
+        return self._get_raw_time_to_retrieve_summary_unlocked()
+
+    def _get_raw_time_to_retrieve_summary_unlocked(self) -> RetrieveLatencySummary:
+        """Return raw retrieve summary without taking the shared lock."""
+        count = len(self.raw_time_to_retrieve)
+        if count == 0:
+            return RetrieveLatencySummary(
+                count=0, mean=0.0, p90=0.0, p95=0.0, p99=0.0
+            )
+
+        sorted_values = sorted(self.raw_time_to_retrieve)
+        mean = float(sum(self.raw_time_to_retrieve) / count)
+        return RetrieveLatencySummary(
+            count=count,
+            mean=mean,
+            p90=_percentile_from_sorted_values(sorted_values, 90.0),
+            p95=_percentile_from_sorted_values(sorted_values, 95.0),
+            p99=_percentile_from_sorted_values(sorted_values, 99.0),
+        )
 
     @staticmethod
     def DestroyInstance():
@@ -1085,6 +1201,36 @@ class PrometheusLogger:
             documentation="Local storage usage (bytes) of lmcache",
             labelnames=labelnames,
             multiprocess_mode="sum",
+        )
+        self.gauge_raw_time_to_retrieve_count = self._gauge_cls(
+            name="lmcache:raw_time_to_retrieve_count",
+            documentation="Total number of raw time_to_retrieve samples retained",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+        self.gauge_raw_time_to_retrieve_mean = self._gauge_cls(
+            name="lmcache:raw_time_to_retrieve_mean",
+            documentation="Mean raw time_to_retrieve latency (seconds)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+        self.gauge_raw_time_to_retrieve_p90 = self._gauge_cls(
+            name="lmcache:raw_time_to_retrieve_p90",
+            documentation="P90 raw time_to_retrieve latency (seconds)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+        self.gauge_raw_time_to_retrieve_p95 = self._gauge_cls(
+            name="lmcache:raw_time_to_retrieve_p95",
+            documentation="P95 raw time_to_retrieve latency (seconds)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+        self.gauge_raw_time_to_retrieve_p99 = self._gauge_cls(
+            name="lmcache:raw_time_to_retrieve_p99",
+            documentation="P99 raw time_to_retrieve latency (seconds)",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
         )
 
         self.gauge_active_memory_objs_count = self._gauge_cls(
@@ -1732,6 +1878,21 @@ class PrometheusLogger:
         self._log_gauge(self.gauge_remote_cache_usage, stats.remote_cache_usage_bytes)
 
         self._log_gauge(self.gauge_local_storage_usage, stats.local_storage_usage_bytes)
+        self._log_gauge(
+            self.gauge_raw_time_to_retrieve_count, stats.raw_time_to_retrieve_count
+        )
+        self._log_gauge(
+            self.gauge_raw_time_to_retrieve_mean, stats.raw_time_to_retrieve_mean
+        )
+        self._log_gauge(
+            self.gauge_raw_time_to_retrieve_p90, stats.raw_time_to_retrieve_p90
+        )
+        self._log_gauge(
+            self.gauge_raw_time_to_retrieve_p95, stats.raw_time_to_retrieve_p95
+        )
+        self._log_gauge(
+            self.gauge_raw_time_to_retrieve_p99, stats.raw_time_to_retrieve_p99
+        )
 
         self._log_histogram(self.histogram_time_to_retrieve, stats.time_to_retrieve)
 
@@ -1898,7 +2059,7 @@ class LMCacheStatsLogger:
     ):
         self.metadata = metadata
         self.log_interval = log_interval
-        self.monitor = LMCStatsMonitor.GetOrCreate()
+        self.monitor = LMCStatsMonitor.GetOrCreate(config=config)
         self.prometheus_logger = PrometheusLogger.GetOrCreate(metadata, config=config)
         self.lmc_usage_logger = ContinuousUsageContext.GetOrCreate(metadata)
         self.is_running = True

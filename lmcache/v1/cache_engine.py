@@ -201,7 +201,7 @@ class LMCacheEngine:
         )
 
         InitializeUsageContext(config, metadata)
-        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate(config=config)
         # Initialize PinMonitor singleton with config
         PinMonitor.GetOrCreate(config)
 

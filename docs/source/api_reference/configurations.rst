@@ -402,6 +402,19 @@ The value must be a list of numeric boundaries (floats or ints).
    * - ``request_cache_lifespan``
      - Request cache lifespan (minutes)
 
+Raw Retrieve Latency Recording
+------------------------------
+
+For benchmark runs, you can store every ``time_to_retrieve`` sample in-memory
+using a compact ``array('d')`` buffer (8 bytes per sample):
+
+.. code-block:: yaml
+
+    extra_config:
+      record_raw_time_to_retrieve: true
+
+This option defaults to ``true``.
+
 Internal API Server Configurations
 ----------------------------------
 
