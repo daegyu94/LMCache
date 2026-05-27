@@ -55,7 +55,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (  # noqa: E402
 SIZE_RE = re.compile(r"^\s*(\d+)\s*([KMGT]i?B?|B)?\s*$", re.IGNORECASE)
 VALID_WINDOW_POLICIES = ("equal", "explicit")
 VALID_STOP_POLICIES = ("timeout", "total_written_size", "iterations")
-VALID_RUH_ASSIGNMENTS = ("mixed", "per_app")
+VALID_RUH_ASSIGNMENTS = ("mixed", "per_app", "per_app_rr")
 VALID_PLACEMENTS = ("fixed", "random")
 VALID_WORKLOAD_KEYS = ("storage_class", "dataset_adapter", "trace_name")
 VALID_LAUNCH_POLICIES = ("simultaneous", "random_jitter")
@@ -356,12 +356,14 @@ def assigned_data_ruhs(
         return []
     if assignment == "mixed":
         return [policy.data_ruhs[window_index % len(policy.data_ruhs)]]
-    if assignment != "per_app":
+    if assignment not in ["per_app", "per_app_rr"]:
         raise ValueError(f"unknown RUH assignment: {assignment}")
     if workload_key not in app_to_ruhs:
         keys = sorted(app_to_ruhs)
         assigned = policy.data_ruhs[len(keys) % len(policy.data_ruhs)]
         app_to_ruhs[workload_key] = [assigned]
+    if assignment == "per_app_rr":
+        return [list(app_to_ruhs[workload_key])[window_index % len(list(app_to_ruhs[workload_key]))]]
     return list(app_to_ruhs[workload_key])
 
 
