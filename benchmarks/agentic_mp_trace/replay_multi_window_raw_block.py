@@ -1791,11 +1791,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-store-workers", type=int, default=2)
     parser.add_argument("--num-load-workers", type=int, default=4)
     parser.add_argument("--num-lookup-workers", type=int, default=1)
-    parser.add_argument(
-        "--io-submit-policy",
-        choices=("per_window", "global_limited"),
-        default="per_window",
-    )
     parser.add_argument("--max-active-windows", type=int, default=None)
     parser.add_argument(
         "--gpu-io-mode",
@@ -1828,8 +1823,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.target_host_write_bytes is not None:
         args.target_host_write_bytes = int(parse_size(args.target_host_write_bytes))
     if args.max_active_windows is None:
-        args.max_active_windows = args.num_windows
-    if args.io_submit_policy == "per_window":
         args.max_active_windows = args.num_windows
     if args.max_active_windows <= 0:
         parser.error("--max-active-windows must be positive")
