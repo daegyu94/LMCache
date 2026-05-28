@@ -1228,6 +1228,58 @@ class RawBlockCore:
             return False
         return 0 < size <= (self.slot_bytes - self.header_bytes)
 
+    def _decode_checkpoint_entry(
+        self,
+        encoded_key: str,
+        entry: dict[str, Any],
+    ) -> _Entry | None:
+        """Decode one recovered checkpoint entry into an index entry.
+
+        Args:
+            encoded_key: Encoded raw-block key for the checkpoint entry.
+            entry: Raw checkpoint entry dictionary.
+
+        Returns:
+            A decoded index entry, or None when the entry references an
+            invalid slot or payload size.
+
+        Raises:
+            Exception: If the entry cannot be parsed into metadata.
+        """
+        offset = int(entry.get("offset", 0))
+        size = int(entry.get("size", 0))
+        if not self._is_valid_checkpoint_entry(offset, size):
+            return None
+
+        shape_list = entry.get("shape")
+        fmt_name = entry.get("fmt")
+        cached_positions_list = entry.get("cached_positions")
+        dtype_name = entry.get("dtype")
+
+        shape = torch.Size(list(shape_list)) if shape_list is not None else None
+        fmt = (
+            MemoryFormat[fmt_name]
+            if isinstance(fmt_name, str) and fmt_name in MemoryFormat.__members__
+            else MemoryFormat.UNDEFINED
+        )
+        cached_positions = (
+            torch.tensor(cached_positions_list, dtype=torch.long)
+            if cached_positions_list is not None
+            else None
+        )
+        dtype = self._recover_checkpoint_dtype(encoded_key, dtype_name)
+
+        meta = DiskCacheMetadata(
+            path=f"{self.device_path}@{offset}",
+            size=size,
+            shape=shape,
+            dtype=dtype,
+            cached_positions=cached_positions,
+            fmt=fmt,
+            pin_count=0,
+        )
+        return _Entry(offset=offset, size=size, meta=meta)
+
     def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Apply decoded checkpoint state after validating layout fields."""
         if not isinstance(data, dict):
@@ -1304,48 +1356,21 @@ class RawBlockCore:
                 for encoded_key, entry in entries.items():
                     if not isinstance(entry, dict):
                         continue
-
-                    offset = int(entry.get("offset", 0))
-                    size = int(entry.get("size", 0))
-                    shape_list = entry.get("shape")
-                    fmt_name = entry.get("fmt")
-                    cached_positions_list = entry.get("cached_positions")
-                    dtype_name = entry.get("dtype")
-
-                    if not self._is_valid_checkpoint_entry(offset, size):
+                    try:
+                        decoded_entry = self._decode_checkpoint_entry(
+                            str(encoded_key),
+                            entry,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "RawBlockCore skipping invalid checkpoint entry %r: %s",
+                            encoded_key,
+                            e,
+                        )
                         continue
-
-                    shape = (
-                        torch.Size(list(shape_list)) if shape_list is not None else None
-                    )
-                    fmt = (
-                        MemoryFormat[fmt_name]
-                        if isinstance(fmt_name, str)
-                        and fmt_name in MemoryFormat.__members__
-                        else MemoryFormat.UNDEFINED
-                    )
-                    cached_positions = (
-                        torch.tensor(cached_positions_list, dtype=torch.long)
-                        if cached_positions_list is not None
-                        else None
-                    )
-                    dtype = self._recover_checkpoint_dtype(
-                        str(encoded_key),
-                        dtype_name,
-                    )
-
-                    meta = DiskCacheMetadata(
-                        path=f"{self.device_path}@{offset}",
-                        size=size,
-                        shape=shape,
-                        dtype=dtype,
-                        cached_positions=cached_positions,
-                        fmt=fmt,
-                        pin_count=0,
-                    )
-                    self._index[encoded_key] = _Entry(
-                        offset=offset, size=size, meta=meta
-                    )
+                    if decoded_entry is None:
+                        continue
+                    self._index[encoded_key] = decoded_entry
 
             used_slots = {
                 self._offset_to_slot(int(entry.offset))

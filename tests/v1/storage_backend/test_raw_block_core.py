@@ -123,3 +123,76 @@ def test_raw_block_core_recovers_checkpoint_from_temp_file(tmp_path):
         assert memory_obj_bytes(loaded) == payload
     finally:
         recovered.close()
+
+
+def test_raw_block_core_apply_loaded_state_skips_invalid_entry(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+
+    seed_core = RawBlockCore(config, key_namespace="object")
+    try:
+        valid_spec = encode_object_key(make_object_key(41))
+        payload = b"checkpoint-survivor"
+        put_result = seed_core.put_many([valid_spec], [make_memory_obj(payload)])
+        assert put_result.results == [True]
+
+        valid_offset = seed_core.entry_offset(valid_spec.encoded)
+        assert valid_offset is not None
+    finally:
+        seed_core.close()
+
+    recovered = RawBlockCore(config, key_namespace="object")
+    try:
+        checkpoint_state = {
+            "version": 1,
+            "device_path": str(path),
+            "capacity_bytes": config.capacity_bytes,
+            "block_align": config.block_align,
+            "header_bytes": config.header_bytes,
+            "slot_bytes": config.slot_bytes,
+            "meta_total_bytes": config.meta_total_bytes,
+            "meta_magic": config.meta_magic.decode("ascii"),
+            "meta_version": config.meta_version,
+            "data_base_offset": config.meta_total_bytes,
+            "next_slot": 2,
+            "free_slots": [],
+            "entries": {
+                valid_spec.encoded: {
+                    "offset": valid_offset,
+                    "size": len(payload),
+                    "shape": [len(payload)],
+                    "dtype": "uint8",
+                    "fmt": "BINARY",
+                    "cached_positions": None,
+                },
+                "bad-offset-entry": {
+                    # Invalid offset: int("not-an-int") raises ValueError.
+                    "offset": "not-an-int",
+                    "size": 8,
+                    "shape": [8],
+                    "dtype": "uint8",
+                    "fmt": "BINARY",
+                    "cached_positions": None,
+                },
+                "bad-shape-entry": {
+                    "offset": valid_offset + config.slot_bytes,
+                    "size": 8,
+                    # Invalid shape: object() is not iterable, so TypeError is raised.
+                    "shape": object(),
+                    "dtype": "uint8",
+                    "fmt": "BINARY",
+                    "cached_positions": None,
+                },
+            },
+        }
+
+        assert recovered.apply_loaded_state(checkpoint_state) is True
+        assert recovered.contains_key(valid_spec.encoded) is True
+        assert recovered.contains_key("bad-offset-entry") is False
+        assert recovered.contains_key("bad-shape-entry") is False
+
+        loaded = make_empty_memory_obj(len(payload))
+        assert recovered.load_many_into([valid_spec.encoded], [loaded]) == [True]
+        assert memory_obj_bytes(loaded) == payload
+    finally:
+        recovered.close()
