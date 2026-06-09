@@ -40,6 +40,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.mp_observability.trace.decorator import (
     enable_tracing,
     is_tracing_enabled,
@@ -50,6 +51,11 @@ logger = init_logger(__name__)
 
 
 class StorageManager:
+    # Singleton dispatch for L2 storage gauges: tests may construct multiple
+    # managers, but the OTel SDK only honors the first gauge registration.
+    _gauges_registered: bool = False
+    _gauge_target: "StorageManager | None" = None
+
     def __init__(self, config: StorageManagerConfig):
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
@@ -76,6 +82,20 @@ class StorageManager:
                     l1_manager=self._l1_manager,
                 )
             self._l2_adapters.append(adapter)
+
+        StorageManager._gauge_target = self
+        if not StorageManager._gauges_registered:
+            StorageManager._gauges_registered = True
+            register_gauge(
+                "lmcache.storage_manager",
+                "lmcache_mp.l2_storage_usage_bytes",
+                "Bytes currently held in L2 storage across all adapters",
+                lambda: (
+                    StorageManager._gauge_target.get_l2_storage_usage_bytes()
+                    if StorageManager._gauge_target is not None
+                    else 0
+                ),
+            )
 
         # Per-cache_salt quota registry. Shared across the L2 eviction
         # controller (reads quotas each cycle) and the HTTP quota
@@ -583,6 +603,13 @@ class StorageManager:
             for salt, used in snap.items():
                 totals[salt] = totals.get(salt, 0) + used
         return totals
+
+    def get_l2_storage_usage_bytes(self) -> int:
+        """Aggregate byte usage across every L2 adapter."""
+        total = 0
+        for adapter in self._l2_adapters:
+            total += adapter.get_usage().total_bytes_used
+        return total
 
     def clear(self, force: bool = False):
         """
