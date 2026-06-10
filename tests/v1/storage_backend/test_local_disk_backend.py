@@ -56,14 +56,17 @@ def create_test_config(
     return config
 
 
-def create_test_metadata():
+def create_test_metadata(
+    local_worker_id: int = 0,
+    local_world_size: int = 1,
+):
     """Create a test metadata for LMCacheMetadata."""
     return LMCacheMetadata(
         model_name="test_model",
         world_size=1,
-        local_world_size=1,
+        local_world_size=local_world_size,
         worker_id=0,
-        local_worker_id=0,
+        local_worker_id=local_worker_id,
         kv_dtype=torch.bfloat16,
         kv_shape=(28, 2, 256, 8, 128),
     )
@@ -118,6 +121,7 @@ def local_disk_backend(temp_disk_path, async_loop, local_cpu_backend):
         loop=async_loop,
         local_cpu_backend=local_cpu_backend,
         dst_device="cuda:0",
+        metadata=create_test_metadata(),
     )
 
 
@@ -132,11 +136,13 @@ class TestLocalDiskBackend:
             loop=async_loop,
             local_cpu_backend=local_cpu_backend,
             dst_device="cuda:0",
+            metadata=create_test_metadata(),
         )
 
         assert backend.dst_device == "cuda:0"
         assert backend.local_cpu_backend == local_cpu_backend
         assert backend.path == temp_disk_path
+        assert backend.assigned_paths == [temp_disk_path]
         assert os.path.exists(temp_disk_path)
         assert backend.lmcache_worker is None
         assert backend.instance_id == "test_instance"
@@ -158,6 +164,7 @@ class TestLocalDiskBackend:
             local_cpu_backend=local_cpu_backend,
             dst_device="cuda:0",
             lmcache_worker=lmcache_worker,
+            metadata=create_test_metadata(),
         )
 
         assert backend.lmcache_worker == lmcache_worker
@@ -201,7 +208,7 @@ class TestMultiPathDiskBackend:
     """Test cases for multi-path (multi-device) LocalDiskBackend."""
 
     def test_init_multi_path(self, async_loop, local_cpu_backend):
-        """Test initialisation with comma-separated paths."""
+        """Test initialisation with comma-separated paths (by_gpu default)."""
         dir_a = tempfile.mkdtemp()
         dir_b = tempfile.mkdtemp()
         try:
@@ -212,6 +219,7 @@ class TestMultiPathDiskBackend:
                 loop=async_loop,
                 local_cpu_backend=local_cpu_backend,
                 dst_device="cuda:0",
+                metadata=create_test_metadata(),
             )
 
             # Path selected by device_id (0 % 2 = 0 -> dir_a)
@@ -227,7 +235,7 @@ class TestMultiPathDiskBackend:
             local_cpu_backend.memory_allocator.close()
 
     def test_gpu_affinity_selects_path(self, async_loop, local_cpu_backend):
-        """Different cuda devices select different paths via modulo."""
+        """Different cuda devices select different paths via modulo (by_gpu)."""
         dir_a = tempfile.mkdtemp()
         dir_b = tempfile.mkdtemp()
         try:
@@ -241,6 +249,7 @@ class TestMultiPathDiskBackend:
                     loop=async_loop,
                     local_cpu_backend=local_cpu_backend,
                     dst_device=device,
+                    metadata=create_test_metadata(),
                 )
                 dirs_by_gpu[device] = backend.path
 
@@ -252,7 +261,7 @@ class TestMultiPathDiskBackend:
             local_cpu_backend.memory_allocator.close()
 
     def test_all_directories_created(self, async_loop, local_cpu_backend):
-        """All paths in the list get their directories created."""
+        """All paths in the list get their directories created (by_gpu)."""
         base = tempfile.mkdtemp()
         try:
             paths = [os.path.join(base, f"nvme{i}") for i in range(3)]
@@ -263,11 +272,72 @@ class TestMultiPathDiskBackend:
                 loop=async_loop,
                 local_cpu_backend=local_cpu_backend,
                 dst_device="cuda:0",
+                metadata=create_test_metadata(),
             )
             for p in paths:
                 assert os.path.isdir(p), f"{p} should exist"
         finally:
             shutil.rmtree(base, ignore_errors=True)
+            local_cpu_backend.memory_allocator.close()
+
+    def test_local_rank_selects_path(self, async_loop, local_cpu_backend):
+        """Different local ranks select different paths when GPU == SSD."""
+        dir_a = tempfile.mkdtemp()
+        dir_b = tempfile.mkdtemp()
+        try:
+            combined = f"{dir_a},{dir_b}"
+            config = create_test_config(
+                combined,
+                local_disk_path_sharding="by_local_rank",
+            )
+
+            dirs_by_rank = {}
+            for local_rank, device in enumerate(("cuda:0", "cuda:1")):
+                backend = LocalDiskBackend(
+                    config=config,
+                    loop=async_loop,
+                    local_cpu_backend=local_cpu_backend,
+                    dst_device=device,
+                    metadata=create_test_metadata(
+                        local_worker_id=local_rank,
+                        local_world_size=2,
+                    ),
+                )
+                dirs_by_rank[local_rank] = backend.path
+
+            assert dirs_by_rank[0] == dir_a
+            assert dirs_by_rank[1] == dir_b
+        finally:
+            shutil.rmtree(dir_a, ignore_errors=True)
+            shutil.rmtree(dir_b, ignore_errors=True)
+            local_cpu_backend.memory_allocator.close()
+
+    def test_by_local_rank_rejects_non_multiple_workers_to_paths(
+        self, async_loop, local_cpu_backend
+    ):
+        dir_a = tempfile.mkdtemp()
+        dir_b = tempfile.mkdtemp()
+        try:
+            combined = f"{dir_a},{dir_b}"
+            config = create_test_config(
+                combined,
+                local_disk_path_sharding="by_local_rank",
+            )
+
+            with pytest.raises(ValueError, match="equal or exact multiples"):
+                LocalDiskBackend(
+                    config=config,
+                    loop=async_loop,
+                    local_cpu_backend=local_cpu_backend,
+                    dst_device="cuda:0",
+                    metadata=create_test_metadata(
+                        local_worker_id=0,
+                        local_world_size=3,
+                    ),
+                )
+        finally:
+            shutil.rmtree(dir_a, ignore_errors=True)
+            shutil.rmtree(dir_b, ignore_errors=True)
             local_cpu_backend.memory_allocator.close()
 
     def test_single_path_backward_compat(
@@ -280,26 +350,44 @@ class TestMultiPathDiskBackend:
             loop=async_loop,
             local_cpu_backend=local_cpu_backend,
             dst_device="cuda:0",
+            metadata=create_test_metadata(),
         )
         assert backend.path == temp_disk_path
         local_cpu_backend.memory_allocator.close()
 
     def test_path_sharding_default(self, temp_disk_path, async_loop, local_cpu_backend):
-        """Default local_disk_path_sharding is 'by_gpu' (backend inits OK)."""
+        """Default local_disk_path_sharding is 'by_gpu'."""
         config = create_test_config(temp_disk_path)
         backend = LocalDiskBackend(
             config=config,
             loop=async_loop,
             local_cpu_backend=local_cpu_backend,
             dst_device="cuda:0",
+            metadata=create_test_metadata(),
         )
         assert backend.path == temp_disk_path
+        local_cpu_backend.memory_allocator.close()
+
+    def test_by_local_rank_requires_metadata(
+        self, temp_disk_path, async_loop, local_cpu_backend
+    ):
+        config = create_test_config(
+            temp_disk_path,
+            local_disk_path_sharding="by_local_rank",
+        )
+        with pytest.raises(ValueError, match="requires metadata"):
+            LocalDiskBackend(
+                config=config,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cuda:0",
+            )
         local_cpu_backend.memory_allocator.close()
 
     def test_path_sharding_explicit_by_gpu(
         self, temp_disk_path, async_loop, local_cpu_backend
     ):
-        """Explicitly setting local_disk_path_sharding='by_gpu' works."""
+        """Explicit 'by_gpu' keeps device-id-based single-path mapping."""
         config = create_test_config(temp_disk_path, local_disk_path_sharding="by_gpu")
         backend = LocalDiskBackend(
             config=config,
@@ -325,8 +413,10 @@ class TestMultiPathDiskBackend:
                 dst_device="cuda:0",
             )
 
-    def test_cpu_dst_device_defaults_to_first_path(self, async_loop, local_cpu_backend):
-        """dst_device='cpu' should fall back to device_id=0."""
+    def test_by_gpu_cpu_dst_device_defaults_to_first_path(
+        self, async_loop, local_cpu_backend
+    ):
+        """by_gpu with dst_device='cpu' falls back to device_id=0."""
         dir_a = tempfile.mkdtemp()
         dir_b = tempfile.mkdtemp()
         try:
@@ -343,6 +433,35 @@ class TestMultiPathDiskBackend:
         finally:
             shutil.rmtree(dir_a, ignore_errors=True)
             shutil.rmtree(dir_b, ignore_errors=True)
+            local_cpu_backend.memory_allocator.close()
+
+    def test_subset_mode_distributes_keys_within_assigned_paths(
+        self, async_loop, local_cpu_backend
+    ):
+        dirs = [tempfile.mkdtemp() for _ in range(4)]
+        try:
+            config = create_test_config(
+                ",".join(dirs),
+                local_disk_path_sharding="by_local_rank",
+            )
+            backend = LocalDiskBackend(
+                config=config,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cuda:1",
+                metadata=create_test_metadata(local_worker_id=1, local_world_size=2),
+            )
+
+            assert backend.assigned_paths == dirs[2:]
+
+            resolved_paths = {
+                backend.path_sharder.resolve_path_for_key(create_test_key(i))
+                for i in range(128)
+            }
+            assert resolved_paths == set(dirs[2:])
+        finally:
+            for directory in dirs:
+                shutil.rmtree(directory, ignore_errors=True)
             local_cpu_backend.memory_allocator.close()
 
 

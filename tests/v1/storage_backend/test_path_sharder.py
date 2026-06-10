@@ -9,8 +9,10 @@ import tempfile
 
 # Third Party
 import pytest
+import torch
 
 # First Party
+from lmcache.utils import CacheEngineKey
 from lmcache.v1.storage_backend.path_sharder import PathSharder
 
 
@@ -207,3 +209,207 @@ class TestPathSharder:
         finally:
             for d in dirs:
                 shutil.rmtree(d, ignore_errors=True)
+
+    # -- by_local_rank tests -----------------------------------------------
+
+    def test_by_local_rank_rejects_missing_rank_metadata(self):
+        d = tempfile.mkdtemp()
+        try:
+            with pytest.raises(ValueError, match="requires local_rank"):
+                PathSharder(d, strategy="by_local_rank", dst_device="cuda:0")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_maps_one_to_one_when_gpu_equals_ssd(self):
+        dirs = [tempfile.mkdtemp() for _ in range(3)]
+        try:
+            csv = ",".join(dirs)
+            for rank, directory in enumerate(dirs):
+                s = PathSharder(
+                    csv,
+                    strategy="by_local_rank",
+                    dst_device=f"cuda:{rank}",
+                    local_rank=rank,
+                    local_world_size=3,
+                )
+                assert s.selected == directory
+                assert s.assigned_paths == [directory]
+                assert s.mode == "single_path"
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_modulo_when_gpu_exceeds_ssd(self):
+        dirs = [tempfile.mkdtemp() for _ in range(2)]
+        try:
+            csv = ",".join(dirs)
+            s = PathSharder(
+                csv,
+                strategy="by_local_rank",
+                dst_device="cuda:4",
+                local_rank=2,
+                local_world_size=4,
+            )
+            assert s.selected == dirs[0]
+            assert s.assigned_paths == [dirs[0]]
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_more_workers_than_paths_requires_divisibility(self):
+        dirs = [tempfile.mkdtemp() for _ in range(2)]
+        try:
+            csv = ",".join(dirs)
+            with pytest.raises(ValueError, match="equal or exact multiples"):
+                PathSharder(
+                    csv,
+                    strategy="by_local_rank",
+                    dst_device="cuda:0",
+                    local_rank=0,
+                    local_world_size=3,
+                )
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_rejects_non_positive_world_size(self):
+        d = tempfile.mkdtemp()
+        try:
+            with pytest.raises(ValueError, match="local_world_size to be positive"):
+                PathSharder(
+                    d,
+                    strategy="by_local_rank",
+                    dst_device="cuda:0",
+                    local_rank=0,
+                    local_world_size=0,
+                )
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_rejects_out_of_range_rank(self):
+        d = tempfile.mkdtemp()
+        try:
+            with pytest.raises(ValueError, match="local_rank to be in the range"):
+                PathSharder(
+                    d,
+                    strategy="by_local_rank",
+                    dst_device="cuda:0",
+                    local_rank=2,
+                    local_world_size=2,
+                )
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_rejects_negative_rank(self):
+        d = tempfile.mkdtemp()
+        try:
+            with pytest.raises(ValueError, match="local_rank to be in the range"):
+                PathSharder(
+                    d,
+                    strategy="by_local_rank",
+                    dst_device="cuda:0",
+                    local_rank=-1,
+                    local_world_size=2,
+                )
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_assigns_subset_when_ssd_exceeds_gpu(self):
+        dirs = [tempfile.mkdtemp() for _ in range(4)]
+        try:
+            csv = ",".join(dirs)
+            s = PathSharder(
+                csv,
+                strategy="by_local_rank",
+                dst_device="cuda:1",
+                local_rank=1,
+                local_world_size=2,
+            )
+            assert s.selected == dirs[2]
+            assert s.assigned_paths == dirs[2:]
+            assert s.mode == "subset"
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_non_divisible_ssd_raises(self):
+        dirs = [tempfile.mkdtemp() for _ in range(3)]
+        try:
+            csv = ",".join(dirs)
+            with pytest.raises(ValueError, match="equal or exact multiples"):
+                PathSharder(
+                    csv,
+                    strategy="by_local_rank",
+                    dst_device="cuda:0",
+                    local_rank=0,
+                    local_world_size=2,
+                )
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_subset_path_resolution_is_deterministic(self):
+        dirs = [tempfile.mkdtemp() for _ in range(4)]
+        try:
+            csv = ",".join(dirs)
+            s = PathSharder(
+                csv,
+                strategy="by_local_rank",
+                dst_device="cuda:0",
+                local_rank=0,
+                local_world_size=2,
+            )
+            key = _create_test_key(11)
+
+            first = s.resolve_path_for_key(key)
+            second = s.resolve_path_for_key(key)
+
+            assert first == second
+            assert first in s.assigned_paths
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_local_rank_path_selection_does_not_depend_on_dst_device(self):
+        """by_local_rank uses explicit local_rank/local_world_size inputs."""
+        dirs = [tempfile.mkdtemp() for _ in range(3)]
+        try:
+            csv = ",".join(dirs)
+            s = PathSharder(
+                csv,
+                strategy="by_local_rank",
+                dst_device="cuda",
+                local_rank=1,
+                local_world_size=3,
+            )
+            assert s.selected == dirs[1]
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_cpu_device_can_still_use_explicit_local_rank(self):
+        """CPU dst_device is fine when rank metadata is provided explicitly."""
+        dirs = [tempfile.mkdtemp() for _ in range(3)]
+        try:
+            csv = ",".join(dirs)
+            s = PathSharder(
+                csv,
+                strategy="by_local_rank",
+                dst_device="cpu",
+                local_rank=2,
+                local_world_size=3,
+            )
+            assert s.selected == dirs[2]
+        finally:
+            for d in dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+def _create_test_key(key_id: int) -> CacheEngineKey:
+    return CacheEngineKey(
+        model_name="test_model",
+        world_size=2,
+        worker_id=0,
+        chunk_hash=key_id,
+        dtype=torch.bfloat16,
+    )

@@ -121,29 +121,59 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock = threading.Lock()
 
         assert config.local_disk is not None
+        local_rank: int | None = None
+        local_world_size: int | None = None
+        if config.local_disk_path_sharding == "by_local_rank":
+            # Check here (rather than delegating to PathSharder) to surface a
+            # more actionable error message that names the missing config field.
+            if metadata is None:
+                raise ValueError(
+                    "local_disk_path_sharding='by_local_rank' requires metadata "
+                    "with local_worker_id and local_world_size"
+                )
+            local_rank = metadata.local_worker_id
+            local_world_size = metadata.local_world_size
 
         sharder = PathSharder(
             raw_csv=config.local_disk,
             strategy=config.local_disk_path_sharding,
             dst_device=dst_device,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
             create_dirs=True,
         )
+        self.path_sharder = sharder
+        self.assigned_paths: list[str] = sharder.assigned_paths
         self.path: str = sharder.selected
+        self.path_block_sizes = {
+            path: os.statvfs(path).f_bsize for path in self.assigned_paths
+        }
 
-        logger.info(
-            "Local disk cache path: %s (device %s, %d path(s) configured)",
-            self.path,
-            dst_device,
-            len(sharder.all_paths),
-        )
+        if sharder.strategy == "by_gpu":
+            logger.info(
+                "Local disk cache strategy=by_gpu device=%s "
+                "configured_paths=%d selected_path=%s",
+                dst_device,
+                len(sharder.all_paths),
+                self.path,
+            )
+        else:
+            logger.info(
+                "Local disk cache strategy=by_local_rank rank=%d/%d mode=%s "
+                "configured_paths=%d assigned_paths=%s",
+                sharder.local_rank,
+                sharder.local_world_size,
+                sharder.mode,
+                len(sharder.all_paths),
+                self.assigned_paths,
+            )
 
         self.loop = loop
 
         self.use_local_cpu = config.local_cpu
 
         # Block size (for file system I/O)
-        stat = os.statvfs(self.path)
-        self.os_disk_bs = stat.f_bsize
+        self.os_disk_bs = self.path_block_sizes[self.path]
         self.use_odirect = False
 
         if config.extra_config is not None:
@@ -188,7 +218,14 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> str:
-        return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
+        base_path = self.path_sharder.resolve_path_for_key(key)
+        return os.path.join(base_path, key.to_string().replace("/", "-") + ".pt")
+
+    def _get_disk_block_size(self, path: str) -> int:
+        # path is always produced by _key_to_path(), which places files
+        # directly under the mount point with no subdirectories.
+        root_path = os.path.dirname(path)
+        return self.path_block_sizes.get(root_path, self.os_disk_bs)
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -622,7 +659,8 @@ class LocalDiskBackend(StorageBackendInterface):
     def write_file(self, buffer, path):
         start_time = time.time()
         size = len(buffer)
-        if size % self.os_disk_bs != 0 or not self.use_odirect:
+        disk_block_size = self._get_disk_block_size(path)
+        if size % disk_block_size != 0 or not self.use_odirect:
             with open(path, "wb") as f:
                 f.write(buffer)
         else:
@@ -639,7 +677,8 @@ class LocalDiskBackend(StorageBackendInterface):
     def read_file(self, key, buffer, path):
         start_time = time.time()
         size = len(buffer)
-        fblock_aligned = size % self.os_disk_bs == 0
+        disk_block_size = self._get_disk_block_size(path)
+        fblock_aligned = size % disk_block_size == 0
         if not fblock_aligned and self.use_odirect:
             logger.warning(
                 "Cannot use O_DIRECT for this file, "

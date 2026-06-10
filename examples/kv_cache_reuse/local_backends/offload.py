@@ -14,7 +14,12 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
 
-def setup_environment_variables(vllm_version: str, use_disk: bool = False):
+def setup_environment_variables(
+    vllm_version: str,
+    use_disk: bool = False,
+    disk_paths: list[str] | None = None,
+    path_sharding: str = "by_gpu",
+):
     # LMCache-related environment variables
 
     # LMCache is set to use 256 tokens per chunk
@@ -27,8 +32,14 @@ def setup_environment_variables(vllm_version: str, use_disk: bool = False):
         # Set the maximum size of the local CPU buffer size to 5GB
         os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
-        # Enable local disk backend in LMCache
-        os.environ["LMCACHE_LOCAL_DISK"] = "file://local_disk/"
+        if disk_paths:
+            # Enable multi-path disk backend: comma-separated list of paths,
+            # one per SSD device (e.g. /mnt/disk0,/mnt/disk1).
+            os.environ["LMCACHE_LOCAL_DISK"] = ",".join(disk_paths)
+            os.environ["LMCACHE_LOCAL_DISK_PATH_SHARDING"] = path_sharding
+        else:
+            # Enable local disk backend in LMCache
+            os.environ["LMCACHE_LOCAL_DISK"] = "file://local_disk/"
 
         # Set the maximum size of the local disk size to 10GB
         os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "10"
@@ -44,7 +55,12 @@ def setup_environment_variables(vllm_version: str, use_disk: bool = False):
 
 
 @contextlib.contextmanager
-def build_llm_with_lmcache(lmcache_connector: str, model: str, vllm_version: str):
+def build_llm_with_lmcache(
+    lmcache_connector: str,
+    model: str,
+    vllm_version: str,
+    tensor_parallel_size: int = 1,
+):
     ktc = KVTransferConfig(
         kv_connector=lmcache_connector,
         kv_role="kv_both",
@@ -63,6 +79,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str, vllm_version: str
         "kv_transfer_config": ktc,
         "max_model_len": 8000,
         "gpu_memory_utilization": 0.8,
+        "tensor_parallel_size": tensor_parallel_size,
     }
     if vllm_version == "v0":
         llm_kwargs["enable_chunked_prefill"] = True  # Only in v0
@@ -111,6 +128,33 @@ def parse_args():
         action="store_true",
         help="Specify whether to use disk as backend (default: False)",
     )
+    parser.add_argument(
+        "--multi-disk",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Use multiple NVMe paths for disk offloading "
+            "(e.g. --multi-disk /mnt/nvme0 /mnt/nvme1). "
+            "Implies --use-disk."
+        ),
+    )
+    parser.add_argument(
+        "--path-sharding",
+        choices=["by_gpu", "by_local_rank"],
+        default="by_gpu",
+        help="Path sharding strategy when --multi-disk is set (default: by_gpu)",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help=(
+            "Tensor parallel size (default: 1). "
+            "Multi-disk path sharding is most effective with TP > 1: "
+            "by_gpu assigns one path per GPU device, "
+            "by_local_rank assigns paths by TP rank."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -124,9 +168,17 @@ def main():
         lmcache_connector = "LMCacheConnectorV1"
         model = "mistralai/Mistral-7B-Instruct-v0.2"
 
-    setup_environment_variables(args.version, args.use_disk)
+    use_disk = args.use_disk or bool(args.multi_disk)
+    setup_environment_variables(
+        args.version,
+        use_disk=use_disk,
+        disk_paths=args.multi_disk,
+        path_sharding=args.path_sharding,
+    )
 
-    with build_llm_with_lmcache(lmcache_connector, model, args.version) as llm:
+    with build_llm_with_lmcache(
+        lmcache_connector, model, args.version, args.tensor_parallel_size
+    ) as llm:
         # This example script runs two requests with a shared prefix.
         # Define the shared prompt and specific prompts
         shared_prompt = "Hello, how are you?" * 1000

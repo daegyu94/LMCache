@@ -53,33 +53,73 @@ Passed in through ``LMCACHE_CONFIG_FILE=your-lmcache-config.yaml``
 Multi-Path (Multi-Device) Disk Offloading
 -----------------------------------------
 
-If you have **multiple NVMe devices** (or any independent mount points), you can
-assign each GPU its own disk path so that each device writes to a dedicated drive.
+If you have **multiple NVMe devices** (or any independent mount points), LMCache
+supports two different path-selection policies for the local disk backend.
 
 Specify a **comma-separated list** of paths in ``local_disk``.
 Each path can optionally use the ``file://`` prefix.  The
-``local_disk_path_sharding`` option controls how each GPU worker selects its
-path.  Currently only ``"by_gpu"`` is supported (the default), which selects a
-path based on the device index (``device_id % num_paths``), so all KV cache
-files from a given GPU land on the same NVMe.  This is especially useful when
-GPUs and NVMe devices share a PCIe switch or NUMA node.
+``local_disk_path_sharding`` option controls how each local worker selects its
+path set. The default is ``"by_gpu"``.
 
-For example, with two GPUs and two paths:
+Available policies:
+
+- ``by_gpu`` *(default)*: uses the GPU device id from ``dst_device`` and always
+  selects exactly one path per worker
+- ``by_local_rank``: uses ``LMCacheMetadata.local_worker_id`` and
+  ``local_world_size`` for rank-aware placement within a host
+
+Choosing a policy:
+
+- Use ``by_gpu`` (default) when each GPU maps 1:1 to a dedicated SSD, or when
+  you want the simpler device-id-based behavior.
+- ``by_gpu`` is most effective when ``#GPU == #SSD`` so each GPU maps 1:1 to a
+  dedicated SSD path.
+- If ``#GPU != #SSD``, ``by_gpu`` still works, but it remains a
+  single-path-per-GPU policy and does not turn extra SSDs into a rank-owned
+  subset.
+- Use ``by_local_rank`` when you need TP-rank-aware placement, want
+  ``#GPU < #SSD`` with per-rank SSD subsets, or run TP+DP where ``by_gpu``
+  would assign different paths to the same TP rank across DP replicas and
+  prevent KV cache reuse between them.
+
+``by_gpu`` details:
+
+- path selection is based on the device index:
+  ``selected_path = paths[device_id % num_paths]``
+- all KV cache files from a given GPU land on the same NVMe path
+- this is especially useful when GPUs and NVMe devices share a PCIe switch or
+  NUMA node, and you want to preserve that locality
+
+``by_gpu`` examples:
+
+With two GPUs and two paths:
 
 - ``cuda:0`` → ``/mnt/nvme0/kvcache/``
 - ``cuda:1`` → ``/mnt/nvme1/kvcache/``
 
+With four GPUs and two paths:
+
+- ``cuda:0`` and ``cuda:2`` → ``/mnt/nvme0/kvcache/``
+- ``cuda:1`` and ``cuda:3`` → ``/mnt/nvme1/kvcache/``
+
+With two GPUs and four paths:
+
+- only two paths are used directly, because ``by_gpu`` still chooses one path
+  per GPU worker based on device id
+- if you want each rank to use a two-SSD subset in this topology, use
+  ``by_local_rank`` instead
+
 ``max_local_disk_size`` is the **total budget** shared across all paths.
 
-**Environment variable example:**
+**Environment variable example (`by_gpu`):**
 
 .. code-block:: bash
 
     export LMCACHE_LOCAL_DISK="file:///mnt/nvme0/kvcache/,file:///mnt/nvme1/kvcache/"
     export LMCACHE_LOCAL_DISK_PATH_SHARDING="by_gpu"
-    export LMCACHE_MAX_LOCAL_DISK_SIZE=20.0   # combined budget (GB)
+    export LMCACHE_MAX_LOCAL_DISK_SIZE=20.0
 
-**YAML example:**
+**YAML example (`by_gpu`):**
 
 .. code-block:: yaml
 
@@ -87,11 +127,60 @@ For example, with two GPUs and two paths:
     local_disk_path_sharding: "by_gpu"
     max_local_disk_size: 20.0
 
+Supported ``by_local_rank`` mapping rules:
+
+- ``#GPU == #SSD``: each local rank owns exactly one path
+- ``#GPU > #SSD``: supported only when ``local_world_size % num_paths == 0``;
+  local ranks share paths via ``local_rank % num_paths``
+- ``#GPU < #SSD``: supported only when ``num_paths % local_world_size == 0``;
+  each local rank owns a contiguous subset of paths
+- non-divisible cases in either direction (for example ``3 GPU / 2 SSD`` or
+  ``2 GPU / 3 SSD``): backend initialization fails
+
+When ``by_local_rank`` assigns multiple paths to one rank, each KV chunk is
+still written to exactly one path. LMCache picks that path using
+``chunk_hash % num_assigned_paths``; the same chunk always lands on the same
+path within a session. LMCache does **not** stripe a single chunk file
+across multiple devices.
+
+If backend initialization fails, ``LocalDiskBackend`` is not registered. In
+that state, KV offloading to local disk does not happen.
+
+``by_local_rank`` examples:
+
+With two GPUs and two paths:
+
+- ``local_rank=0`` → ``/mnt/nvme0/kvcache/``
+- ``local_rank=1`` → ``/mnt/nvme1/kvcache/``
+
+With two GPUs and four paths:
+
+- ``local_rank=0`` owns ``/mnt/nvme0/kvcache/`` and ``/mnt/nvme1/kvcache/``
+- ``local_rank=1`` owns ``/mnt/nvme2/kvcache/`` and ``/mnt/nvme3/kvcache/``
+- each chunk for rank 0 or rank 1 lands on exactly one of that rank's two paths
+
+**Environment variable example (`by_local_rank`):**
+
+.. code-block:: bash
+
+    export LMCACHE_LOCAL_DISK="file:///mnt/nvme0/kvcache/,file:///mnt/nvme1/kvcache/"
+    export LMCACHE_LOCAL_DISK_PATH_SHARDING="by_local_rank"
+    export LMCACHE_MAX_LOCAL_DISK_SIZE=20.0
+
+**YAML example (`by_local_rank`):**
+
+.. code-block:: yaml
+
+    local_disk: "/mnt/nvme0/kvcache/,/mnt/nvme1/kvcache/"
+    local_disk_path_sharding: "by_local_rank"
+    max_local_disk_size: 20.0
+
 .. note::
 
-    Each GPU worker uses only its assigned path, so O_DIRECT alignment
-    is determined by that path's filesystem block size.  Different
-    devices may have different block sizes without issue.
+    Each worker uses only its assigned path or assigned subset, and each
+    chunk uses exactly one concrete path, so O_DIRECT alignment is determined
+    by that path's filesystem block size. Different devices may have different
+    block sizes without issue.
 
 .. tip::
 
@@ -99,7 +188,7 @@ For example, with two GPUs and two paths:
     you will get true block-level striping (even a single large file can
     use bandwidth from both devices simultaneously).  The multi-path
     feature is most useful when you cannot or do not want to reconfigure
-    the block devices — for example, when they already have other data.
+    the block devices -- for example, when they already have other data.
 
 Local Storage Explanation:
 --------------------------
