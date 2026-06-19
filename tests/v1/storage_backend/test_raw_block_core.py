@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 # Standard
+from unittest.mock import MagicMock, patch
 import threading
+import types
 
 # Third Party
 import pytest
@@ -219,12 +221,18 @@ def test_raw_block_core_iouring_recovery_does_not_use_posix_threads(monkeypatch)
     core._lock_refcnt = {}
     core._meta_dirty_total = 0
     core.io_engine = "io_uring"
+    core.use_uring_cmd = False
     core._recovery_read_threads = 8
     core.key_namespace = "object"
     core._read_slot_header = lambda offset: (
         specs[(offset // 4096) - 1].slot_identity,
         7,
     )
+    # io_uring dispatch reads headers via the batched path; stub it to the
+    # single-read helper so this test exercises dispatch without real io_uring.
+    core._read_slot_headers_batched = lambda offsets: [
+        core._read_slot_header(off) for off in offsets
+    ]
 
     def fail_thread_pool_executor(*args, **kwargs):
         raise AssertionError("io_uring recovery must not use POSIX read threads")
@@ -237,3 +245,162 @@ def test_raw_block_core_iouring_recovery_does_not_use_posix_threads(monkeypatch)
     core._validate_loaded_entries()
 
     assert list(core._index) == [spec.encoded for spec in specs]
+
+
+
+def _make_mocked_core(tmp_path, monkeypatch):
+    """Build a RawBlockCore whose Rust device is fully mocked.
+
+    Returns (core, mock_dev). The mock_dev is returned by _rawdev() for the
+    duration of the test. No real I/O occurs.
+    """
+    mock_dev = MagicMock()
+    mock_dev.size_bytes.return_value = 128 * 1024 * 1024
+    monkeypatch.setattr(RawBlockCore, "_rawdev", lambda self: mock_dev)
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+    return core, mock_dev
+
+
+def _populate_index(core, n: int) -> None:
+    """Insert n fake entries into core._index with valid slot offsets."""
+    base = core._data_base_offset
+    slot = core.slot_bytes
+    for i in range(n):
+        core._index[f"fake-key-{i}"] = types.SimpleNamespace(
+            offset=base + i * slot,
+            size=64,
+        )
+
+
+def test_read_slot_headers_batched_empty(tmp_path, monkeypatch):
+    core, _ = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        assert core._read_slot_headers_batched([]) == []
+    finally:
+        core.close()
+
+
+def test_read_slot_headers_batched_falls_back_to_per_slot_on_error(
+    tmp_path, monkeypatch
+):
+    # A batched read fails as a whole even if only one slot errored, and it does
+    # not report which. Fall back to per-slot reads so a single bad slot is
+    # isolated (only it returns None) instead of dropping the whole batch.
+    core, mock_dev = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        mock_dev.batched_read.side_effect = RuntimeError("io error")
+        with patch.object(
+            core,
+            "_read_slot_header",
+            side_effect=lambda off: (0xAA, 64) if off == 0 else None,
+        ):
+            result = core._read_slot_headers_batched([0, 4096])
+        assert result == [(0xAA, 64), None]
+    finally:
+        core.close()
+
+
+def test_read_slot_headers_batched_decodes_valid_headers(tmp_path, monkeypatch):
+    core, mock_dev = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        expected = [(0xABCDEF01, 1024), (0x12345678, 2048)]
+
+        def fake_batched_read(offsets, views, total_lens):
+            for view, (identity, payload_len) in zip(views, expected, strict=False):
+                hdr = bytearray(core.header_bytes)
+                hdr[0:8] = b"LMCBLK01"
+                hdr[8:16] = identity.to_bytes(8, "little")
+                hdr[16:24] = payload_len.to_bytes(8, "little")
+                view[:] = hdr
+            return 42
+
+        mock_dev.batched_read.side_effect = fake_batched_read
+        result = core._read_slot_headers_batched([0, 4096])
+        assert result == expected
+        mock_dev.wait_iouring.assert_called_once_with(42)
+    finally:
+        core.close()
+
+
+def test_read_slot_headers_batched_splits_into_queue_depth_batches(
+    tmp_path, monkeypatch
+):
+    # Large recovery must not allocate one buffer for every entry; reads are
+    # split into iouring_queue_depth-sized batches with input order preserved.
+    core, mock_dev = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        core.iouring_queue_depth = 2
+        offsets = [0, 4096, 8192, 12288, 16384]
+        seen_offsets: list[list[int]] = []
+
+        def fake_batched_read(batch_offsets, views, total_lens):
+            seen_offsets.append(list(batch_offsets))
+            for view, off in zip(views, batch_offsets, strict=False):
+                hdr = bytearray(core.header_bytes)
+                hdr[0:8] = b"LMCBLK01"
+                hdr[8:16] = off.to_bytes(8, "little")  # identity == offset
+                hdr[16:24] = (64).to_bytes(8, "little")
+                view[:] = hdr
+            return len(seen_offsets)  # distinct batch_id per call
+
+        mock_dev.batched_read.side_effect = fake_batched_read
+        result = core._read_slot_headers_batched(offsets)
+
+        # split 2 + 2 + 1, each batch sees its own chunk
+        assert seen_offsets == [[0, 4096], [8192, 12288], [16384]]
+        assert mock_dev.batched_read.call_count == 3
+        # order preserved across batches (identity == offset)
+        assert result == [(off, 64) for off in offsets]
+    finally:
+        core.close()
+
+
+def test_validate_loaded_entries_iouring_uses_batched_read(tmp_path, monkeypatch):
+    core, _ = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        _populate_index(core, 3)
+        core.io_engine = "io_uring"
+        core.use_uring_cmd = False
+
+        with patch.object(
+            core, "_read_slot_headers_batched", return_value=[None] * 3
+        ) as mock_batched:
+            core._validate_loaded_entries()
+
+        assert mock_batched.called
+        assert len(mock_batched.call_args[0][0]) == 3
+    finally:
+        core.close()
+
+
+def test_validate_loaded_entries_single_item_skips_batched(tmp_path, monkeypatch):
+    core, _ = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        _populate_index(core, 1)
+        core.io_engine = "io_uring"
+        core.use_uring_cmd = False
+
+        with patch.object(core, "_read_slot_headers_batched") as mock_batched:
+            with patch.object(core, "_read_slot_header", return_value=None):
+                core._validate_loaded_entries()
+        mock_batched.assert_not_called()
+    finally:
+        core.close()
+
+
+def test_validate_loaded_entries_uring_cmd_uses_sequential(tmp_path, monkeypatch):
+    core, _ = _make_mocked_core(tmp_path, monkeypatch)
+    try:
+        _populate_index(core, 3)
+        core.io_engine = "io_uring"
+        core.use_uring_cmd = True
+
+        with patch.object(core, "_read_slot_headers_batched") as mock_batched:
+            with patch.object(core, "_read_slot_header", return_value=None):
+                core._validate_loaded_entries()
+        mock_batched.assert_not_called()
+    finally:
+        core.use_uring_cmd = False
+        core.close()
