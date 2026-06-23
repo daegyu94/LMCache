@@ -568,6 +568,8 @@ class FSL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
     ) -> None:
         success = True
+        stored_keys: list[ObjectKey] = []
+        stored_sizes: list[int] = []
         try:
             for key, obj in zip(keys, objects, strict=True):
                 file_path, tmp_path = self._key_to_file_and_tmp_path(key)
@@ -606,6 +608,8 @@ class FSL2Adapter(L2AdapterInterface):
                             await f.write(buf)
 
                     await aiofiles.os.replace(tmp_path, file_path)
+                    stored_keys.append(key)
+                    stored_sizes.append(size)
                     logger.debug(
                         "FSL2Adapter stored key %s (%d bytes)",
                         file_path.name,
@@ -628,6 +632,8 @@ class FSL2Adapter(L2AdapterInterface):
 
         with self._lock:
             self._completed_store_tasks[task_id] = success
+        if stored_keys:
+            self._notify_keys_stored(stored_keys, stored_sizes)
         self._store_efd.notify()
 
     # ---- lookup ---------------------------------------------------------
