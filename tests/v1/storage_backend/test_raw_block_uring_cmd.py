@@ -6,6 +6,7 @@
 from unittest.mock import MagicMock, patch
 import asyncio
 import os
+import stat
 
 # Third Party
 import pytest
@@ -53,6 +54,11 @@ def _has_ext() -> bool:
         return True
     except Exception:
         return False
+
+
+def _stat_result(mode: int) -> os.stat_result:
+    """Build a minimal stat result for device validation tests."""
+    return os.stat_result((mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
 
 # Skip all tests in this file if the Rust extension is not available
@@ -187,6 +193,55 @@ def test_uring_cmd_requires_character_device(loop_in_thread):
             local_cpu_backend=local_cpu_backend,
             loop=loop_in_thread,
         )
+
+
+def test_uring_cmd_rejects_block_device_without_opening_real_device(loop_in_thread):
+    """Test block-device rejection without opening a real device node."""
+    config = MockConfig(device_path=TEST_DEVICES["block_device"], use_uring_cmd=True)
+    metadata = MockMetadata(worker_id=0, world_size=1)
+    local_cpu_backend = MockLocalCPUBackend()
+
+    with (
+        patch("os.stat", return_value=_stat_result(stat.S_IFBLK)) as mock_stat,
+        pytest.raises(
+            ValueError,
+            match="use_uring_cmd requires an NVMe namespace character device",
+        ),
+    ):
+        RustRawBlockBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu_backend,
+            loop=loop_in_thread,
+        )
+
+    mock_stat.assert_called_once_with(TEST_DEVICES["block_device"])
+
+
+def test_uring_cmd_transfer_limit_uses_sysfs_without_opening_real_device():
+    """Test auto transfer-limit discovery without opening a real NVMe device."""
+    expected_path = (
+        f"{_get_sysfs_path(TEST_DEVICES['char_device'])}/queue/max_hw_sectors_kb"
+    )
+
+    with (
+        patch("os.stat", return_value=_stat_result(stat.S_IFCHR)) as mock_stat,
+        patch(
+            "lmcache.v1.storage_backend.raw_block.core._read_sysfs_int",
+            return_value=1024,
+        ) as mock_read,
+        patch.object(RawBlockCore, "_rawdev", return_value=MagicMock()) as mock_rawdev,
+        patch.object(RawBlockCore, "_ensure_capacity_and_layout"),
+        patch.object(RawBlockCore, "_load_checkpoint_from_device"),
+    ):
+        backend = _build_transfer_limit_backend(
+            TEST_DEVICES["char_device"], max_data_transfer_size=-1
+        )
+
+    mock_stat.assert_called_once_with(TEST_DEVICES["char_device"])
+    mock_read.assert_called_once_with(expected_path)
+    mock_rawdev.assert_not_called()
+    assert backend._core.max_data_transfer_size == 1024 * 1024
 
 
 def test_uring_cmd_get_nvme_info(loop_in_thread):

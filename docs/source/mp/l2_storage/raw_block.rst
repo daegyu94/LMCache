@@ -37,6 +37,10 @@ caller-provided load buffers during prefetch.
 - ``max_data_transfer_size``: Maximum data transfer size for
   ``use_uring_cmd=true``. Large transfers are split into smaller chunks
   that fit within device limits.
+- ``fdp_enabled``: Enables NVMe Flexible Data Placement (FDP) discovery
+  and non-zero handle registration. Requires ``io_engine="io_uring"`` and
+  ``use_uring_cmd=true``.
+- ``fdp_placement_handles``: Optional exact non-zero handle list.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
   Worker-thread counts for each operation type.
 
@@ -57,7 +61,13 @@ caller-provided load buffers during prefetch.
   command passthrough.
 - ``use_uring_cmd`` requires ``io_engine="io_uring"`` to be set.
 - When ``use_uring_cmd=true``, ``use_odirect`` is ignored for NVMe namespace
-  character devices.
+  character devices. FDP examples set ``use_odirect=false`` because
+  ``io_uring_cmd`` uses NVMe passthrough rather than the POSIX write path.
+- FDP registers only non-zero handles. If ``fdp_placement_handles`` is
+  omitted, all discovered non-zero handles are used; if provided, the list must
+  exactly match the device's non-zero handle set and must not contain 0. Current
+  writes still omit FDP placement handles until the placement policy is added;
+  checkpoint metadata writes also use default NVMe placement with no directive.
 
 **Configuration examples:**
 
@@ -71,6 +81,9 @@ caller-provided load buffers during prefetch.
 
     # With io_uring_cmd (NVMe passthrough)
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "iouring_queue_depth": 256, "max_data_transfer_size": 131072, "use_odirect": false}'
+
+    # With FDP discovery enabled, registering all non-zero device handles
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'

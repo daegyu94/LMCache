@@ -38,10 +38,21 @@ StoreController / PrefetchController
 - Preserve restart recovery semantics.
 - Keep the MP controller flow unchanged: store, lookup-and-lock, load, unlock.
 
-## TODO
+## FDP Placement Base
 
-- FDP / placement-hint support.
-- A raw NVMe command path.
+The MP `raw_block` adapter supports NVMe Flexible Data Placement (FDP) status
+discovery when `io_engine="io_uring"` and `use_uring_cmd=true`. At startup, it
+queries FDP reclaim unit handle status from the device and reports the
+discovered mapping. Startup fails if the query fails or the device reports no
+handles.
+
+FDP plumbing is split by layer: `RawBlockL2Adapter` discovers and registers
+non-zero placement handles, while `RawBlockCore` enforces that explicit handle 0
+is never used. The placement policy that assigns handles to KV writes is a
+follow-up; for now KV data and checkpoint metadata omit placement handles and
+use default NVMe writes with no directive. User-facing FDP configuration rules
+live in `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command
+encoding details live in `rust/raw_block/README.md`.
 
 ## Key Design Choice
 
@@ -129,6 +140,8 @@ The MP adapter is configured through `--l2-adapter` JSON:
   "num_load_workers": 4
 }
 ```
+
+For FDP configuration examples, see `docs/source/mp/l2_storage/raw_block.rst`.
 
 Important validation rules:
 
