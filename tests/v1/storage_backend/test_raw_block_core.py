@@ -123,3 +123,76 @@ def test_raw_block_core_recovers_checkpoint_from_temp_file(tmp_path):
         assert memory_obj_bytes(loaded) == payload
     finally:
         recovered.close()
+
+
+class _FakeRawDevice:
+    def __init__(self) -> None:
+        self.batched_write_calls: list[
+            tuple[list[int], list[int], list[int | None] | None]
+        ] = []
+
+    def batched_write(
+        self,
+        offsets: list[int],
+        buffers: list[bytearray],
+        total_lens: list[int],
+        placement_ids: list[int | None] | None = None,
+    ) -> int:
+        self.batched_write_calls.append((offsets, total_lens, placement_ids))
+        return 123
+
+    def wait_iouring(self, batch_id: int) -> None:
+        assert batch_id == 123
+
+
+def test_raw_block_core_write_buffers_preserves_none_vs_zero_placement():
+    core = object.__new__(RawBlockCore)
+    core.io_engine = "io_uring"
+    core.use_uring_cmd = False
+    core._raw = _FakeRawDevice()
+
+    core._write_buffers(
+        [4096, 8192],
+        [bytearray(b"a"), bytearray(b"b")],
+        [1, 1],
+        [1, 1],
+        [None, 0],
+    )
+
+    assert core._raw.batched_write_calls == [([4096, 8192], [1, 1], [None, 0])]
+
+
+def test_raw_block_core_write_one_sets_same_placement_for_header_and_payload():
+    core = object.__new__(RawBlockCore)
+    core.block_align = 4096
+    core.header_bytes = 4096
+    core.io_engine = "io_uring"
+    core.use_odirect = False
+    core.use_uring_cmd = False
+    calls = []
+
+    def fake_write_buffers(
+        offsets, buffers, payload_lens, total_lens, placement_ids=None
+    ):
+        calls.append((offsets, payload_lens, total_lens, placement_ids))
+
+    core._write_buffers = fake_write_buffers
+    core._prepare_write_payload = lambda memory_obj: (memory_obj.byte_array, 4, 4)
+    core._encode_header = lambda slot_identity, payload_len: b"header"
+    core._lock = type(
+        "Lock", (), {"__enter__": lambda self: None, "__exit__": lambda *args: None}
+    )()
+    core._inflight_io_count = 0
+    core._last_io_ts = 0
+
+    spec = encode_object_key(make_object_key(501))
+
+    assert core._write_one(spec, make_memory_obj(b"data"), 8192, placement_id=0)
+    assert calls == [
+        (
+            [8192, 8192 + 4096],
+            [6, 4],
+            [6, 4],
+            [0, 0],
+        )
+    ]

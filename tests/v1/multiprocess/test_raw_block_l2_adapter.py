@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from pathlib import Path
+from unittest.mock import patch
 
 # Third Party
 import pytest
@@ -116,5 +117,104 @@ def test_raw_block_l2_adapter_delete_makes_key_miss(tmp_path):
         lookup_bitmap = adapter.query_lookup_and_lock_result(lookup_task_id)
         assert lookup_bitmap is not None
         assert lookup_bitmap.test(0) is False
+    finally:
+        adapter.close()
+
+
+class _FakeFdpCore:
+    def __init__(self, status: list[tuple[int, int]] | None = None) -> None:
+        self.status = status if status is not None else [(0, 10), (7, 17)]
+        self.slot_bytes = RAW_BLOCK_CI_SLOT_BYTES
+
+    def fetch_fdp_status(self, max_ruhs: int = 256) -> list[tuple[int, int]]:
+        return self.status
+
+    def report_status(self) -> dict:
+        return {
+            "is_healthy": True,
+            "usable_capacity_bytes": RAW_BLOCK_CI_SLOT_BYTES * 8,
+        }
+
+    def snapshot_indexed_keys(self) -> list[str]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def _make_fdp_config(handles: list[int] | None = None) -> RawBlockL2AdapterConfig:
+    return RawBlockL2AdapterConfig(
+        device_path="/dev/ng0n1",
+        capacity_bytes=RAW_BLOCK_CI_CAPACITY_BYTES,
+        block_align=RAW_BLOCK_CI_BLOCK_ALIGN,
+        header_bytes=RAW_BLOCK_CI_HEADER_BYTES,
+        slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
+        meta_total_bytes=RAW_BLOCK_CI_META_TOTAL_BYTES,
+        use_odirect=False,
+        enable_zero_copy=False,
+        meta_enable_periodic=False,
+        meta_idle_quiet_ms=0,
+        io_engine="io_uring",
+        use_uring_cmd=True,
+        iouring_queue_depth=8,
+        fdp_enabled=True,
+        fdp_placement_handles=handles,
+        num_store_workers=1,
+        num_lookup_workers=1,
+        num_load_workers=1,
+    )
+
+
+def _make_fdp_adapter(fake_core: _FakeFdpCore, config: RawBlockL2AdapterConfig):
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+        return_value=fake_core,
+    ):
+        return RawBlockL2Adapter(config)
+
+
+def test_raw_block_fdp_requires_uring_cmd_config():
+    with pytest.raises(ValueError, match="fdp_enabled requires"):
+        RawBlockL2AdapterConfig(
+            device_path="/dev/ng0n1",
+            slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
+            io_engine="posix",
+            use_uring_cmd=False,
+            fdp_enabled=True,
+        )
+
+
+def test_raw_block_fdp_explicit_handle_validation_rejects_missing_handle():
+    fake_core = _FakeFdpCore(status=[(1, 11)])
+    config = _make_fdp_config(handles=[1, 2])
+
+    with pytest.raises(ValueError, match="not reported"):
+        _make_fdp_adapter(fake_core, config)
+
+
+def test_raw_block_fdp_explicit_handle_validation_rejects_duplicate_handle():
+    fake_core = _FakeFdpCore(status=[(0, 10), (7, 17)])
+    config = _make_fdp_config(handles=[0, 0])
+
+    with pytest.raises(ValueError, match="duplicate handles"):
+        _make_fdp_adapter(fake_core, config)
+
+
+def test_raw_block_fdp_empty_status_fails_startup():
+    fake_core = _FakeFdpCore(status=[])
+    config = _make_fdp_config()
+
+    with pytest.raises(RuntimeError, match="no handles"):
+        _make_fdp_adapter(fake_core, config)
+
+
+def test_raw_block_fdp_status_is_reported():
+    fake_core = _FakeFdpCore(status=[(0, 10), (7, 17)])
+    adapter = _make_fdp_adapter(fake_core, _make_fdp_config(handles=[0]))
+    try:
+        status = adapter.report_status()
+        assert status["fdp_enabled"] is True
+        assert status["fdp_discovered_status"] == [(0, 10), (7, 17)]
+        assert status["fdp_placement_handles"] == [0]
     finally:
         adapter.close()

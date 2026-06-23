@@ -142,6 +142,20 @@ dev = RawBlockDevice(
 )
 ```
 
+## FDP Notes
+
+FDP status can be queried from Python when `use_uring_cmd=True`:
+
+```python
+handles = dev.fetch_fdp_status()  # [(placement_id, ruh_id), ...]
+```
+
+For writes, omitting `placement_id` is not the same as passing `0`. Omitted
+placement leaves the NVMe directive unset (`dtype=0, dspec=0`), while
+`placement_id=0` explicitly sends an FDP directive for handle 0. LMCache uses
+this distinction so metadata checkpoints can use default placement while raw
+block data slots can target FDP handles.
+
 ## MP Adapter Example
 
 To use the MP adapter from `lmcache server`, pass a `raw_block` L2 adapter

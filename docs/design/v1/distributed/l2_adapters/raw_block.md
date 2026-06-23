@@ -38,10 +38,27 @@ StoreController / PrefetchController
 - Preserve restart recovery semantics.
 - Keep the MP controller flow unchanged: store, lookup-and-lock, load, unlock.
 
-## TODO
+## FDP Placement Base
 
-- FDP / placement-hint support.
-- A raw NVMe command path.
+The MP `raw_block` adapter supports NVMe Flexible Data Placement (FDP)
+discovery only when `io_engine="io_uring"` and `use_uring_cmd=true`. During
+startup, the adapter queries the device for FDP reclaim unit handles and, when
+`fdp_placement_handles` is configured, intersects the discovered handles with
+that explicit list. Startup fails if the query fails, if the resulting handle
+list is empty, or if any explicitly configured handle is not reported by the
+device.
+
+FDP directives are sent for raw-block data slot writes, including both the
+per-slot header and payload. Metadata checkpoint reads and writes omit placement
+handles, so they use the device's default placement. This keeps checkpoint
+metadata lifetime separate from cached KV slot lifetime.
+
+`None` and integer `0` have different meanings. `None` means no directive and
+passes `dtype=0, dspec=0` to NVMe. Integer `0` is a valid explicit FDP placement
+handle and sends the FDP directive with `dspec=0`.
+
+Policy-specific mapping will build on this query, validation, and propagation
+path in later changes.
 
 ## Key Design Choice
 
@@ -127,6 +144,22 @@ The MP adapter is configured through `--l2-adapter` JSON:
   "num_store_workers": 2,
   "num_lookup_workers": 1,
   "num_load_workers": 4
+}
+```
+
+For FDP, start from the base `raw_block` configuration above, switch to the NVMe
+character namespace device, and enable `io_uring_cmd`. Add or override these
+fields to restrict the selected placement handles to an explicit subset reported
+by the device:
+
+```json
+{
+  "device_path": "/dev/ng0n1",
+  "use_odirect": false,
+  "io_engine": "io_uring",
+  "use_uring_cmd": true,
+  "fdp_enabled": true,
+  "fdp_placement_handles": [0, 1]
 }
 ```
 

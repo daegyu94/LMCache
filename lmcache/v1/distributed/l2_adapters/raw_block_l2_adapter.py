@@ -88,6 +88,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH,
         use_uring_cmd: bool = False,
         max_data_transfer_size: int = 0,
+        fdp_enabled: bool = False,
+        fdp_placement_handles: list[int] | None = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
@@ -114,6 +116,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth: Queue depth for the Rust io_uring engine.
             use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
             max_data_transfer_size: Max data transfer size for a single request.
+            fdp_enabled: Enable NVMe Flexible Data Placement discovery and
+                directive plumbing for data-slot writes.
+            fdp_placement_handles: Optional placement handle subset to use.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -141,6 +146,18 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
         self.use_uring_cmd = bool(use_uring_cmd)
         self.max_data_transfer_size = int(max_data_transfer_size)
+        self.fdp_enabled = bool(fdp_enabled)
+        self.fdp_placement_handles = (
+            [int(handle) for handle in fdp_placement_handles]
+            if fdp_placement_handles is not None
+            else None
+        )
+        if self.fdp_enabled and (
+            self.io_engine != "io_uring" or not self.use_uring_cmd
+        ):
+            raise ValueError(
+                "fdp_enabled requires io_engine='io_uring' and use_uring_cmd=true"
+            )
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
         self.num_load_workers = int(num_load_workers)
@@ -176,6 +193,18 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         max_data_transfer_size = int(d.get("max_data_transfer_size", 0))
+        fdp_enabled = bool(d.get("fdp_enabled", False))
+        raw_fdp_handles = d.get("fdp_placement_handles")
+        fdp_placement_handles: list[int] | None
+        if raw_fdp_handles is None:
+            fdp_placement_handles = None
+        elif isinstance(raw_fdp_handles, list) and all(
+            isinstance(handle, int) and not isinstance(handle, bool)
+            for handle in raw_fdp_handles
+        ):
+            fdp_placement_handles = [int(handle) for handle in raw_fdp_handles]
+        else:
+            raise ValueError("fdp_placement_handles must be a list of integers")
 
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
@@ -194,6 +223,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
         if use_uring_cmd and io_engine != "io_uring":
             raise ValueError("use_uring_cmd requires io_uring io_engine")
+        if fdp_enabled and (io_engine != "io_uring" or not use_uring_cmd):
+            raise ValueError(
+                "fdp_enabled requires io_engine='io_uring' and use_uring_cmd=true"
+            )
 
         worker_defaults = {
             "num_store_workers": 2,
@@ -227,6 +260,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth=iouring_queue_depth,
             use_uring_cmd=use_uring_cmd,
             max_data_transfer_size=max_data_transfer_size,
+            fdp_enabled=fdp_enabled,
+            fdp_placement_handles=fdp_placement_handles,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
@@ -268,6 +303,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- max_data_transfer_size (int): for a single I/O request "
             "(0: (default) auto detect limit splitting, > 0: explicit split, "
             "< 0: auto detect limit splitting)\n"
+            "- fdp_enabled (bool): enable FDP discovery and directive plumbing "
+            "(default false)\n"
+            "- fdp_placement_handles (list[int]): optional FDP handle subset\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
             "- num_load_workers (int): load worker threads (default 4)"
@@ -344,6 +382,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+            self._fdp_enabled = bool(config.fdp_enabled)
+            self._fdp_discovered_status: list[tuple[int, int]] = []
+            self._fdp_placement_handles: list[int] = []
+            if self._fdp_enabled:
+                self._configure_fdp(config)
             if config.io_engine == "io_uring":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
@@ -599,11 +642,58 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "store_inflight_task_count": self._store_inflight_tasks,
                 "lookup_inflight_task_count": self._lookup_inflight_tasks,
                 "load_inflight_task_count": self._load_inflight_tasks,
+                "fdp_enabled": self._fdp_enabled,
+                "fdp_discovered_status": list(self._fdp_discovered_status),
+                "fdp_placement_handles": list(self._fdp_placement_handles),
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
                 "core": core_status,
             }
+
+    def _configure_fdp(self, config: RawBlockL2AdapterConfig) -> None:
+        """Fetch and validate FDP placement handles for this adapter."""
+        try:
+            discovered = self._core.fetch_fdp_status()
+        except Exception as e:
+            raise RuntimeError("raw_block FDP status query failed") from e
+        if not discovered:
+            raise RuntimeError("raw_block FDP enabled but device returned no handles")
+
+        available_handles = {int(pid) for pid, _ruhid in discovered}
+        configured_handles = config.fdp_placement_handles
+        if configured_handles is None:
+            selected = sorted(available_handles)
+        else:
+            duplicate_handles = sorted(
+                {
+                    int(handle)
+                    for handle in configured_handles
+                    if configured_handles.count(handle) > 1
+                }
+            )
+            if duplicate_handles:
+                raise ValueError(
+                    "fdp_placement_handles contains duplicate handles: "
+                    f"{duplicate_handles}"
+                )
+            missing = sorted(set(configured_handles) - available_handles)
+            if missing:
+                raise ValueError(
+                    "fdp_placement_handles contains handles not reported by "
+                    f"the device: {missing}"
+                )
+            selected = [int(handle) for handle in configured_handles]
+
+        if not selected:
+            raise RuntimeError(
+                "raw_block FDP enabled but no placement handles selected"
+            )
+
+        self._fdp_discovered_status = [
+            (int(pid), int(ruhid)) for pid, ruhid in discovered
+        ]
+        self._fdp_placement_handles = selected
 
     def _raise_if_closed_locked(self) -> None:
         if self._closed:

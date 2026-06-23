@@ -37,6 +37,12 @@ caller-provided load buffers during prefetch.
 - ``max_data_transfer_size``: Maximum data transfer size for
   ``use_uring_cmd=true``. Large transfers are split into smaller chunks
   that fit within device limits.
+- ``fdp_enabled``: Enables NVMe Flexible Data Placement (FDP) discovery and
+  directive plumbing for data slot writes. FDP is supported only by the MP
+  ``raw_block`` adapter when ``io_engine="io_uring"`` and
+  ``use_uring_cmd=true``.
+- ``fdp_placement_handles``: Optional list of placement handles that raw-block
+  may use. When omitted, all handles reported by the device are selected.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
   Worker-thread counts for each operation type.
 
@@ -57,7 +63,15 @@ caller-provided load buffers during prefetch.
   command passthrough.
 - ``use_uring_cmd`` requires ``io_engine="io_uring"`` to be set.
 - When ``use_uring_cmd=true``, ``use_odirect`` is ignored for NVMe namespace
-  character devices.
+  character devices. FDP examples set ``use_odirect=false`` because
+  ``io_uring_cmd`` sends NVMe passthrough commands and does not use the POSIX
+  ``O_DIRECT`` write path.
+- FDP directives are applied to raw-block data slot writes, including both the
+  per-slot header and payload. Metadata checkpoint reads and writes omit
+  placement handles by design and use the device's default placement.
+- Omitted directive and placement handle ``0`` are distinct: omitted directive
+  is represented as ``None`` and sends ``dtype=0, dspec=0``; handle ``0`` is a
+  valid explicit FDP placement and sends the FDP directive with ``dspec=0``.
 
 **Configuration examples:**
 
@@ -71,6 +85,9 @@ caller-provided load buffers during prefetch.
 
     # With io_uring_cmd (NVMe passthrough)
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "iouring_queue_depth": 256, "max_data_transfer_size": 131072, "use_odirect": false}'
+
+    # With FDP discovery enabled and an explicit handle subset
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_placement_handles": [0, 1], "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'
