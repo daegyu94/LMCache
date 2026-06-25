@@ -211,6 +211,16 @@ def _with_cache_salt(key: ObjectKey, cache_salt: str) -> ObjectKey:
     )
 
 
+def _with_model_name(key: ObjectKey, model_name: str) -> ObjectKey:
+    return key.__class__(
+        chunk_hash=key.chunk_hash,
+        model_name=model_name,
+        kv_rank=key.kv_rank,
+        object_group_id=key.object_group_id,
+        cache_salt=key.cache_salt,
+    )
+
+
 def test_raw_block_fdp_requires_uring_cmd_config():
     with pytest.raises(ValueError, match="fdp_enabled requires"):
         RawBlockL2AdapterConfig(
@@ -453,6 +463,74 @@ def test_raw_block_fdp_domain_isolation_exhaustion_uses_default_once():
         }
         assert warning_mock.call_count == 1
         assert "domain_isolation exhausted placement handles" in str(
+            warning_mock.call_args.args[0]
+        )
+    finally:
+        warning_patch.stop()
+        adapter.close()
+
+
+def test_raw_block_fdp_model_isolation_assigns_and_reuses_models():
+    fake_core = _FakeFdpCore(status=[(0, 10), (7, 17)])
+    config = _make_fdp_config(
+        handles=[0, 7],
+        fdp_policy="model_isolation",
+    )
+    adapter = _make_fdp_adapter(fake_core, config)
+    try:
+        keys = [
+            _with_model_name(make_object_key(1), "meta-llama/Llama-3.1-8B"),
+            _with_model_name(make_object_key(2), "mistralai/Mistral-7B"),
+            _with_model_name(make_object_key(3), "meta-llama/Llama-3.1-8B"),
+        ]
+        objects = [make_memory_obj(b"a"), make_memory_obj(b"b"), make_memory_obj(b"c")]
+        task_id = adapter.submit_store_task(keys, objects)
+
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+        assert fake_core.put_many_calls[0][1] == [0, 7, 0]
+        status = adapter.report_status()
+        assert status["fdp_policy"] == "model_isolation"
+        assert status["fdp_model_to_placement"] == {
+            "meta-llama/Llama-3.1-8B": 0,
+            "mistralai/Mistral-7B": 7,
+        }
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_model_isolation_exhaustion_uses_default_once():
+    fake_core = _FakeFdpCore(status=[(5, 15)])
+    config = _make_fdp_config(
+        handles=[5],
+        fdp_policy="model_isolation",
+    )
+    adapter = _make_fdp_adapter(fake_core, config)
+    warning_patch = patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.logger.warning"
+    )
+    warning_mock = warning_patch.start()
+    try:
+        keys = [
+            _with_model_name(make_object_key(1), "model-a"),
+            _with_model_name(make_object_key(2), "model-b"),
+            _with_model_name(make_object_key(3), "model-b"),
+        ]
+        task_id = adapter.submit_store_task(
+            keys,
+            [make_memory_obj(b"a"), make_memory_obj(b"b"), make_memory_obj(b"c")],
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+        assert fake_core.put_many_calls[0][1] == [5, None, None]
+        status = adapter.report_status()
+        assert status["fdp_model_to_placement"] == {
+            "model-a": 5,
+            "model-b": None,
+        }
+        assert warning_mock.call_count == 1
+        assert "model_isolation exhausted placement handles" in str(
             warning_mock.call_args.args[0]
         )
     finally:

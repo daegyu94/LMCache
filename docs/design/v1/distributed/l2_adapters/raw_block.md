@@ -57,9 +57,11 @@ metadata lifetime separate from cached KV slot lifetime.
 passes `dtype=0, dspec=0` to NVMe. Integer `0` is a valid explicit FDP placement
 handle and sends the FDP directive with `dspec=0`.
 
-`rank_isolation` and `domain_isolation` are sibling FDP placement policies. Both
-select placement handles for raw-block data slot writes, but they use different
-isolation keys.
+`rank_isolation`, `domain_isolation`, and `model_isolation` are sibling FDP
+placement policies. All three select placement handles for raw-block data slot
+writes, but they use different isolation keys. The adapter supports one
+`fdp_policy` value per configuration; composite policies such as rank plus model
+isolation are not supported yet.
 
 `rank_isolation` maps the local rank encoded in `ObjectKey.kv_rank` to FDP
 placement handles. FDP SSDs are node-local NVMe devices shared by GPU workers
@@ -78,6 +80,12 @@ are first observed in a store request. The first observed store for a new
 `cache_salt` values are recorded with `None`, which means the write uses default
 device placement. The exhaustion warning is emitted once so store workers do not
 log on every I/O after the pool is exhausted.
+
+`model_isolation` maps `ObjectKey.model_name` values to FDP placement handles
+when they are first observed in a store request. It uses the same handle
+assignment and exhaustion behavior as `domain_isolation`, but isolates by model
+because different models can have different workload characteristics and cache
+lifetimes.
 
 ## Key Design Choice
 
@@ -195,6 +203,23 @@ to `domain_isolation`:
   "use_uring_cmd": true,
   "fdp_enabled": true,
   "fdp_policy": "domain_isolation",
+  "fdp_placement_handles": [0, 1, 2, 3]
+}
+```
+
+For `model_isolation`, set `fdp_policy` to `model_isolation`. Each distinct
+`ObjectKey.model_name` receives the next selected placement handle when first
+observed in a store request:
+
+```json
+{
+  "type": "raw_block",
+  "device_path": "/dev/ng0n1",
+  "slot_bytes": 1048576,
+  "io_engine": "io_uring",
+  "use_uring_cmd": true,
+  "fdp_enabled": true,
+  "fdp_policy": "model_isolation",
   "fdp_placement_handles": [0, 1, 2, 3]
 }
 ```

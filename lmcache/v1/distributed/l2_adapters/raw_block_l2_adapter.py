@@ -59,8 +59,8 @@ RawBlockStoreTaskResult = tuple[
     list[int],
 ]
 
-FdpPolicy = Literal["rank_isolation", "domain_isolation"]
-_FDP_POLICIES = {"rank_isolation", "domain_isolation"}
+FdpPolicy = Literal["rank_isolation", "domain_isolation", "model_isolation"]
+_FDP_POLICIES = {"rank_isolation", "domain_isolation", "model_isolation"}
 _FDP_HANDLE_CLAIM_DIR_ENV = "LMCACHE_RAW_BLOCK_FDP_CLAIM_DIR"
 _FDP_HANDLE_CLAIM_DIR_NAME = "lmcache_raw_block_fdp_claims"
 
@@ -157,8 +157,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             fdp_enabled: Enable NVMe Flexible Data Placement discovery and
                 directive plumbing for data-slot writes.
             fdp_policy: FDP placement policy. Required when ``fdp_enabled`` is
-                true. Supported values are ``"rank_isolation"`` and
-                ``"domain_isolation"``.
+                true. Supported values are ``"rank_isolation"``,
+                ``"domain_isolation"``, and ``"model_isolation"``.
             fdp_placement_handles: Optional placement handle subset to use.
                 For ``rank_isolation``, local rank N maps to selected handle N.
             num_store_workers: Number of store worker threads.
@@ -370,8 +370,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "< 0: auto detect limit splitting)\n"
             "- fdp_enabled (bool): enable FDP discovery and directive plumbing "
             "(default false)\n"
-            "- fdp_policy (str): rank_isolation or domain_isolation "
-            "(required when fdp_enabled=true)\n"
+            "- fdp_policy (str): rank_isolation, domain_isolation, or "
+            "model_isolation (required when fdp_enabled=true)\n"
             "- fdp_placement_handles (list[int]): optional FDP handle subset\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
@@ -457,9 +457,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._fdp_rank_lock = threading.Lock()
             self._fdp_handle_claim_files: list[IO[str]] = []
             self._fdp_cache_salt_to_placement: dict[str, int | None] = {}
-            self._fdp_domain_next_handle_index = 0
-            self._fdp_domain_exhausted_warned = False
-            self._fdp_domain_lock = threading.Lock()
+            self._fdp_model_to_placement: dict[str, int | None] = {}
+            self._fdp_lazy_next_handle_index = 0
+            self._fdp_lazy_exhausted_warned = False
+            self._fdp_lazy_isolation_lock = threading.Lock()
             if self._fdp_enabled:
                 self._configure_fdp(config)
             if config.io_engine == "io_uring":
@@ -712,8 +713,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
         """Return adapter health, task counters, and core status."""
         core_status = self._core.report_status()
         with self._lock:
-            with self._fdp_domain_lock:
+            with self._fdp_lazy_isolation_lock:
                 cache_salt_to_placement = dict(self._fdp_cache_salt_to_placement)
+                model_to_placement = dict(self._fdp_model_to_placement)
             return {
                 "is_healthy": core_status.get("is_healthy", True) and not self._closed,
                 "type": "RawBlockL2Adapter",
@@ -726,6 +728,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "fdp_placement_handles": list(self._fdp_placement_handles),
                 "fdp_local_rank_to_placement": dict(self._fdp_local_rank_to_placement),
                 "fdp_cache_salt_to_placement": cache_salt_to_placement,
+                "fdp_model_to_placement": model_to_placement,
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
@@ -861,35 +864,61 @@ class RawBlockL2Adapter(L2AdapterInterface):
             return placement_ids
         if self._fdp_policy == "domain_isolation":
             return self._placement_ids_for_cache_salts(keys)
+        if self._fdp_policy == "model_isolation":
+            return self._placement_ids_for_models(keys)
         raise RuntimeError(f"unsupported FDP policy: {self._fdp_policy}")
 
     def _placement_ids_for_cache_salts(self, keys: list[ObjectKey]) -> list[int | None]:
         """Return lazy-assigned FDP placement handles by cache_salt."""
+        return self._placement_ids_for_lazy_isolation_values(
+            [key.cache_salt for key in keys],
+            self._fdp_cache_salt_to_placement,
+            "domain_isolation",
+            "cache_salt",
+        )
+
+    def _placement_ids_for_models(self, keys: list[ObjectKey]) -> list[int | None]:
+        """Return lazy-assigned FDP placement handles by model_name."""
+        return self._placement_ids_for_lazy_isolation_values(
+            [key.model_name for key in keys],
+            self._fdp_model_to_placement,
+            "model_isolation",
+            "model_name",
+        )
+
+    def _placement_ids_for_lazy_isolation_values(
+        self,
+        isolation_values: list[str],
+        placement_by_value: dict[str, int | None],
+        policy_name: str,
+        value_name: str,
+    ) -> list[int | None]:
+        """Return lazy-assigned FDP placement handles by isolation value."""
         placement_ids: list[int | None] = []
-        with self._fdp_domain_lock:
-            for key in keys:
-                cache_salt = key.cache_salt
-                if cache_salt not in self._fdp_cache_salt_to_placement:
-                    if self._fdp_domain_next_handle_index < len(
+        with self._fdp_lazy_isolation_lock:
+            for isolation_value in isolation_values:
+                if isolation_value not in placement_by_value:
+                    if self._fdp_lazy_next_handle_index < len(
                         self._fdp_placement_handles
                     ):
                         placement_id: int | None = self._fdp_placement_handles[
-                            self._fdp_domain_next_handle_index
+                            self._fdp_lazy_next_handle_index
                         ]
-                        self._fdp_domain_next_handle_index += 1
+                        self._fdp_lazy_next_handle_index += 1
                     else:
                         # None means no directive by design; handle 0 remains a
                         # valid explicit placement when present in the handle pool.
                         placement_id = None
-                        if not self._fdp_domain_exhausted_warned:
-                            logger.warning(
-                                "raw_block FDP domain_isolation exhausted placement "
-                                "handles; new cache_salt values will use default "
-                                "placement"
+                        if not self._fdp_lazy_exhausted_warned:
+                            warning_message = (
+                                f"raw_block FDP {policy_name} exhausted placement "
+                                f"handles; new {value_name} values will use "
+                                "default placement"
                             )
-                            self._fdp_domain_exhausted_warned = True
-                    self._fdp_cache_salt_to_placement[cache_salt] = placement_id
-                placement_ids.append(self._fdp_cache_salt_to_placement[cache_salt])
+                            logger.warning(warning_message)
+                            self._fdp_lazy_exhausted_warned = True
+                    placement_by_value[isolation_value] = placement_id
+                placement_ids.append(placement_by_value[isolation_value])
         return placement_ids
 
     def _raise_if_closed_locked(self) -> None:

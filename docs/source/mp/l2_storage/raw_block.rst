@@ -44,6 +44,7 @@ caller-provided load buffers during prefetch.
 - ``fdp_policy``: FDP placement policy. Required when ``fdp_enabled=true``.
   ``"rank_isolation"`` maps the local rank encoded in ``ObjectKey.kv_rank``
   to handles. ``"domain_isolation"`` maps ``cache_salt`` values to handles.
+  ``"model_isolation"`` maps ``ObjectKey.model_name`` values to handles.
 - ``fdp_placement_handles``: Optional list of placement handles that raw-block
   may use. When omitted, all handles reported by the device are selected.
   For ``rank_isolation``, local rank N maps to selected handle N.
@@ -76,9 +77,11 @@ caller-provided load buffers during prefetch.
 - Omitted directive and placement handle ``0`` are distinct: omitted directive
   is represented as ``None`` and sends ``dtype=0, dspec=0``; handle ``0`` is a
   valid explicit FDP placement and sends the FDP directive with ``dspec=0``.
-- ``rank_isolation`` and ``domain_isolation`` are separate FDP policies. Choose
-  one policy per adapter configuration based on whether placement should follow
-  local writer rank or ``cache_salt`` domain.
+- ``rank_isolation``, ``domain_isolation``, and ``model_isolation`` are
+  separate FDP policies. Choose one policy per adapter configuration based on
+  whether placement should follow local writer rank, ``cache_salt`` domain, or
+  model name. Composite policies such as rank plus model isolation are not
+  supported yet.
 - ``rank_isolation`` uses local ranks because an FDP SSD is a node-local NVMe
   device shared by GPU workers on the same LMCache server.
 - Local ranks are registered lazily from ``ObjectKey.kv_rank`` at store time.
@@ -88,8 +91,13 @@ caller-provided load buffers during prefetch.
 - ``domain_isolation`` assigns the next selected placement handle when a new
   ``cache_salt`` is first observed in a store request. The same ``cache_salt``
   reuses that handle for later data slot writes.
-- If ``domain_isolation`` exhausts the selected handles, new ``cache_salt``
-  values write with no directive (``None``) and a warning is logged once.
+- ``model_isolation`` assigns the next selected placement handle when a new
+  ``ObjectKey.model_name`` is first observed in a store request. The same model
+  reuses that handle for later data slot writes. This can separate models with
+  different workload characteristics and cache lifetimes.
+- If ``domain_isolation`` or ``model_isolation`` exhausts the selected handles,
+  new isolation values write with no directive (``None``) and a warning is
+  logged once.
 
 **Configuration examples:**
 
@@ -109,6 +117,9 @@ caller-provided load buffers during prefetch.
 
     # With cache_salt domain isolation
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "domain_isolation", "fdp_placement_handles": [0, 1, 2, 3], "use_odirect": false}'
+
+    # With model isolation
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "model_isolation", "fdp_placement_handles": [0, 1, 2, 3], "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'
