@@ -57,8 +57,15 @@ metadata lifetime separate from cached KV slot lifetime.
 passes `dtype=0, dspec=0` to NVMe. Integer `0` is a valid explicit FDP placement
 handle and sends the FDP directive with `dspec=0`.
 
-Policy-specific mapping will build on this query, validation, and propagation
-path in later changes.
+`rank_isolation` maps the local rank encoded in `ObjectKey.kv_rank` to FDP
+placement handles. FDP SSDs are node-local NVMe devices shared by GPU workers
+on the same LMCache server, so this policy isolates local writers. Local ranks
+are registered lazily when store keys first arrive from the engine. Local rank N
+maps to selected handle N, preserving explicit handle order. If a store sees a
+local rank without a selected handle, that store fails instead of sharing another
+rank's handle. The selected handles are also claimed exclusively per device
+while the adapter is running, so another local adapter using the same device must
+select a disjoint handle subset.
 
 ## Key Design Choice
 
@@ -159,6 +166,7 @@ by the device:
   "io_engine": "io_uring",
   "use_uring_cmd": true,
   "fdp_enabled": true,
+  "fdp_policy": "rank_isolation",
   "fdp_placement_handles": [0, 1]
 }
 ```

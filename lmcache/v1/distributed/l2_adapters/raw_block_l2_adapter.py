@@ -13,7 +13,11 @@ from __future__ import annotations
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional
+from typing import IO, TYPE_CHECKING, Any, Literal, Optional
+import fcntl
+import hashlib
+import os
+import tempfile
 import threading
 
 if TYPE_CHECKING:
@@ -55,6 +59,39 @@ RawBlockStoreTaskResult = tuple[
     list[int],
 ]
 
+FdpPolicy = Literal["rank_isolation"]
+_FDP_POLICIES = {"rank_isolation"}
+_FDP_HANDLE_CLAIM_DIR_ENV = "LMCACHE_RAW_BLOCK_FDP_CLAIM_DIR"
+_FDP_HANDLE_CLAIM_DIR_NAME = "lmcache_raw_block_fdp_claims"
+
+
+def _local_rank_from_kv_rank(kv_rank: int) -> int:
+    """Extract local rank from ObjectKey.ComputeKVRank low 8 bits.
+
+    FDP placement is scoped to the node-local NVMe namespace shared by
+    local GPU workers attached to this LMCache server.
+    """
+    return int(kv_rank) & 0xFF
+
+
+def _fdp_handle_claim_root() -> str:
+    """Return the root directory for cross-process FDP handle claim locks."""
+    return os.environ.get(
+        _FDP_HANDLE_CLAIM_DIR_ENV,
+        os.path.join(tempfile.gettempdir(), _FDP_HANDLE_CLAIM_DIR_NAME),
+    )
+
+
+def _fdp_device_claim_dir(device_path: str) -> str:
+    """Return a stable per-device directory for FDP handle claim locks."""
+    normalized_path = os.path.realpath(device_path)
+    digest = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:16]
+    device_name = os.path.basename(normalized_path) or "device"
+    safe_device_name = "".join(
+        ch if ch.isalnum() or ch in {".", "_", "-"} else "_" for ch in device_name
+    )
+    return os.path.join(_fdp_handle_claim_root(), f"{safe_device_name}-{digest}")
+
 
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
@@ -89,6 +126,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd: bool = False,
         max_data_transfer_size: int = 0,
         fdp_enabled: bool = False,
+        fdp_policy: FdpPolicy | None = None,
         fdp_placement_handles: list[int] | None = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
@@ -118,7 +156,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             max_data_transfer_size: Max data transfer size for a single request.
             fdp_enabled: Enable NVMe Flexible Data Placement discovery and
                 directive plumbing for data-slot writes.
+            fdp_policy: FDP placement policy. Required when ``fdp_enabled`` is
+                true.
             fdp_placement_handles: Optional placement handle subset to use.
+                For ``rank_isolation``, local rank N maps to selected handle N.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -147,6 +188,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.use_uring_cmd = bool(use_uring_cmd)
         self.max_data_transfer_size = int(max_data_transfer_size)
         self.fdp_enabled = bool(fdp_enabled)
+        if fdp_policy is not None and fdp_policy not in _FDP_POLICIES:
+            raise ValueError(
+                "fdp_policy must be one of: " + ", ".join(sorted(_FDP_POLICIES))
+            )
+        self.fdp_policy: FdpPolicy | None = fdp_policy
         self.fdp_placement_handles = (
             [int(handle) for handle in fdp_placement_handles]
             if fdp_placement_handles is not None
@@ -158,6 +204,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError(
                 "fdp_enabled requires io_engine='io_uring' and use_uring_cmd=true"
             )
+        if self.fdp_enabled and self.fdp_policy is None:
+            raise ValueError("fdp_enabled requires fdp_policy")
+        if self.fdp_policy is not None and not self.fdp_enabled:
+            raise ValueError("fdp_policy requires fdp_enabled=true")
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
         self.num_load_workers = int(num_load_workers)
@@ -194,6 +244,16 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         max_data_transfer_size = int(d.get("max_data_transfer_size", 0))
         fdp_enabled = bool(d.get("fdp_enabled", False))
+        fdp_policy_raw = d.get("fdp_policy")
+        fdp_policy: FdpPolicy | None
+        if fdp_policy_raw is None:
+            fdp_policy = None
+        elif fdp_policy_raw == "rank_isolation":
+            fdp_policy = fdp_policy_raw
+        else:
+            raise ValueError(
+                "fdp_policy must be one of: " + ", ".join(sorted(_FDP_POLICIES))
+            )
         raw_fdp_handles = d.get("fdp_placement_handles")
         fdp_placement_handles: list[int] | None
         if raw_fdp_handles is None:
@@ -227,7 +287,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError(
                 "fdp_enabled requires io_engine='io_uring' and use_uring_cmd=true"
             )
-
+        if fdp_enabled and fdp_policy is None:
+            raise ValueError("fdp_enabled requires fdp_policy")
+        if fdp_policy is not None and not fdp_enabled:
+            raise ValueError("fdp_policy requires fdp_enabled=true")
         worker_defaults = {
             "num_store_workers": 2,
             "num_lookup_workers": 1,
@@ -261,6 +324,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_uring_cmd=use_uring_cmd,
             max_data_transfer_size=max_data_transfer_size,
             fdp_enabled=fdp_enabled,
+            fdp_policy=fdp_policy,
             fdp_placement_handles=fdp_placement_handles,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
@@ -305,6 +369,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "< 0: auto detect limit splitting)\n"
             "- fdp_enabled (bool): enable FDP discovery and directive plumbing "
             "(default false)\n"
+            "- fdp_policy (str): rank_isolation (required when fdp_enabled=true)\n"
             "- fdp_placement_handles (list[int]): optional FDP handle subset\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
@@ -383,8 +448,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
             self._fdp_enabled = bool(config.fdp_enabled)
+            self._fdp_policy = config.fdp_policy
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_handles: list[int] = []
+            self._fdp_local_rank_to_placement: dict[int, int] = {}
+            self._fdp_rank_lock = threading.Lock()
+            self._fdp_handle_claim_files: list[IO[str]] = []
             if self._fdp_enabled:
                 self._configure_fdp(config)
             if config.io_engine == "io_uring":
@@ -616,6 +685,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._load_pool.shutdown(wait=True)
 
         self._core.close()
+        self._release_fdp_handle_claims()
 
         with self._lock:
             store_efd = self._store_efd
@@ -643,8 +713,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "lookup_inflight_task_count": self._lookup_inflight_tasks,
                 "load_inflight_task_count": self._load_inflight_tasks,
                 "fdp_enabled": self._fdp_enabled,
+                "fdp_policy": self._fdp_policy,
                 "fdp_discovered_status": list(self._fdp_discovered_status),
                 "fdp_placement_handles": list(self._fdp_placement_handles),
+                "fdp_local_rank_to_placement": dict(self._fdp_local_rank_to_placement),
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
@@ -694,6 +766,91 @@ class RawBlockL2Adapter(L2AdapterInterface):
             (int(pid), int(ruhid)) for pid, ruhid in discovered
         ]
         self._fdp_placement_handles = selected
+        if config.fdp_policy == "rank_isolation":
+            self._claim_fdp_placement_handles(config.device_path, selected)
+
+    def _claim_fdp_placement_handles(
+        self, device_path: str, placement_handles: list[int]
+    ) -> None:
+        """Claim rank-isolation FDP handles across local adapter processes."""
+        claim_dir = _fdp_device_claim_dir(device_path)
+        os.makedirs(claim_dir, mode=0o700, exist_ok=True)
+        claimed_files: list[IO[str]] = []
+        try:
+            for placement_handle in sorted(placement_handles):
+                claim_path = os.path.join(claim_dir, f"handle_{placement_handle}.lock")
+                claim_file = open(claim_path, "a+", encoding="utf-8")
+                try:
+                    fcntl.flock(claim_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as e:
+                    claim_file.close()
+                    raise RuntimeError(
+                        "rank_isolation FDP placement handle is already "
+                        f"claimed for device {device_path!r}: {placement_handle}"
+                    ) from e
+                except OSError:
+                    claim_file.close()
+                    raise
+                claimed_files.append(claim_file)
+                claim_file.seek(0)
+                claim_file.truncate()
+                claim_file.write(
+                    f"pid={os.getpid()} device_path={device_path} "
+                    f"placement_handle={placement_handle}\n"
+                )
+                claim_file.flush()
+        except Exception:
+            self._release_fdp_handle_claim_files(claimed_files)
+            raise
+        self._fdp_handle_claim_files.extend(claimed_files)
+
+    def _release_fdp_handle_claims(self) -> None:
+        """Release any FDP placement handles claimed by this adapter."""
+        claim_files = getattr(self, "_fdp_handle_claim_files", [])
+        self._fdp_handle_claim_files = []
+        self._release_fdp_handle_claim_files(claim_files)
+
+    @staticmethod
+    def _release_fdp_handle_claim_files(claim_files: list[IO[str]]) -> None:
+        """Unlock and close FDP handle claim files."""
+        for claim_file in claim_files:
+            try:
+                fcntl.flock(claim_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                claim_file.close()
+            except OSError:
+                pass
+
+    def _placement_for_local_rank(self, local_rank: int) -> int:
+        """Return the FDP placement handle for ``local_rank``."""
+        with self._fdp_rank_lock:
+            try:
+                placement_id = self._fdp_local_rank_to_placement[local_rank]
+            except KeyError:
+                if local_rank >= len(self._fdp_placement_handles):
+                    raise ValueError(
+                        "rank_isolation requires one selected FDP placement "
+                        "handle per local_rank: "
+                        f"local_rank={local_rank} handles="
+                        f"{len(self._fdp_placement_handles)}"
+                    ) from None
+                placement_id = self._fdp_placement_handles[local_rank]
+                self._fdp_local_rank_to_placement[local_rank] = placement_id
+        return placement_id
+
+    def _placement_ids_for_keys(self, keys: list[ObjectKey]) -> list[int | None] | None:
+        """Return per-key FDP placement handles for the active policy."""
+        if not self._fdp_enabled:
+            return None
+        if self._fdp_policy == "rank_isolation":
+            placement_ids: list[int | None] = []
+            for key in keys:
+                local_rank = _local_rank_from_kv_rank(key.kv_rank)
+                placement_ids.append(self._placement_for_local_rank(local_rank))
+            return placement_ids
+        raise RuntimeError(f"unsupported FDP policy: {self._fdp_policy}")
 
     def _raise_if_closed_locked(self) -> None:
         if self._closed:
@@ -756,7 +913,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - raw-block slot byte charges aligned with the newly stored keys
         """
         specs = [encode_object_key(key) for key in keys]
-        put_result = self._core.put_many(specs, objects)
+        placement_ids = self._placement_ids_for_keys(keys)
+        put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
         stored_encoded = set(put_result.stored_keys)
         slot_bytes = int(self._core.slot_bytes)
         stored_keys: list[ObjectKey] = []
@@ -866,6 +1024,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
                 setattr(self, pool_name, None)
+
+        self._release_fdp_handle_claims()
 
         core = getattr(self, "_core", None)
         if core is not None:

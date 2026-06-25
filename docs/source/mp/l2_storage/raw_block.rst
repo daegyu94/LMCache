@@ -41,8 +41,12 @@ caller-provided load buffers during prefetch.
   directive plumbing for data slot writes. FDP is supported only by the MP
   ``raw_block`` adapter when ``io_engine="io_uring"`` and
   ``use_uring_cmd=true``.
+- ``fdp_policy``: FDP placement policy. Required when ``fdp_enabled=true``.
+  ``"rank_isolation"`` maps the local rank encoded in ``ObjectKey.kv_rank``
+  to handles.
 - ``fdp_placement_handles``: Optional list of placement handles that raw-block
   may use. When omitted, all handles reported by the device are selected.
+  For ``rank_isolation``, local rank N maps to selected handle N.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
   Worker-thread counts for each operation type.
 
@@ -72,6 +76,12 @@ caller-provided load buffers during prefetch.
 - Omitted directive and placement handle ``0`` are distinct: omitted directive
   is represented as ``None`` and sends ``dtype=0, dspec=0``; handle ``0`` is a
   valid explicit FDP placement and sends the FDP directive with ``dspec=0``.
+- ``rank_isolation`` uses local ranks because an FDP SSD is a node-local NVMe
+  device shared by GPU workers on the same LMCache server.
+- Local ranks are registered lazily from ``ObjectKey.kv_rank`` at store time.
+  Store fails if a local rank has no selected placement handle.
+- Selected handles are claimed exclusively per device while the adapter runs.
+  Local adapters sharing an FDP SSD must use disjoint handle subsets.
 
 **Configuration examples:**
 
@@ -86,8 +96,8 @@ caller-provided load buffers during prefetch.
     # With io_uring_cmd (NVMe passthrough)
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "iouring_queue_depth": 256, "max_data_transfer_size": 131072, "use_odirect": false}'
 
-    # With FDP discovery enabled and an explicit handle subset
-    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_placement_handles": [0, 1], "use_odirect": false}'
+    # With rank isolation
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "rank_isolation", "fdp_placement_handles": [0, 1], "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'

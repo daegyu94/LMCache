@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 # Third Party
@@ -29,12 +30,20 @@ from tests.v1.storage_backend.raw_block_test_utils import (
 install_native_storage_ops_fallback()
 pytest.importorskip("lmcache_rust_raw_block_io")
 
+
+@pytest.fixture(autouse=True)
+def isolate_raw_block_fdp_claim_dir(tmp_path, monkeypatch):
+    """Keep FDP handle claim locks isolated per test."""
+    monkeypatch.setenv("LMCACHE_RAW_BLOCK_FDP_CLAIM_DIR", str(tmp_path / "fdp_claims"))
+
+
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc  # noqa: E402
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey  # noqa: E402
 from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (  # noqa: E402
     RawBlockL2Adapter,
     RawBlockL2AdapterConfig,
 )
+from lmcache.v1.storage_backend.raw_block import RawBlockPutManyResult  # noqa: E402
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
@@ -125,9 +134,23 @@ class _FakeFdpCore:
     def __init__(self, status: list[tuple[int, int]] | None = None) -> None:
         self.status = status if status is not None else [(0, 10), (7, 17)]
         self.slot_bytes = RAW_BLOCK_CI_SLOT_BYTES
+        self.put_many_calls: list[tuple[list[str], list[int | None] | None]] = []
 
     def fetch_fdp_status(self, max_ruhs: int = 256) -> list[tuple[int, int]]:
         return self.status
+
+    def put_many(
+        self,
+        keys: list[Any],
+        objs: list[Any],
+        placement_ids: list[int | None] | None = None,
+    ) -> RawBlockPutManyResult:
+        del objs
+        self.put_many_calls.append(([spec.encoded for spec in keys], placement_ids))
+        return RawBlockPutManyResult(
+            results=[True] * len(keys),
+            stored_keys=[spec.encoded for spec in keys],
+        )
 
     def report_status(self) -> dict:
         return {
@@ -142,7 +165,11 @@ class _FakeFdpCore:
         pass
 
 
-def _make_fdp_config(handles: list[int] | None = None) -> RawBlockL2AdapterConfig:
+def _make_fdp_config(
+    handles: list[int] | None = None,
+    *,
+    fdp_policy: str = "rank_isolation",
+) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path="/dev/ng0n1",
         capacity_bytes=RAW_BLOCK_CI_CAPACITY_BYTES,
@@ -158,6 +185,7 @@ def _make_fdp_config(handles: list[int] | None = None) -> RawBlockL2AdapterConfi
         use_uring_cmd=True,
         iouring_queue_depth=8,
         fdp_enabled=True,
+        fdp_policy=fdp_policy,  # type: ignore[arg-type]
         fdp_placement_handles=handles,
         num_store_workers=1,
         num_lookup_workers=1,
@@ -180,6 +208,17 @@ def test_raw_block_fdp_requires_uring_cmd_config():
             slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
             io_engine="posix",
             use_uring_cmd=False,
+            fdp_enabled=True,
+        )
+
+
+def test_raw_block_fdp_enabled_requires_policy():
+    with pytest.raises(ValueError, match="fdp_enabled requires fdp_policy"):
+        RawBlockL2AdapterConfig(
+            device_path="/dev/ng0n1",
+            slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
+            io_engine="io_uring",
+            use_uring_cmd=True,
             fdp_enabled=True,
         )
 
@@ -210,11 +249,122 @@ def test_raw_block_fdp_empty_status_fails_startup():
 
 def test_raw_block_fdp_status_is_reported():
     fake_core = _FakeFdpCore(status=[(0, 10), (7, 17)])
-    adapter = _make_fdp_adapter(fake_core, _make_fdp_config(handles=[0]))
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(handles=[0]),
+    )
     try:
         status = adapter.report_status()
         assert status["fdp_enabled"] is True
         assert status["fdp_discovered_status"] == [(0, 10), (7, 17)]
         assert status["fdp_placement_handles"] == [0]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_rank_isolation_requires_fdp_enabled():
+    with pytest.raises(ValueError, match="fdp_policy requires"):
+        RawBlockL2AdapterConfig(
+            device_path="/dev/ng0n1",
+            slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
+            fdp_policy="rank_isolation",  # type: ignore[arg-type]
+        )
+
+
+def test_raw_block_fdp_rank_isolation_claims_handles_exclusively():
+    status = [(handle, 100 + handle) for handle in range(8)]
+    first_adapter = _make_fdp_adapter(
+        _FakeFdpCore(status=status),
+        _make_fdp_config(
+            handles=[0, 1],
+            fdp_policy="rank_isolation",
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="already claimed"):
+            _make_fdp_adapter(
+                _FakeFdpCore(status=status),
+                _make_fdp_config(
+                    handles=[0, 1],
+                    fdp_policy="rank_isolation",
+                ),
+            )
+
+        second_adapter = _make_fdp_adapter(
+            _FakeFdpCore(status=status),
+            _make_fdp_config(
+                handles=[2, 3],
+                fdp_policy="rank_isolation",
+            ),
+        )
+        second_adapter.close()
+    finally:
+        first_adapter.close()
+
+    released_adapter = _make_fdp_adapter(
+        _FakeFdpCore(status=status),
+        _make_fdp_config(
+            handles=[0, 1],
+            fdp_policy="rank_isolation",
+        ),
+    )
+    released_adapter.close()
+
+
+def test_raw_block_fdp_rank_isolation_passes_per_key_placements():
+    fake_core = _FakeFdpCore(status=[(0, 10), (5, 15)])
+    config = _make_fdp_config(fdp_policy="rank_isolation")
+    adapter = _make_fdp_adapter(fake_core, config)
+    try:
+
+        def with_rank(chunk_id: int, local_rank: int) -> ObjectKey:
+            key = make_object_key(chunk_id)
+            return key.__class__(
+                chunk_hash=key.chunk_hash,
+                model_name=key.model_name,
+                kv_rank=ObjectKey.ComputeKVRank(4, local_rank, 4, local_rank),
+                object_group_id=key.object_group_id,
+                cache_salt=key.cache_salt,
+            )
+
+        keys = [with_rank(1, 1), with_rank(2, 0), with_rank(3, 1)]
+        objects = [
+            make_memory_obj(b"a"),
+            make_memory_obj(b"b"),
+            make_memory_obj(b"c"),
+        ]
+        task_id = adapter.submit_store_task(keys, objects)
+
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+        assert fake_core.put_many_calls[0][1] == [5, 0, 5]
+        status = adapter.report_status()
+        assert status["fdp_policy"] == "rank_isolation"
+        assert status["fdp_local_rank_to_placement"] == {0: 0, 1: 5}
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_rank_isolation_fails_at_store_for_missing_handle():
+    fake_core = _FakeFdpCore(status=[(0, 10)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(handles=[0], fdp_policy="rank_isolation"),
+    )
+    try:
+        key = make_object_key(1)
+        key = key.__class__(
+            chunk_hash=key.chunk_hash,
+            model_name=key.model_name,
+            kv_rank=ObjectKey.ComputeKVRank(4, 1, 4, 1),
+            object_group_id=key.object_group_id,
+            cache_salt=key.cache_salt,
+        )
+        task_id = adapter.submit_store_task([key], [make_memory_obj(b"a")])
+
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert not adapter.pop_completed_store_tasks()[task_id].is_successful()
+        assert fake_core.put_many_calls == []
+        assert adapter.report_status()["fdp_local_rank_to_placement"] == {}
     finally:
         adapter.close()
