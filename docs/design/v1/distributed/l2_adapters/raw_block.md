@@ -57,6 +57,10 @@ metadata lifetime separate from cached KV slot lifetime.
 passes `dtype=0, dspec=0` to NVMe. Integer `0` is a valid explicit FDP placement
 handle and sends the FDP directive with `dspec=0`.
 
+`rank_isolation` and `domain_isolation` are sibling FDP placement policies. Both
+select placement handles for raw-block data slot writes, but they use different
+isolation keys.
+
 `rank_isolation` maps the local rank encoded in `ObjectKey.kv_rank` to FDP
 placement handles. FDP SSDs are node-local NVMe devices shared by GPU workers
 on the same LMCache server, so this policy isolates local writers. Local ranks
@@ -66,6 +70,14 @@ local rank without a selected handle, that store fails instead of sharing anothe
 rank's handle. The selected handles are also claimed exclusively per device
 while the adapter is running, so another local adapter using the same device must
 select a disjoint handle subset.
+
+`domain_isolation` maps `cache_salt` values to FDP placement handles when they
+are first observed in a store request. The first observed store for a new
+`cache_salt` consumes the next selected handle; later stores for the same
+`cache_salt` reuse that handle. If the selected handle pool is exhausted, new
+`cache_salt` values are recorded with `None`, which means the write uses default
+device placement. The exhaustion warning is emitted once so store workers do not
+log on every I/O after the pool is exhausted.
 
 ## Key Design Choice
 
@@ -168,6 +180,22 @@ by the device:
   "fdp_enabled": true,
   "fdp_policy": "rank_isolation",
   "fdp_placement_handles": [0, 1]
+}
+```
+
+For `domain_isolation`, use the same FDP base configuration and set the policy
+to `domain_isolation`:
+
+```json
+{
+  "type": "raw_block",
+  "device_path": "/dev/ng0n1",
+  "slot_bytes": 1048576,
+  "io_engine": "io_uring",
+  "use_uring_cmd": true,
+  "fdp_enabled": true,
+  "fdp_policy": "domain_isolation",
+  "fdp_placement_handles": [0, 1, 2, 3]
 }
 ```
 

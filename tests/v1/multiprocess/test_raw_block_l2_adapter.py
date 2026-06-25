@@ -201,6 +201,16 @@ def _make_fdp_adapter(fake_core: _FakeFdpCore, config: RawBlockL2AdapterConfig):
         return RawBlockL2Adapter(config)
 
 
+def _with_cache_salt(key: ObjectKey, cache_salt: str) -> ObjectKey:
+    return key.__class__(
+        chunk_hash=key.chunk_hash,
+        model_name=key.model_name,
+        kv_rank=key.kv_rank,
+        object_group_id=key.object_group_id,
+        cache_salt=cache_salt,
+    )
+
+
 def test_raw_block_fdp_requires_uring_cmd_config():
     with pytest.raises(ValueError, match="fdp_enabled requires"):
         RawBlockL2AdapterConfig(
@@ -367,4 +377,84 @@ def test_raw_block_fdp_rank_isolation_fails_at_store_for_missing_handle():
         assert fake_core.put_many_calls == []
         assert adapter.report_status()["fdp_local_rank_to_placement"] == {}
     finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_domain_isolation_assigns_and_reuses_cache_salts():
+    fake_core = _FakeFdpCore(status=[(0, 10), (7, 17)])
+    config = _make_fdp_config(
+        handles=[0, 7],
+        fdp_policy="domain_isolation",
+    )
+    adapter = _make_fdp_adapter(fake_core, config)
+    try:
+        keys = [
+            _with_cache_salt(make_object_key(1), "tenant-a"),
+            _with_cache_salt(make_object_key(2), "tenant-b"),
+            _with_cache_salt(make_object_key(3), "tenant-a"),
+        ]
+        objects = [make_memory_obj(b"a"), make_memory_obj(b"b"), make_memory_obj(b"c")]
+        task_id = adapter.submit_store_task(keys, objects)
+
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+        assert fake_core.put_many_calls[0][1] == [0, 7, 0]
+        status = adapter.report_status()
+        assert status["fdp_policy"] == "domain_isolation"
+        assert status["fdp_cache_salt_to_placement"] == {
+            "tenant-a": 0,
+            "tenant-b": 7,
+        }
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_domain_isolation_exhaustion_uses_default_once():
+    fake_core = _FakeFdpCore(status=[(0, 10)])
+    config = _make_fdp_config(
+        handles=[0],
+        fdp_policy="domain_isolation",
+    )
+    adapter = _make_fdp_adapter(fake_core, config)
+    warning_patch = patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.logger.warning"
+    )
+    warning_mock = warning_patch.start()
+    try:
+        keys = [
+            _with_cache_salt(make_object_key(1), "tenant-a"),
+            _with_cache_salt(make_object_key(2), "tenant-b"),
+        ]
+        task_id = adapter.submit_store_task(
+            keys,
+            [make_memory_obj(b"a"), make_memory_obj(b"b")],
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+        keys = [
+            _with_cache_salt(make_object_key(3), "tenant-c"),
+            _with_cache_salt(make_object_key(4), "tenant-b"),
+        ]
+        task_id = adapter.submit_store_task(
+            keys,
+            [make_memory_obj(b"c"), make_memory_obj(b"d")],
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+        assert fake_core.put_many_calls[0][1] == [0, None]
+        assert fake_core.put_many_calls[1][1] == [None, None]
+        status = adapter.report_status()
+        assert status["fdp_cache_salt_to_placement"] == {
+            "tenant-a": 0,
+            "tenant-b": None,
+            "tenant-c": None,
+        }
+        assert warning_mock.call_count == 1
+        assert "domain_isolation exhausted placement handles" in str(
+            warning_mock.call_args.args[0]
+        )
+    finally:
+        warning_patch.stop()
         adapter.close()
