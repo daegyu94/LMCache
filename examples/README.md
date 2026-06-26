@@ -75,6 +75,7 @@ Focus: deploying, monitoring, and operating LMCache in production.
 |---------|-------------|----------|
 | [`kv_cache_reuse/remote_backends/`](kv_cache_reuse/remote_backends/) | Remote storage backends: InfiniStore, Mooncake, S3, Valkey, Redis. Each subdirectory has its own README with backend-specific setup. | 1 GPU + respective backend |
 | [`serde/fp8/`](serde/fp8/) | Quantize KV cache to fp8 before writing to disk (L2 adapter), then dequantize on prefetch. Halves disk storage requirements. | Hopper / Ada GPU (H100, RTX 40-series) |
+| [`raw_block_fdp/`](raw_block_fdp/) | Standalone smoke test for raw-block FDP discovery and placement-policy mapping on an NVMe FDP namespace. | FDP NVMe |
 | [`redis_lookup/`](redis_lookup/) | Shows the Redis key schema used by LMCache (`model@world_size@worker_id@chunk_hash`) and `redis-cli` commands for inspecting live cache entries. | Redis + 1 GPU |
 
 ### Non-Prefix KV Reuse (CacheBlend)
