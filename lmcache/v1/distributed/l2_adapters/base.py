@@ -218,6 +218,63 @@ class L2AdapterInterface(ABC):
         """
         pass
 
+    def submit_store_task_with_context(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        instance_id: int | None = None,
+    ) -> L2TaskId:
+        """Submit a store task with the originating engine instance id.
+
+        The default implementation ignores ``instance_id`` and delegates to
+        ``submit_store_task``. Adapters that route by instance (e.g. FDP
+        class isolation) override this and consume the extra context.
+
+        Args:
+            keys: Keys to store.
+            objects: Memory objects to store, aligned with ``keys``.
+            instance_id: Engine instance id that produced this batch, or
+                ``None`` if the caller does not track instance context.
+
+        Returns:
+            L2TaskId: Task id of the submitted store task.
+        """
+        del instance_id
+        return self.submit_store_task(keys, objects)
+
+    def on_engine_context_registered(
+        self,
+        instance_id: int,
+        placement_hint: str | None,
+    ) -> None:
+        """Notify the adapter that an engine instance has registered.
+
+        Called by the storage manager after a successful
+        ``REGISTER_KV_CACHE`` (both GPU and engine-driven paths). The
+        default is a no-op. Adapters that route stores by engine instance
+        override this hook to precompute per-instance routing state (e.g.
+        map ``placement_hint`` to a placement handle) and raise from here
+        to reject unusable registrations.
+
+        Args:
+            instance_id: Newly registered engine instance id.
+            placement_hint: Storage placement hint the engine supplied at
+                registration time, or ``None`` if unset.
+        """
+        del instance_id, placement_hint
+
+    def on_engine_context_unregistered(self, instance_id: int) -> None:
+        """Notify the adapter that an engine instance has unregistered.
+
+        Called by the storage manager after an instance's context is
+        torn down. The default is a no-op. Adapters that hold
+        per-instance routing state override this hook to release it.
+
+        Args:
+            instance_id: Engine instance id that was unregistered.
+        """
+        del instance_id
+
     @abstractmethod
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         """Pop all completed store tasks.

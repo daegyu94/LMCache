@@ -1066,6 +1066,31 @@ def test_server_register_and_find_non_cuda_context_layout(
     assert layout.shapes[0] == torch.Size([2, 2, 16, 16])
 
 
+def test_engine_driven_register_propagates_adapter_context_reject(
+    stub_native_storage_ops: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A raise from broadcast_engine_context_registered aborts REGISTER.
+
+    Adapters that need per-instance routing (e.g. raw_block FDP class
+    isolation without a hint) reject a registration by raising from
+    ``on_engine_context_registered``; the storage manager surfaces that
+    raise, and REGISTER must not leave a half-built entry behind.
+    """
+    module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    mock_storage.broadcast_engine_context_registered.side_effect = ValueError(
+        "raw_block FDP class isolation requires a placement hint"
+    )
+
+    with pytest.raises(ValueError, match="placement hint"):
+        module.register_kv_cache_engine_driven_context(
+            _default_register_payload(instance_id=11)
+        )
+
+    # No context entry or layout entry was created.
+    assert ctx.layout_desc_registry.find("m", 1) is None
+
+
 def test_server_store_and_retrieve_cpu_chunks(
     stub_native_storage_ops: Any,
     server_module_factory: ServerModuleFactory,

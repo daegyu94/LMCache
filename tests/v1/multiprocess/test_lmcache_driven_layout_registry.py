@@ -141,6 +141,45 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     assert ctx.layout_desc_registry.find("shared-model", 1) is None
 
 
+def test_gpu_register_propagates_adapter_context_reject(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_native_storage_ops: Any,
+) -> None:
+    """A raise from broadcast_engine_context_registered aborts REGISTER.
+
+    Adapters that need per-instance routing (e.g. raw_block FDP class
+    isolation without a hint) reject a registration by raising from
+    ``on_engine_context_registered``; the storage manager surfaces that
+    raise, and REGISTER must leave no context entry or layout registration
+    behind.
+    """
+    # First Party
+    from lmcache.utils import EngineType
+    from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
+    from lmcache.v1.multiprocess.modules import (
+        lmcache_driven_transfer as lmcache_driven_transfer_mod,
+    )
+
+    ctx = MagicMock()
+    ctx.chunk_size = 16
+    ctx.layout_desc_registry = LayoutDescRegistry()
+    ctx.storage_manager.broadcast_engine_context_registered.side_effect = ValueError(
+        "raw_block FDP class isolation requires a placement hint"
+    )
+
+    monkeypatch.setattr(
+        lmcache_driven_transfer_mod,
+        "DeviceHostFuncDispatcher",
+        _FakeDeviceHostFuncDispatcher,
+    )
+
+    module = lmcache_driven_transfer_mod.LMCacheDrivenTransferModule(ctx)
+    with pytest.raises(ValueError, match="placement hint"):
+        module.register_kv_cache(1, [], "m", 1, EngineType.VLLM, {}, [])
+
+    assert ctx.layout_desc_registry.find("m", 1) is None
+
+
 def _layout() -> Any:
     """A minimal layout descriptor for registry tests."""
     # First Party

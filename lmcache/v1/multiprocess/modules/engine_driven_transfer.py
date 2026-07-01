@@ -282,7 +282,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         for obj_keys in write_obj_keys:
             if obj_keys:
-                self._ctx.storage_manager.finish_write(obj_keys)
+                self._ctx.storage_manager.finish_write(
+                    obj_keys, instance_id=instance_id
+                )
         for obj_keys in read_obj_keys:
             if obj_keys:
                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)
@@ -373,6 +375,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        # Adapters may reject the registration (e.g. raw_block FDP class
+        # isolation without a hint). Fail fast BEFORE publishing the
+        # entry/strategy so a rejected instance never routes traffic.
+        self._ctx.storage_manager.broadcast_engine_context_registered(
+            payload.instance_id, payload.placement_hint
+        )
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -409,6 +417,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             return
 
         self._release_entry(instance_id, entry)
+        self._ctx.storage_manager.broadcast_engine_context_unregistered(instance_id)
         logger.info("Unregistered non-CUDA context for instance ID %d", instance_id)
 
     @_lmcache_nvtx_annotate

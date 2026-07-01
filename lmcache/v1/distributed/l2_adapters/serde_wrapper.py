@@ -72,6 +72,10 @@ class _StoreTaskState:
     keys: list[ObjectKey]
     temp_keys: list[ObjectKey]
     temp_objs: list[MemoryObj]
+    instance_id: int | None
+    """Engine instance id that produced this batch, or ``None`` when no
+    instance context was supplied. Forwarded to the inner adapter when
+    the serialize→store transition submits the inner store."""
     phase: _StorePhase
     """SERIALIZE while temps are write-locked; INNER_STORE after the
     serialize→store transition. Only read on shutdown to pick the right
@@ -166,7 +170,23 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
+        """Submit a wrapped store without instance context.
+
+        Equivalent to ``submit_store_task_with_context`` with
+        ``instance_id=None``.
+        """
+        return self.submit_store_task_with_context(keys, objects, instance_id=None)
+
+    def submit_store_task_with_context(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        instance_id: int | None = None,
+    ) -> L2TaskId:
         """Submit a wrapped store (serialize → inner.store).
+
+        The ``instance_id`` is captured on the task state and forwarded to
+        the inner adapter when serialize completes.
 
         All-or-nothing: if temp alloc fails for any key or serialize
         submission raises, the whole task is marked failed and the
@@ -194,6 +214,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             keys=list(keys),
             temp_keys=temp_keys,
             temp_objs=temp_objs,
+            instance_id=instance_id,
             phase=_StorePhase.SERIALIZE,
         )
         try:
@@ -328,6 +349,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         # Listeners track what's actually stored — which is inner's job.
         self._inner.register_listener(listener)
 
+    def on_engine_context_registered(
+        self,
+        instance_id: int,
+        placement_hint: str | None,
+    ) -> None:
+        # Instance/placement decisions belong to the wrapped adapter.
+        self._inner.on_engine_context_registered(instance_id, placement_hint)
+
+    def on_engine_context_unregistered(self, instance_id: int) -> None:
+        self._inner.on_engine_context_unregistered(instance_id)
+
     def report_status(self) -> dict:
         inner_status = self._inner.report_status()
         return {**inner_status, "serde_wrapped": True}
@@ -453,7 +485,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             # can safely read them during the store.
             self._l1_manager.finish_write_and_reserve_read(state.temp_keys)
             try:
-                inner_id = self._inner.submit_store_task(state.keys, state.temp_objs)
+                inner_id = self._inner.submit_store_task_with_context(
+                    state.keys,
+                    state.temp_objs,
+                    instance_id=state.instance_id,
+                )
             except Exception:
                 logger.exception(
                     "Serde wrapper: inner.submit_store_task raised for task %d",

@@ -230,7 +230,9 @@ class PickleTransferStrategy(TransferStrategy):
                 written_keys.append(obj_key)
         finally:
             if written_keys:
-                self._storage_manager.finish_write(written_keys)
+                self._storage_manager.finish_write(
+                    written_keys, instance_id=instance_id
+                )
 
         return len(written_keys) == len(reserved_dict)
 
@@ -386,7 +388,7 @@ class ShmTransferStrategy(TransferStrategy):
         if reserved_keys is None:
             return False
         if reserved_keys:
-            self._storage_manager.finish_write(reserved_keys)
+            self._storage_manager.finish_write(reserved_keys, instance_id=instance_id)
         return True
 
     def prepare_retrieve(

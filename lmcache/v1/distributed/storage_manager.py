@@ -227,16 +227,27 @@ class StorageManager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        instance_id: int | None = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
 
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
+            instance_id: Optional engine instance id that produced the
+                batch. When provided, it is threaded through to the store
+                controller so per-instance routing (e.g. FDP class
+                isolation) receives the correct context. Failed L1
+                keys have their pending annotation cleared to avoid
+                stranding state on keys that never reach L2 store.
         """
+        if instance_id is not None:
+            self._store_controller.register_pending_store_instance(keys, instance_id)
         finish_result = self._l1_manager.finish_write(keys)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        if instance_id is not None and failed_keys:
+            self._store_controller.clear_pending_store_instance(failed_keys)
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_FINISHED,
@@ -248,6 +259,42 @@ class StorageManager:
         )
 
         # TODO: global key states update
+
+    def register_l2_store_instance(
+        self,
+        keys: list[ObjectKey],
+        instance_id: int,
+    ) -> None:
+        """Annotate ``keys`` with the engine ``instance_id`` for L2 store routing.
+
+        Callers that cannot pass ``instance_id`` through
+        ``finish_write`` (e.g. the GPU store path routes finish_write
+        through a stream callback whose payload is only the key list)
+        record the annotation up front. The store controller pops the
+        annotation when the matching L1 write-finished notification
+        arrives.
+        """
+        self._store_controller.register_pending_store_instance(keys, instance_id)
+
+    def broadcast_engine_context_registered(
+        self,
+        instance_id: int,
+        placement_hint: str | None,
+    ) -> None:
+        """Notify L2 adapters that a new engine instance has registered.
+
+        Called by the MP register handlers after a successful
+        REGISTER_KV_CACHE. Adapters that route stores by engine instance
+        (e.g. raw_block class isolation) precompute routing state here
+        and may raise from their hook to reject an unusable registration.
+        """
+        self._store_controller.broadcast_engine_context_registered(
+            instance_id, placement_hint
+        )
+
+    def broadcast_engine_context_unregistered(self, instance_id: int) -> None:
+        """Notify L2 adapters that an engine instance has unregistered."""
+        self._store_controller.broadcast_engine_context_unregistered(instance_id)
 
     @contextmanager
     def read_prefetched_results(

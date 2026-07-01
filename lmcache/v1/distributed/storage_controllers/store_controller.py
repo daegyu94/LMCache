@@ -46,22 +46,33 @@ logger = init_logger(__name__)
 STORE_LOOP_POLL_TIMEOUT_MS = 500
 
 
-def _group_keys_by_shape(
+def _group_keys_by_shape_and_instance(
     keys: list[ObjectKey],
-) -> dict[tuple, list[ObjectKey]]:
-    """Group ``keys`` by the fields that determine their KV cache shape.
+    key_to_instance: dict[ObjectKey, int],
+) -> dict[tuple, tuple[list[ObjectKey], int | None]]:
+    """Group ``keys`` by shape and the engine instance that produced them.
 
-    Each bucket shares a single ``(shape, dtype)``, so each bucket can be
-    submitted as one ``submit_store_task`` call. Today the shape is pinned
-    by ``(model_name, kv_rank)`` — ``kv_rank`` packs ``world_size`` and
-    parallelism config, so different TP/PP setups land in different
-    buckets. Extend the grouping tuple when a new shape-affecting field is
-    added to ``ObjectKey``.
+    Each bucket shares a single ``(shape, dtype, instance_id)`` and can be
+    submitted as one ``submit_store_task_with_context`` call carrying that
+    instance id. Shape is pinned today by ``(model_name, kv_rank)``;
+    ``kv_rank`` packs ``world_size`` and parallelism config, so different
+    TP/PP setups land in different buckets. Keys not present in
+    ``key_to_instance`` fall into an ``instance_id=None`` bucket.
+
+    Returns:
+        A dict keyed by the grouping tuple whose values are
+        ``(keys_in_group, instance_id)`` — the second element is the
+        instance id shared by every key in the group (``None`` when no
+        instance context was registered for the batch).
     """
     groups: dict[tuple, list[ObjectKey]] = defaultdict(list)
     for key in keys:
-        groups[(key.model_name, key.kv_rank)].append(key)
-    return groups
+        instance_id = key_to_instance.get(key)
+        groups[(key.model_name, key.kv_rank, instance_id)].append(key)
+    return {
+        group_key: (group_keys, group_key[2])
+        for group_key, group_keys in groups.items()
+    }
 
 
 # Helper classes (module-level, before main class)
@@ -254,6 +265,16 @@ class StoreController(StorageControllerInterface):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
 
+        # Pending instance-id annotations for keys that are on their way
+        # to L2 store. Populated by ``register_pending_store_instance``
+        # ahead of ``finish_write`` and drained in ``_process_new_keys``
+        # when the corresponding L1-write-finished notification arrives.
+        # Protected by ``_instance_lock`` because the register/clear
+        # calls happen on the storage-manager thread while the drain
+        # runs on the store loop thread.
+        self._instance_lock = threading.Lock()
+        self._pending_store_instance: dict[ObjectKey, int] = {}
+
         # (adapter_index, task_id) -> InFlightStoreTask
         # Composite key is needed because task IDs are only unique
         # within a single adapter, not across adapters.
@@ -319,6 +340,72 @@ class StoreController(StorageControllerInterface):
         self._cleanup_in_flight_tasks()
         self._listener.close()
         self._adapter_ctrl_efd.close()
+
+    def register_pending_store_instance(
+        self,
+        keys: list[ObjectKey],
+        instance_id: int,
+    ) -> None:
+        """Record the engine instance that produced ``keys``.
+
+        Called by ``StorageManager.finish_write`` before the L1
+        write-finished notification reaches the store loop. Later,
+        ``_process_new_keys`` pops the annotations and groups keys so
+        that each L2 store task carries a single ``instance_id``.
+
+        Args:
+            keys: Keys about to enter L2 store routing.
+            instance_id: Engine instance that produced ``keys``.
+        """
+        if not keys:
+            return
+        with self._instance_lock:
+            for key in keys:
+                self._pending_store_instance[key] = instance_id
+
+    def clear_pending_store_instance(self, keys: list[ObjectKey]) -> None:
+        """Discard pending instance annotations for ``keys``.
+
+        Called when ``finish_write`` fails and the keys will never reach
+        the store loop, so their instance annotations must not linger.
+        """
+        if not keys:
+            return
+        with self._instance_lock:
+            for key in keys:
+                self._pending_store_instance.pop(key, None)
+
+    def _pop_pending_store_instances(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, int]:
+        """Pop instance annotations for ``keys`` (called from the loop)."""
+        if not keys:
+            return {}
+        popped: dict[ObjectKey, int] = {}
+        with self._instance_lock:
+            for key in keys:
+                instance_id = self._pending_store_instance.pop(key, None)
+                if instance_id is not None:
+                    popped[key] = instance_id
+        return popped
+
+    def broadcast_engine_context_registered(
+        self,
+        instance_id: int,
+        placement_hint: str | None,
+    ) -> None:
+        """Notify every attached L2 adapter that ``instance_id`` registered.
+
+        The storage manager calls this after a successful REGISTER_KV_CACHE
+        so adapters can precompute per-instance routing state.
+        """
+        for adapter in self._l2_adapters.values():
+            adapter.on_engine_context_registered(instance_id, placement_hint)
+
+    def broadcast_engine_context_unregistered(self, instance_id: int) -> None:
+        """Notify every attached L2 adapter that ``instance_id`` unregistered."""
+        for adapter in self._l2_adapters.values():
+            adapter.on_engine_context_unregistered(instance_id)
 
     def report_status(self) -> dict:
         """Return a status dict for the store controller."""
@@ -567,10 +654,17 @@ class StoreController(StorageControllerInterface):
             keys (list[ObjectKey]): Keys that finished writing to L1.
         """
 
-        for group in _group_keys_by_shape(keys).values():
-            self._submit_store_for_single_shape(group)
+        key_to_instance = self._pop_pending_store_instances(keys)
+        for group_keys, instance_id in _group_keys_by_shape_and_instance(
+            keys, key_to_instance
+        ).values():
+            self._submit_store_for_single_shape(group_keys, instance_id)
 
-    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
+    def _submit_store_for_single_shape(
+        self,
+        keys: list[ObjectKey],
+        instance_id: int | None,
+    ) -> None:
         """Submit ``keys`` (all same shape) to their target adapters."""
         # Only route to adapters that are live (not draining). Descriptors
         # for draining adapters are kept for in-flight completion handling
@@ -653,7 +747,11 @@ class StoreController(StorageControllerInterface):
                 continue
 
             adapter = self._l2_adapters[adapter_index]
-            task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            task_id = adapter.submit_store_task_with_context(
+                successful_keys,
+                successful_objs,
+                instance_id=instance_id,
+            )
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,

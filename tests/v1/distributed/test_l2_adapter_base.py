@@ -321,3 +321,44 @@ class TestListenersStillFire:
         k = _make_key(1)
         a._notify_keys_accessed([k])
         assert lst.accessed == [[k]]
+
+
+# ---------------------------------------------------------------------------
+# Engine-context hooks
+# ---------------------------------------------------------------------------
+
+
+class TestEngineContextHooks:
+    """The base class provides no-op defaults for the engine-context
+    hooks so most adapters don't need to override anything. Adapters that
+    care about per-instance routing (e.g. raw_block FDP class isolation)
+    override selectively.
+    """
+
+    def test_context_hooks_default_noop(self):
+        a = _StubAdapter()
+        # Neither call raises — both are no-ops on the base class.
+        a.on_engine_context_registered(instance_id=42, placement_hint=None)
+        a.on_engine_context_registered(instance_id=42, placement_hint="hot_churn")
+        a.on_engine_context_unregistered(instance_id=42)
+
+    def test_submit_store_task_with_context_delegates_when_not_overridden(self):
+        """Default ``submit_store_task_with_context`` drops the instance
+        id and forwards to ``submit_store_task`` so adapters that do not
+        opt into per-instance routing stay untouched."""
+
+        class _Recording(_StubAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[list[ObjectKey], list]] = []
+
+            def submit_store_task(self, keys, objects):
+                self.calls.append((list(keys), list(objects)))
+                return 7
+
+        a = _Recording()
+        keys = [_make_key(1), _make_key(2)]
+        objects = [object(), object()]
+        task_id = a.submit_store_task_with_context(keys, objects, instance_id=99)
+        assert task_id == 7
+        assert a.calls == [(keys, objects)]

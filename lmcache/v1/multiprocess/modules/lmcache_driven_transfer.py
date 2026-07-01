@@ -663,6 +663,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 )
                 return
 
+        # Notify L2 adapters BEFORE we build any heavy state. An adapter
+        # that requires per-instance routing (e.g. raw_block FDP class
+        # isolation) may raise here to reject the registration; failing
+        # early keeps rejected instances from ever holding a context.
+        self._ctx.storage_manager.broadcast_engine_context_registered(
+            instance_id, placement_hint
+        )
+
         # Build the context and layout descriptor outside the lock.
         cache_context = create_cache_context(
             kv_caches,
@@ -711,6 +719,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             return
 
         self._release_entry(entry)
+        self._ctx.storage_manager.broadcast_engine_context_unregistered(instance_id)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @_lmcache_nvtx_annotate
@@ -892,10 +901,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
                 if stored_count:
+                    # Register the instance annotation on the store
+                    # controller BEFORE scheduling finish_write on the
+                    # stream. The stream callback dispatcher can only
+                    # forward the key list; the store controller pops
+                    # the annotation when the L1 write-finished
+                    # notification arrives.
+                    stored_keys = list(all_dict.keys())
+                    self._ctx.storage_manager.register_l2_store_instance(
+                        stored_keys, instance_id
+                    )
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
                         "finish_write",
-                        list(all_dict.keys()),
+                        stored_keys,
                     )
                 else:
                     total_bytes = 0
