@@ -132,6 +132,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        placement_hint: Optional storage placement hint from registration.
     """
 
     instance_id: int
@@ -142,6 +143,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    placement_hint: str | None = None
 
 
 @dataclass

@@ -630,6 +630,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
+        placement_hint: str | None = None,
     ) -> None:
         """Register the KV cache tensors for a given GPU instance ID.
 
@@ -645,6 +646,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+            placement_hint: Optional storage placement hint.
         """
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering

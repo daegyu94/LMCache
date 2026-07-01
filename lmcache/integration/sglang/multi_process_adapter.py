@@ -20,6 +20,7 @@ from lmcache.integration.sglang.sglang_adapter import (
     LoadMetadata,
     StoreMetadata,
 )
+from lmcache.integration.sglang.utils import lmcache_get_config
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     DEFAULT_HEARTBEAT_INTERVAL,
     DEFAULT_MQ_TIMEOUT,
@@ -42,6 +43,15 @@ logger = init_logger(__name__)
 # Extra seconds the WAIT_PREFETCH_STATUS response is allowed beyond the daemon's
 # own blocking-wait budget, to cover the request/response round trip.
 _WAIT_LOOKUP_RESPONSE_BUFFER_S = 5.0
+_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY = "lmcache.fdp.placement_hint"
+
+
+def _get_fdp_placement_hint() -> str | None:
+    config = lmcache_get_config()
+    hint = config.get_extra_config_value(_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY)
+    if hint is not None and not isinstance(hint, str):
+        raise ValueError(f"{_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY} must be a string")
+    return hint
 
 
 def _wrap_sglang_kv_caches(
@@ -162,6 +172,7 @@ class LMCacheMPConnector:
                 EngineType.SGLANG,
                 {"tokens_per_block": self.page_size},
                 [],
+                _get_fdp_placement_hint(),
             ],
         ).result(timeout=self._mq_timeout)
         self._registered = True

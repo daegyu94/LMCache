@@ -55,6 +55,7 @@ class EngineDrivenContextEntry:
             instance (register, PING, prepare/commit). Drives reaping.
         has_liveness_signal: True once the instance has sent at least one
             PING. Selects the reap window. Latched only by PING.
+        placement_hint: Optional storage placement hint from registration.
     """
 
     metadata: EngineDrivenContextMetadata
@@ -62,6 +63,7 @@ class EngineDrivenContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    placement_hint: str | None = None
 
 
 class EngineDrivenTransferModule(InstanceLivenessTarget):
@@ -154,6 +156,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             non_cuda_context_meta[str(instance_id)] = {
                 "model_name": entry.model_name,
                 "world_size": entry.world_size,
+                "placement_hint": entry.placement_hint,
                 "block_size": entry.metadata.block_size,
                 "use_mla": entry.metadata.use_mla,
             }
@@ -357,6 +360,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             metadata=metadata,
             model_name=payload.model_name,
             world_size=payload.world_size,
+            placement_hint=payload.placement_hint,
             last_seen=now,
             has_liveness_signal=False,
         )

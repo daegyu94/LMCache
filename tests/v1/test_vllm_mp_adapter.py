@@ -193,6 +193,31 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert args[1] == RequestType.REGISTER_KV_CACHE
 
 
+def test_register_kv_caches_forwards_fdp_placement_hint(monkeypatch):
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    future = MagicMock(name="future")
+    future.result.return_value = None
+    send_mock = MagicMock(name="send_lmcache_request", return_value=future)
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    monkeypatch.setattr(adapter_mod, "wrap_kv_caches", lambda kv: list(kv.values()))
+
+    adapter = _make_worker_adapter(
+        extra_config={"lmcache.fdp.placement_hint": "cold_reuse"}
+    )
+    send_mock.reset_mock()
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    args, _kwargs = send_mock.call_args
+    assert args[1] == RequestType.REGISTER_KV_CACHE
+    assert args[2][-1] == "cold_reuse"
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter
@@ -223,6 +248,28 @@ def test_register_kv_caches_cpu_submits_engine_driven_context_registration(
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
     assert len(args[2]) == 1
+    assert args[2][0].placement_hint is None
+
+
+def test_register_kv_caches_cpu_forwards_fdp_placement_hint(monkeypatch):
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    future = MagicMock(name="future")
+    future.result.return_value = None
+    send_mock = MagicMock(name="send_lmcache_request", return_value=future)
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    adapter = _make_worker_adapter(
+        extra_config={"lmcache.fdp.placement_hint": "cold_reuse"}
+    )
+    send_mock.reset_mock()
+
+    adapter.register_kv_caches({"layer.0": torch.randn(2, 8, 4, 2, 8)})
+
+    args, _kwargs = send_mock.call_args
+    assert args[1] == RequestType.REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
+    assert args[2][0].placement_hint == "cold_reuse"
 
 
 def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):

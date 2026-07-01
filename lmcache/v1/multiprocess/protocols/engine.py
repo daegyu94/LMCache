@@ -99,6 +99,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - layout_hints: LayoutHints - See custom_types.LayoutHints.
         #   - engine_group_infos: list[EngineGroupInfo] - Engine-neutral KV cache
         #     group metadata (msgspec-encoded by the message queue).
+        #   - placement_hint: str | None - Optional storage placement hint.
         # Returns: None
         "REGISTER_KV_CACHE": ProtocolDefinition(
             payload_classes=[
@@ -109,6 +110,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 EngineType,
                 LayoutHints,
                 list[EngineGroupInfo],
+                str | None,
             ],
             response_class=None,
             handler_type=HandlerType.SYNC,

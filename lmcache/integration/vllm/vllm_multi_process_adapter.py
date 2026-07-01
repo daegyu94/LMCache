@@ -69,6 +69,7 @@ DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
 DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
+_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY = "lmcache.fdp.placement_hint"
 
 # Floor (seconds) of the MP server's worker reap timeout. It only covers the
 # default 10 s heartbeat interval (3 x 10 s); the adapter warns at startup
@@ -1070,6 +1071,8 @@ class LMCacheMPWorkerAdapter:
             extra_config: Optional dict with keys starting with
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+                ``lmcache.fdp.placement_hint`` is also accepted as a raw-block
+                FDP registration hint.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
@@ -1080,6 +1083,15 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        self._placement_hint = (
+            None
+            if extra_config is None
+            else extra_config.get(_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY)
+        )
+        if self._placement_hint is not None and not isinstance(
+            self._placement_hint, str
+        ):
+            raise ValueError(f"{_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY} must be a string")
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -1297,6 +1309,7 @@ class LMCacheMPWorkerAdapter:
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                placement_hint=self._placement_hint,
             )
         except TimeoutError:
             raise ConnectionError(

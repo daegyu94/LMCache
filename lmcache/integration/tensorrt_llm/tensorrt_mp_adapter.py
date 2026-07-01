@@ -41,10 +41,14 @@ from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.platform.cuda.ipc_wrapper import RawCudaIPCWrapper
 
+# Local
+from .utils import lmcache_get_config
+
 logger = init_logger(__name__)
 
 DEFAULT_SERVER_URL = "ipc:///tmp/lmcache.sock"
 DEFAULT_MQ_TIMEOUT: float = 300.0
+_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY = "lmcache.fdp.placement_hint"
 
 
 def _get_server_url(llm_args: "TorchLlmArgs") -> str:
@@ -53,6 +57,38 @@ def _get_server_url(llm_args: "TorchLlmArgs") -> str:
     if cfg is not None and cfg.server_url is not None:
         return cfg.server_url
     return os.environ.get("LMCACHE_SERVER_URL", DEFAULT_SERVER_URL)
+
+
+def _get_fdp_placement_hint(llm_args: "TorchLlmArgs") -> str | None:
+    """Resolve the FDP placement hint for TensorRT-LLM MP registration."""
+    cfg = llm_args.kv_connector_config
+    for attr_name in (
+        "placement_hint",
+        "fdp_placement_hint",
+        "lmcache_fdp_placement_hint",
+    ):
+        hint = getattr(cfg, attr_name, None) if cfg is not None else None
+        if hint is not None:
+            if not isinstance(hint, str):
+                raise ValueError(f"{attr_name} must be a string")
+            return hint
+
+    extra_config = getattr(cfg, "extra_config", None) if cfg is not None else None
+    if isinstance(extra_config, dict):
+        hint = extra_config.get(_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY)
+        if hint is not None:
+            if not isinstance(hint, str):
+                raise ValueError(
+                    f"{_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY} must be a string"
+                )
+            return hint
+
+    hint = lmcache_get_config().get_extra_config_value(
+        _FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY
+    )
+    if hint is not None and not isinstance(hint, str):
+        raise ValueError(f"{_FDP_PLACEMENT_HINT_EXTRA_CONFIG_KEY} must be a string")
+    return hint
 
 
 def _send_request(
@@ -369,6 +405,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 EngineType.TRTLLM,
                 layout_hints,
                 [],
+                _get_fdp_placement_hint(self._llm_args),
             ],
         )
         try:
