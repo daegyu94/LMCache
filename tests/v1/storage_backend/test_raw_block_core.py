@@ -258,7 +258,7 @@ def test_raw_block_core_put_many_rejects_zero_placement_before_io(
     spec = encode_object_key(make_object_key(502))
 
     try:
-        with pytest.raises(ValueError, match="placement handle 0"):
+        with pytest.raises(ValueError, match="placement identifier 0"):
             core.put_many([spec], [make_memory_obj(b"data")], placement_ids=[0])
 
         assert raw_device.batched_write_calls == []

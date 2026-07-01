@@ -44,11 +44,10 @@ _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
 RAW_BLOCK_IO_ENGINES = frozenset({"posix", "io_uring"})
 DEFAULT_IOURING_QUEUE_DEPTH = 256
 
-# FDP placement ID semantics are shared by design across raw-block write paths.
-# None omits the directive. Explicit handles must be positive because default
-# writes already use the RUH mapping associated with Placement Handle 0.
-# RawBlockCore rejects explicit handle 0 so KV data never sends an FDP directive
-# for the default placement handle.
+# FDP placement identifier semantics are shared by design across raw-block write paths.
+# None omits the directive. Explicit placement identifiers must be positive;
+# RawBlockCore rejects placement identifier 0 so KV data never sends that
+# reserved value as an explicit FDP directive.
 # Metadata checkpoints are not KV cache data and follow a small periodic/recovery
 # write pattern, so they use default NVMe writes.
 PlacementId = int | None
@@ -107,7 +106,7 @@ def normalize_raw_block_placement_ids(
     field_name: str = "placement_ids",
     allow_none: bool = True,
 ) -> list[PlacementId]:
-    """Validate FDP placement handles and preserve omitted directives."""
+    """Validate FDP placement identifiers and preserve omitted directives."""
     if placement_ids is None:
         return [None] * expected_len
     if len(placement_ids) != expected_len:
@@ -123,7 +122,7 @@ def normalize_raw_block_placement_ids(
         if not isinstance(placement_id, int) or isinstance(placement_id, bool):
             raise ValueError(f"{field_name} must contain integers or None")
         if placement_id == 0:
-            raise ValueError(f"{field_name} must not contain placement handle 0")
+            raise ValueError(f"{field_name} must not contain placement identifier 0")
         if placement_id < 0:
             raise ValueError(f"{field_name} must contain positive integers or None")
         normalized.append(int(placement_id))
@@ -675,9 +674,10 @@ class RawBlockCore:
         Args:
             keys: Ordered raw-block key specs corresponding to ``objs``.
             objs: Memory objects whose byte buffers should be written.
-            placement_ids: Optional per-key FDP placement handles for
-                raw-block writes. ``None`` omits the directive; explicit handle
-                0 is rejected because default writes already use that mapping.
+            placement_ids: Optional per-key FDP placement identifiers for
+                raw-block writes. ``None`` omits the directive; explicit
+                placement identifier 0 is rejected because that value is
+                reserved.
 
         Returns:
             Per-key success results and newly stored encoded keys. If no free
@@ -687,7 +687,7 @@ class RawBlockCore:
 
         Raises:
             ValueError: If either sequence is empty, sequence lengths do not
-                match, or a placement handle is 0.
+                match, or a placement identifier is 0.
         """
         if not keys or not objs:
             raise ValueError("keys and objs must be non-empty")
@@ -1202,8 +1202,8 @@ class RawBlockCore:
             buffers: Source buffers.
             payload_lens: Logical source byte counts.
             total_lens: Physical transfer sizes, including padding.
-            placement_ids: Optional FDP placement handles for each logical
-                write. ``None`` omits the directive; explicit handle 0 is
+            placement_ids: Optional FDP placement identifiers for each logical
+                write. ``None`` omits the directive; explicit placement identifier 0 is
                 rejected.
 
         Raises:
@@ -1337,9 +1337,9 @@ class RawBlockCore:
             buffers: Python buffers to write.
             payload_lens: Logical payload lengths for each buffer.
             total_lens: Physical I/O lengths for each buffer.
-            placement_ids: Optional FDP placement handles for data writes.
-                ``None`` omits the directive; explicit handle 0 is rejected.
-                Metadata checkpoint callers omit this argument so io_uring_cmd
+            placement_ids: Optional FDP placement identifiers for data writes.
+                ``None`` omits the directive; explicit placement identifier 0 is
+                rejected. Metadata checkpoint callers omit this argument so io_uring_cmd
                 leaves the NVMe placement directive unset.
 
         Raises:
@@ -1461,8 +1461,9 @@ class RawBlockCore:
             key: Raw-block key spec with the slot-header identity.
             memory_obj: Source object to write.
             offset: Slot byte offset on the raw device.
-            placement_id: FDP placement handle for this raw-block write.
-                ``None`` omits the directive; explicit handle 0 is rejected.
+            placement_id: FDP placement identifier for this raw-block write.
+                ``None`` omits the directive; explicit placement identifier 0 is
+                rejected.
 
         Returns:
             True when both header and payload writes complete; false otherwise.
@@ -1484,7 +1485,7 @@ class RawBlockCore:
                     padded_header = bytearray(header)
                     padded_header.extend(b"\x00" * (hdr_total - len(header)))
                     header_buf = padded_header
-                # Keep each slot header on the same placement handle as its
+                # Keep each slot header on the same placement identifier as its
                 # payload; future policy can split them if needed.
                 self._write_buffers(
                     [offset, offset + self.header_bytes],

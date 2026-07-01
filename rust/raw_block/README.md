@@ -147,14 +147,14 @@ dev = RawBlockDevice(
 FDP status can be queried from Python when `use_uring_cmd=True`:
 
 ```python
-handles = dev.fetch_fdp_status()  # [(placement_id, ruh_id), ...]
+status = dev.fetch_fdp_status()  # [(placement_id, ruh_id), ...]
 ```
 
 For writes, omitting `placement_id` leaves the NVMe directive unset
-(`dtype=0, dspec=0`). NVMe default writes use the RUH mapping associated with
-Placement Handle 0, so LMCache rejects explicit `placement_id=0` at the
-`RawBlockCore` layer. The low-level status query reads the controller-reported
-16-bit `NRUHSD` count.
+(`dtype=0, dspec=0`). LMCache rejects explicit `placement_id=0` because FDP
+placement identifier 0 is reserved; valid explicit placement identifiers are
+`1..=65535`. The low-level status query reads the controller-reported 16-bit
+`NRUHSD` count.
 
 ## MP Adapter Example
 

@@ -2267,8 +2267,8 @@ impl RawBlockDevice {
                 let placement_id_u16 = placement_ids[i];
 
                 // None means no directive. Some(pid) sets the FDP directive.
-                // Placement handle 0 is reserved for default writes and is
-                // rejected by placement_id_to_u16().
+                // Placement identifier 0 is reserved and rejected by
+                // placement_id_to_u16().
                 let nvme_cmd_data = if let Some((nsid, lba_shift)) = nvme_cmd_data_base {
                     Some(NvmeCmdData {
                         nsid,
