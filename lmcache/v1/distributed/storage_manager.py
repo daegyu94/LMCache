@@ -6,6 +6,7 @@ Distributed multi-tier storage manager for MP mode
 # Standard
 from contextlib import contextmanager
 from typing import Iterator, Literal, Optional
+import os
 import threading
 import time
 
@@ -1092,6 +1093,7 @@ class StorageManager:
             the freshly allocated stable id, ``adapter`` is the new adapter
             instance, and ``descriptor`` is its descriptor carrying that id.
         """
+        self._validate_fdp_raw_block_namespace(config)
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(config, self._l1_memory_desc)
@@ -1103,6 +1105,34 @@ class StorageManager:
             )
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
         return adapter_id, adapter, descriptor
+
+    def _validate_fdp_raw_block_namespace(self, config: L2AdapterConfigBase) -> None:
+        """Reject duplicate FDP-enabled raw_block adapters for one namespace.
+
+        Two FDP-enabled adapters sharing a device namespace would both
+        try to own the same set of placement handles; class-isolation
+        state stored on each adapter would diverge silently. Detect the
+        overlap up front with a normalized real-path comparison.
+        """
+        if not bool(getattr(config, "fdp_enabled", False)):
+            return
+        device_path = getattr(config, "device_path", None)
+        if not isinstance(device_path, str) or not device_path:
+            return
+        namespace = os.path.realpath(os.path.abspath(device_path))
+        for descriptor in self._adapter_descriptors.values():
+            other_config = descriptor.config
+            if not bool(getattr(other_config, "fdp_enabled", False)):
+                continue
+            other_path = getattr(other_config, "device_path", None)
+            if not isinstance(other_path, str) or not other_path:
+                continue
+            other_namespace = os.path.realpath(os.path.abspath(other_path))
+            if other_namespace == namespace:
+                raise ValueError(
+                    "Only one FDP-enabled raw_block adapter is allowed per "
+                    f"device namespace: {namespace}"
+                )
 
     def _should_enable_l2_eviction(
         self,

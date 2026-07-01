@@ -41,6 +41,12 @@ caller-provided load buffers during prefetch.
   and non-zero handle registration. Requires ``io_engine="io_uring"`` and
   ``use_uring_cmd=true``.
 - ``fdp_placement_handles``: Optional exact non-zero handle list.
+- ``fdp_policy``: FDP placement policy. Use ``"none"`` (default) or
+  ``"class_isolation"``.
+- ``fdp_class_granularity``: Placement class granularity, ``"coarse"``
+  (default) or ``"fine"``.
+- ``fdp_class_placement_map``: Optional explicit mapping from class or hint name
+  to FDP placement handle. The same handle may be assigned to multiple classes.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
   Worker-thread counts for each operation type.
 
@@ -65,9 +71,73 @@ caller-provided load buffers during prefetch.
   ``io_uring_cmd`` uses NVMe passthrough rather than the POSIX write path.
 - FDP registers only non-zero handles. If ``fdp_placement_handles`` is
   omitted, all discovered non-zero handles are used; if provided, the list must
-  exactly match the device's non-zero handle set and must not contain 0. Current
-  writes still omit FDP placement handles until the placement policy is added;
-  checkpoint metadata writes also use default NVMe placement with no directive.
+  exactly match the device's non-zero handle set and must not contain 0.
+  Checkpoint metadata writes use default NVMe placement with no directive.
+- ``fdp_policy="class_isolation"`` binds each engine instance to a single
+  FDP placement handle at REGISTER time. The engine's registration hint is
+  normalized to a placement class (see the class-selection table below) and
+  looked up in the class→handle map. Every store from that instance uses the
+  bound handle. If REGISTER is issued without a placement hint under this
+  policy, the adapter rejects the registration.
+- ``fdp_policy`` is a per-adapter concern: adapters that use another policy
+  (or a non-raw_block backend) ignore placement hints entirely. The
+  storage manager rejects registering a second FDP-enabled raw_block
+  adapter against the same device namespace.
+- If ``fdp_class_placement_map`` is omitted, ``class_isolation`` requires enough
+  non-zero FDP handles for every class in the selected granularity and assigns
+  handles in deterministic class order. If the handles are insufficient, server
+  startup fails.
+- vLLM passes the per-instance placement hint through
+  ``kv_connector_extra_config`` with key ``lmcache.fdp.placement_hint``.
+  SGLang and TensorRT-LLM can read the same
+  key from LMCache ``extra_config``; for example,
+  ``LMCACHE_EXTRA_CONFIG='{"lmcache.fdp.placement_hint":"cold_reuse"}'``.
+  TensorRT-LLM MP mode also accepts ``placement_hint``, ``fdp_placement_hint``,
+  or ``lmcache_fdp_placement_hint`` on ``kv_connector_config``.
+
+**FDP class selection:**
+
+The serving engine provides one ``placement_hint`` when it registers a KV-cache
+instance. ``raw_block`` normalizes the hint according to
+``fdp_class_granularity`` and looks up the class in the class→handle map.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 24 24
+
+   * - ``placement_hint`` value
+     - Class/result with ``coarse``
+     - Class/result with ``fine``
+   * - ``hot_churn``
+     - ``hot_churn``
+     - ``hot_churn``
+   * - ``hot_short``, ``hot_session``
+     - ``hot_churn``
+     - Same as the hint
+   * - ``cold_reuse``
+     - ``cold_reuse``
+     - ``cold_reuse``
+   * - ``cold_prefix``, ``cold_rag``, ``cold_checkpoint``
+     - ``cold_reuse``
+     - Same as the hint
+   * - ``bulk_stream``
+     - ``bulk_stream``
+     - ``bulk_stream``
+   * - ``bulk_prefill``, ``bulk_import``
+     - ``bulk_stream``
+     - Same as the hint
+   * - ``ephemeral``
+     - ``ephemeral``
+     - ``ephemeral``
+   * - ``temp_decode``, ``temp_speculative``
+     - ``ephemeral``
+     - Same as the hint
+   * - Missing hint
+     - REGISTER is rejected
+     - REGISTER is rejected
+   * - Unknown hint
+     - REGISTER is rejected
+     - REGISTER is rejected
 
 **Configuration examples:**
 
@@ -84,6 +154,9 @@ caller-provided load buffers during prefetch.
 
     # With FDP discovery enabled, registering all non-zero device handles
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "use_odirect": false}'
+
+    # With FDP class isolation and explicit class-to-handle aliases
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "class_isolation", "fdp_class_placement_map": {"hot_churn": 1, "cold_reuse": 1, "bulk_stream": 2, "ephemeral": 2}, "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'

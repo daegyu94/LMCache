@@ -56,6 +56,103 @@ RawBlockStoreTaskResult = tuple[
     list[int],
 ]
 
+FDP_POLICY_NONE = "none"
+FDP_POLICY_CLASS_ISOLATION = "class_isolation"
+FDP_CLASS_GRANULARITY_COARSE = "coarse"
+FDP_CLASS_GRANULARITY_FINE = "fine"
+FDP_COARSE_CLASSES = ("hot_churn", "cold_reuse", "bulk_stream", "ephemeral")
+FDP_FINE_CLASS_PARENTS = {
+    "hot_short": "hot_churn",
+    "hot_session": "hot_churn",
+    "cold_prefix": "cold_reuse",
+    "cold_rag": "cold_reuse",
+    "cold_checkpoint": "cold_reuse",
+    "bulk_prefill": "bulk_stream",
+    "bulk_import": "bulk_stream",
+    "temp_decode": "ephemeral",
+    "temp_speculative": "ephemeral",
+}
+FDP_POLICY_VALUES = (FDP_POLICY_NONE, FDP_POLICY_CLASS_ISOLATION)
+FDP_CLASS_GRANULARITY_VALUES = (
+    FDP_CLASS_GRANULARITY_COARSE,
+    FDP_CLASS_GRANULARITY_FINE,
+)
+FDP_HINT_TO_COARSE_CLASS = {
+    **{name: name for name in FDP_COARSE_CLASSES},
+    **FDP_FINE_CLASS_PARENTS,
+}
+FDP_FINE_PLACEMENT_CLASSES = FDP_COARSE_CLASSES + tuple(FDP_FINE_CLASS_PARENTS)
+
+
+def _normalize_fdp_policy(policy: object) -> str:
+    normalized = str(FDP_POLICY_NONE if policy is None else policy).strip()
+    if normalized not in FDP_POLICY_VALUES:
+        raise ValueError(
+            f"fdp_policy must be one of {FDP_POLICY_VALUES}, got {policy!r}"
+        )
+    return normalized
+
+
+def _normalize_fdp_class_granularity(granularity: object) -> str:
+    normalized = str(
+        FDP_CLASS_GRANULARITY_COARSE if granularity is None else granularity
+    ).strip()
+    if normalized not in FDP_CLASS_GRANULARITY_VALUES:
+        raise ValueError(
+            "fdp_class_granularity must be one of "
+            f"{FDP_CLASS_GRANULARITY_VALUES}, got {granularity!r}"
+        )
+    return normalized
+
+
+def _fdp_required_classes(granularity: str) -> tuple[str, ...]:
+    if granularity == FDP_CLASS_GRANULARITY_COARSE:
+        return FDP_COARSE_CLASSES
+    return FDP_FINE_PLACEMENT_CLASSES
+
+
+def _normalize_fdp_class_hint(hint: str, granularity: str) -> str:
+    if not isinstance(hint, str):
+        raise ValueError(f"FDP placement class/hint must be a string, got {hint!r}")
+    normalized = hint.strip()
+    if not normalized:
+        raise ValueError("FDP placement class/hint must be non-empty")
+    if granularity == FDP_CLASS_GRANULARITY_COARSE:
+        try:
+            return FDP_HINT_TO_COARSE_CLASS[normalized]
+        except KeyError as e:
+            raise ValueError(f"Unknown FDP placement class/hint {hint!r}") from e
+    if normalized not in FDP_FINE_PLACEMENT_CLASSES:
+        raise ValueError(f"Unknown FDP placement class/hint {hint!r}")
+    return normalized
+
+
+def _normalize_fdp_class_placement_map(
+    mapping: object,
+    granularity: str,
+) -> dict[str, int] | None:
+    if mapping is None:
+        return None
+    if not isinstance(mapping, dict):
+        raise ValueError("fdp_class_placement_map must be a dict")
+
+    normalized: dict[str, int] = {}
+    for raw_name, raw_handle in mapping.items():
+        if not isinstance(raw_name, str):
+            raise ValueError("fdp_class_placement_map keys must be strings")
+        if not isinstance(raw_handle, int):
+            raise ValueError("fdp_class_placement_map values must be integers")
+        name = _normalize_fdp_class_hint(raw_name, granularity)
+        if raw_handle == 0:
+            raise ValueError("fdp_class_placement_map must not use handle 0")
+        existing = normalized.get(name)
+        if existing is not None and existing != raw_handle:
+            raise ValueError(
+                f"fdp_class_placement_map has conflicting values for {name!r}"
+            )
+        normalized[name] = raw_handle
+    return normalized
+
 
 def _normalize_fdp_placement_handles(
     placement_handles: Optional[list[int]],
@@ -122,6 +219,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         max_data_transfer_size: int = 0,
         fdp_enabled: bool = False,
         fdp_placement_handles: Optional[list[int]] = None,
+        fdp_policy: str = FDP_POLICY_NONE,
+        fdp_class_granularity: str = FDP_CLASS_GRANULARITY_COARSE,
+        fdp_class_placement_map: dict[str, int] | None = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
@@ -153,6 +253,16 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             fdp_placement_handles: Optional exact non-zero FDP placement handle
                 list to use for data writes. If omitted, all device-reported
                 handles except 0 are used.
+            fdp_policy: FDP placement policy. ``"none"`` (default) omits
+                placement decisions; ``"class_isolation"`` maps the
+                registration hint of the engine instance that produced
+                each store to a fixed placement handle.
+            fdp_class_granularity: Class normalization mode: ``"coarse"``
+                (default) collapses fine hints onto their parent coarse
+                class; ``"fine"`` keeps fine hints as their own classes.
+            fdp_class_placement_map: Optional explicit class/hint to FDP
+                placement handle mapping. Shared handles across classes
+                are allowed.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -191,6 +301,15 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             _normalize_fdp_placement_handles(fdp_placement_handles)
             if self.fdp_enabled
             else None
+        )
+        self.fdp_policy = _normalize_fdp_policy(fdp_policy)
+        self.fdp_class_granularity = _normalize_fdp_class_granularity(
+            fdp_class_granularity
+        )
+        if self.fdp_policy == FDP_POLICY_CLASS_ISOLATION and not self.fdp_enabled:
+            raise ValueError("fdp_policy='class_isolation' requires fdp_enabled=true")
+        self.fdp_class_placement_map = _normalize_fdp_class_placement_map(
+            fdp_class_placement_map, self.fdp_class_granularity
         )
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
@@ -234,6 +353,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         ):
             raise ValueError("fdp_placement_handles must be a list")
         fdp_placement_handles = raw_fdp_placement_handles if fdp_enabled else None
+        fdp_policy = _normalize_fdp_policy(d.get("fdp_policy", FDP_POLICY_NONE))
+        fdp_class_granularity = _normalize_fdp_class_granularity(
+            d.get("fdp_class_granularity", FDP_CLASS_GRANULARITY_COARSE)
+        )
+        fdp_class_placement_map = d.get("fdp_class_placement_map")
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
         if slot_bytes % block_align != 0:
@@ -290,6 +414,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             max_data_transfer_size=max_data_transfer_size,
             fdp_enabled=fdp_enabled,
             fdp_placement_handles=fdp_placement_handles,
+            fdp_policy=fdp_policy,
+            fdp_class_granularity=fdp_class_granularity,
+            fdp_class_placement_map=fdp_class_placement_map,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
@@ -334,6 +461,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- fdp_enabled (bool): enable FDP discovery (default false)\n"
             "- fdp_placement_handles (list[int]): exact non-zero FDP placement "
             "handles to use; omitted uses all device-reported non-zero handles\n"
+            "- fdp_policy (str): none or class_isolation (default none)\n"
+            "- fdp_class_granularity (str): coarse or fine (default coarse)\n"
+            "- fdp_class_placement_map (dict[str, int]): explicit class/hint "
+            "to FDP placement handle map\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
             "- num_load_workers (int): load worker threads (default 4)"
@@ -407,6 +538,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._store_pool: ThreadPoolExecutor
         self._lookup_pool: ThreadPoolExecutor
         self._load_pool: ThreadPoolExecutor
+        self._fdp_policy = config.fdp_policy
+        self._fdp_class_granularity = config.fdp_class_granularity
+        # Guards ``_fdp_class_placement_map`` and ``_instance_placement_id``.
+        # Registration/unregistration hooks and store submissions both
+        # touch these; the store-controller may call the hook while a
+        # worker thread is running submit_store_task_with_context.
+        self._placement_lock = threading.Lock()
+        self._fdp_class_placement_map: dict[str, int] = {}
+        self._instance_placement_id: dict[int, int] = {}
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
@@ -415,6 +555,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._fdp_placement_handles: list[int] = []
             if self._fdp_enabled:
                 self._configure_fdp(config.fdp_placement_handles)
+            if self._fdp_policy == FDP_POLICY_CLASS_ISOLATION:
+                self._configure_fdp_class_isolation(config.fdp_class_placement_map)
             if config.io_engine == "io_uring":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
@@ -480,7 +622,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
-        """Submit a non-blocking raw-block store task.
+        """Submit a non-blocking raw-block store task without instance context.
+
+        Class-isolation policy requires per-store instance context; use
+        ``submit_store_task_with_context`` from the store controller
+        instead. This entry point is preserved for callers (and tests)
+        that predate the context hook.
 
         Args:
             keys: Object keys to persist.
@@ -492,10 +639,38 @@ class RawBlockL2Adapter(L2AdapterInterface):
         Raises:
             ValueError: If either list is empty or the lengths differ.
         """
+        return self.submit_store_task_with_context(keys, objects, instance_id=None)
+
+    def submit_store_task_with_context(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        instance_id: int | None = None,
+    ) -> L2TaskId:
+        """Submit a non-blocking raw-block store task with an instance id.
+
+        Args:
+            keys: Object keys to persist.
+            objects: Memory objects containing payloads for ``keys``.
+            instance_id: Engine instance that produced this batch, or
+                ``None`` when the caller does not track instance
+                context. Used to resolve the FDP placement handle under
+                class-isolation policy.
+
+        Returns:
+            Task ID that can be observed through ``pop_completed_store_tasks``.
+
+        Raises:
+            ValueError: If either list is empty or the lengths differ.
+            RuntimeError: If class-isolation is active and ``instance_id``
+                has no registered placement handle.
+        """
         if not keys or not objects:
             raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
+
+        placement_id = self._resolve_placement_id_for_instance(instance_id)
 
         with self._lock:
             self._raise_if_closed_locked()
@@ -503,7 +678,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._store_inflight_tasks += 1
         try:
             future = self._store_pool.submit(
-                self._run_store_task, list(keys), list(objects)
+                self._run_store_task,
+                list(keys),
+                list(objects),
+                placement_id,
             )
         except Exception:
             with self._lock:
@@ -663,6 +841,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def report_status(self) -> dict:
         """Return adapter health, task counters, and core status."""
         core_status = self._core.report_status()
+        with self._placement_lock:
+            class_map = dict(self._fdp_class_placement_map)
+            registered_instances = len(self._instance_placement_id)
         with self._lock:
             return {
                 "is_healthy": core_status.get("is_healthy", True) and not self._closed,
@@ -673,11 +854,156 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "fdp_enabled": self._fdp_enabled,
                 "fdp_discovered_status": list(self._fdp_discovered_status),
                 "fdp_placement_handles": list(self._fdp_placement_handles),
+                "fdp_policy": self._fdp_policy,
+                "fdp_class_granularity": self._fdp_class_granularity,
+                "fdp_class_placement_map": class_map,
+                "fdp_registered_instance_count": registered_instances,
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
                 "core": core_status,
             }
+
+    def on_engine_context_registered(
+        self,
+        instance_id: int,
+        placement_hint: str | None,
+    ) -> None:
+        """Precompute the placement handle for ``instance_id``.
+
+        Under ``FDP_POLICY_CLASS_ISOLATION`` every store from
+        ``instance_id`` maps to one placement handle: the handle bound
+        to the coarse (or fine) class of ``placement_hint``. Resolving
+        it once here makes the hot store path a single dict lookup and
+        surfaces a bad hint at REGISTER time instead of on the first
+        store.
+
+        Under any other policy this hook is a no-op — the adapter has
+        no per-instance state to build.
+
+        Raises:
+            ValueError: If class-isolation is active and
+                ``placement_hint`` is missing or unrecognized.
+            RuntimeError: If the resolved class has no configured
+                placement handle (a mapping bug caught at init time).
+        """
+        if self._fdp_policy != FDP_POLICY_CLASS_ISOLATION:
+            return
+        if placement_hint is None:
+            raise ValueError(
+                "raw_block FDP class isolation requires a placement hint at "
+                f"REGISTER for instance {instance_id}"
+            )
+        placement_class = _normalize_fdp_class_hint(
+            placement_hint, self._fdp_class_granularity
+        )
+        with self._placement_lock:
+            try:
+                placement_id = self._fdp_class_placement_map[placement_class]
+            except KeyError as e:
+                raise RuntimeError(
+                    "raw_block FDP class isolation has no placement handle for "
+                    f"class {placement_class!r}"
+                ) from e
+            self._instance_placement_id[instance_id] = placement_id
+        logger.info(
+            "RawBlockL2Adapter registered instance %d as class=%s handle=%d",
+            instance_id,
+            placement_class,
+            placement_id,
+        )
+
+    def on_engine_context_unregistered(self, instance_id: int) -> None:
+        """Release the placement mapping for ``instance_id`` if any."""
+        if self._fdp_policy != FDP_POLICY_CLASS_ISOLATION:
+            return
+        with self._placement_lock:
+            self._instance_placement_id.pop(instance_id, None)
+
+    def _configure_fdp_class_isolation(
+        self, configured_map: dict[str, int] | None
+    ) -> None:
+        """Build the FDP class→handle table used by class isolation.
+
+        Called only when ``fdp_policy == FDP_POLICY_CLASS_ISOLATION``.
+        ``fdp_discovery`` has already run, so
+        ``self._fdp_placement_handles`` is a non-empty list of usable
+        non-zero handles. When no explicit map is configured, classes
+        are assigned handles in the deterministic order returned by
+        ``_fdp_required_classes``. Duplicate handles across classes are
+        allowed and logged.
+        """
+        required_classes = _fdp_required_classes(self._fdp_class_granularity)
+        usable_handles = list(self._fdp_placement_handles)
+        usable_set = set(usable_handles)
+        if not usable_handles:
+            raise RuntimeError(
+                "raw_block FDP class isolation requires non-zero placement handles"
+            )
+
+        if configured_map is None:
+            if len(required_classes) > len(usable_handles):
+                raise RuntimeError(
+                    "raw_block FDP class isolation requires at least "
+                    f"{len(required_classes)} placement handles for "
+                    f"{self._fdp_class_granularity} granularity; "
+                    f"got {len(usable_handles)}"
+                )
+            class_map = {
+                name: usable_handles[i] for i, name in enumerate(required_classes)
+            }
+        else:
+            missing = [name for name in required_classes if name not in configured_map]
+            if missing:
+                raise ValueError(
+                    "fdp_class_placement_map missing classes/hints: "
+                    f"{', '.join(missing)}"
+                )
+            invalid = [
+                handle for handle in configured_map.values() if handle not in usable_set
+            ]
+            if invalid:
+                raise ValueError(
+                    "fdp_class_placement_map contains handles not registered "
+                    f"for this adapter: {invalid}"
+                )
+            class_map = {name: configured_map[name] for name in required_classes}
+
+        shared: dict[int, list[str]] = {}
+        for class_name, handle in class_map.items():
+            shared.setdefault(handle, []).append(class_name)
+        aliases = {handle: names for handle, names in shared.items() if len(names) > 1}
+        if aliases:
+            logger.info("RawBlockL2Adapter FDP class handle aliases: %s", aliases)
+
+        with self._placement_lock:
+            self._fdp_class_placement_map = class_map
+
+    def _resolve_placement_id_for_instance(self, instance_id: int | None) -> int | None:
+        """Return the FDP placement handle for ``instance_id`` (or ``None``).
+
+        No-op for policies other than class isolation. Under class
+        isolation the caller MUST supply an ``instance_id`` that was
+        previously registered via ``on_engine_context_registered``.
+        """
+        if self._fdp_policy != FDP_POLICY_CLASS_ISOLATION:
+            return None
+        if not self._fdp_placement_handles:
+            raise RuntimeError("raw_block FDP placement handles are not configured")
+        if instance_id is None:
+            raise RuntimeError(
+                "raw_block FDP class isolation requires an engine instance context "
+                "for every store; got instance_id=None"
+            )
+        with self._placement_lock:
+            try:
+                return self._instance_placement_id[instance_id]
+            except KeyError as e:
+                raise RuntimeError(
+                    "raw_block FDP class isolation has no placement handle for "
+                    f"instance_id={instance_id}; was the engine context "
+                    "registered?"
+                ) from e
 
     def _configure_fdp(self, configured_handles: Optional[list[int]]) -> None:
         """Fetch and register FDP placement handles for this adapter."""
@@ -725,17 +1051,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._next_task_id += 1
         return task_id
 
-    def _assign_fdp_placement_ids(self, count: int) -> list[int] | None:
-        """Return FDP placement handles for a store batch.
+    def _expand_placement_ids(
+        self, placement_id: int | None, count: int
+    ) -> list[int] | None:
+        """Broadcast ``placement_id`` across ``count`` slots for one batch.
 
-        TODO: implement the placement policy that maps KV writes onto the
-        registered non-zero FDP placement handles. Until that policy lands,
-        return None so data writes omit the NVMe placement directive.
+        Returns ``None`` when no placement decision was made — this
+        preserves the pre-policy behavior of omitting the NVMe
+        placement directive from the write.
         """
-        del count
-        if self._fdp_enabled and not self._fdp_placement_handles:
-            raise RuntimeError("raw_block FDP placement handles are not configured")
-        return None
+        if placement_id is None:
+            if self._fdp_enabled and not self._fdp_placement_handles:
+                raise RuntimeError("raw_block FDP placement handles are not configured")
+            return None
+        return [placement_id] * count
 
     def _seed_usage_from_core_snapshot(self) -> None:
         """Seed byte counters for entries recovered by RawBlockCore startup."""
@@ -774,12 +1103,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        placement_id: int | None,
     ) -> RawBlockStoreTaskResult:
         """Persist one submitted store batch in the worker pool.
 
         Args:
             keys: Object keys submitted for storage.
             objects: Payload buffers aligned with ``keys``.
+            placement_id: Placement handle resolved at submit time (from
+                the engine instance's registered class), or ``None`` when
+                no placement decision applies.
 
         Returns:
             A 3-tuple containing:
@@ -789,7 +1122,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - raw-block slot byte charges aligned with the newly stored keys
         """
         specs = [encode_object_key(key) for key in keys]
-        placement_ids = self._assign_fdp_placement_ids(len(specs))
+        placement_ids = self._expand_placement_ids(placement_id, len(specs))
         put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
         stored_encoded = set(put_result.stored_keys)
         slot_bytes = int(self._core.slot_bytes)

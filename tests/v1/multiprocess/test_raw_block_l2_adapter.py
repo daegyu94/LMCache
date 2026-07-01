@@ -162,6 +162,9 @@ class _FakeFdpCore:
 def _make_fdp_config(
     *,
     placement_handles: list[int] | None = None,
+    fdp_policy: str = "none",
+    fdp_class_granularity: str = "coarse",
+    fdp_class_placement_map: dict[str, int] | None = None,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path="/dev/ng0n1",
@@ -179,6 +182,9 @@ def _make_fdp_config(
         iouring_queue_depth=8,
         fdp_enabled=True,
         fdp_placement_handles=placement_handles,
+        fdp_policy=fdp_policy,
+        fdp_class_granularity=fdp_class_granularity,
+        fdp_class_placement_map=fdp_class_placement_map,
         num_store_workers=1,
         num_lookup_workers=1,
         num_load_workers=1,
@@ -253,7 +259,7 @@ def test_raw_block_fdp_status_reports_registered_nonzero_handles() -> None:
         adapter.close()
 
 
-def test_raw_block_fdp_store_does_not_assign_placement_handles_yet() -> None:
+def test_raw_block_fdp_none_policy_does_not_assign_placement_handles() -> None:
     fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
     adapter = _make_fdp_adapter(fake_core, _make_fdp_config())
     try:
@@ -266,6 +272,238 @@ def test_raw_block_fdp_store_does_not_assign_placement_handles_yet() -> None:
 
         assert result.is_successful()
         assert fake_core.put_many_calls == [None]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_auto_maps_coarse_classes() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        status = adapter.report_status()
+        assert status["fdp_class_placement_map"] == {
+            "hot_churn": 1,
+            "cold_reuse": 2,
+            "bulk_stream": 3,
+            "ephemeral": 4,
+        }
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_requires_handles_without_map() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13)])
+
+    with pytest.raises(RuntimeError, match="requires at least 4 placement handles"):
+        _make_fdp_adapter(
+            fake_core,
+            _make_fdp_config(fdp_policy="class_isolation"),
+        )
+
+
+def test_raw_block_fdp_class_isolation_allows_explicit_handle_aliases() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(
+            fdp_policy="class_isolation",
+            fdp_class_placement_map={
+                "hot_churn": 1,
+                "cold_reuse": 1,
+                "bulk_stream": 2,
+                "ephemeral": 2,
+            },
+        ),
+    )
+    try:
+        status = adapter.report_status()
+        assert status["fdp_class_placement_map"] == {
+            "hot_churn": 1,
+            "cold_reuse": 1,
+            "bulk_stream": 2,
+            "ephemeral": 2,
+        }
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_uses_registered_instance_handle() -> None:
+    """Registering an instance under class isolation pins its stores to one
+    placement handle; ``submit_store_task_with_context`` picks that handle up
+    from ``instance_id``. This mirrors the storage-manager wiring."""
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        adapter.on_engine_context_registered(
+            instance_id=42, placement_hint="cold_reuse"
+        )
+        keys = [make_object_key(1, "same-model"), make_object_key(2, "same-model")]
+        objects: list[Any] = [make_memory_obj(b"a"), make_memory_obj(b"b")]
+
+        task_id = adapter.submit_store_task_with_context(keys, objects, instance_id=42)
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        result = adapter.pop_completed_store_tasks()[task_id]
+
+        assert result.is_successful()
+        assert fake_core.put_many_calls == [[2, 2]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_coarse_normalizes_fine_hint() -> None:
+    """A fine hint (e.g. ``cold_rag``) collapses to its coarse parent
+    (``cold_reuse``) at registration time; every store for that
+    instance uses the coarse-class handle."""
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        adapter.on_engine_context_registered(instance_id=7, placement_hint="cold_rag")
+        task_id = adapter.submit_store_task_with_context(
+            [make_object_key(1, "rag-model")],
+            [make_memory_obj(b"r")],
+            instance_id=7,
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        result = adapter.pop_completed_store_tasks()[task_id]
+
+        assert result.is_successful()
+        assert fake_core.put_many_calls == [[2]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_register_rejects_missing_hint() -> None:
+    """Class isolation cannot resolve a handle without a hint, so the
+    adapter refuses the registration up front."""
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        with pytest.raises(ValueError, match="requires a placement hint"):
+            adapter.on_engine_context_registered(instance_id=9, placement_hint=None)
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_register_rejects_unknown_hint() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        with pytest.raises(ValueError, match="Unknown FDP placement class/hint"):
+            adapter.on_engine_context_registered(
+                instance_id=9, placement_hint="not-a-class"
+            )
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_store_rejects_unregistered_instance() -> None:
+    """An unregistered instance has no bound handle, so its store fails
+    fast rather than silently emitting a garbage placement decision."""
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="no placement handle for instance_id"):
+            adapter.submit_store_task_with_context(
+                [make_object_key(1, "unregistered-model")],
+                [make_memory_obj(b"e")],
+                instance_id=1234,
+            )
+        assert fake_core.put_many_calls == []
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_rejects_unusable_map_handle() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12)])
+
+    with pytest.raises(ValueError, match="handles not registered"):
+        _make_fdp_adapter(
+            fake_core,
+            _make_fdp_config(
+                fdp_policy="class_isolation",
+                fdp_class_placement_map={
+                    "hot_churn": 1,
+                    "cold_reuse": 1,
+                    "bulk_stream": 2,
+                    "ephemeral": 99,
+                },
+            ),
+        )
+
+
+def test_raw_block_fdp_class_isolation_fine_hint_is_separate_class() -> None:
+    status = [(0, 10)] + [(i, 10 + i) for i in range(1, 14)]
+    explicit_map = {
+        "hot_churn": 1,
+        "cold_reuse": 2,
+        "bulk_stream": 3,
+        "ephemeral": 4,
+        "hot_short": 5,
+        "hot_session": 6,
+        "cold_prefix": 7,
+        "cold_rag": 8,
+        "cold_checkpoint": 9,
+        "bulk_prefill": 10,
+        "bulk_import": 11,
+        "temp_decode": 12,
+        "temp_speculative": 13,
+    }
+    fake_core = _FakeFdpCore(status=status)
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(
+            fdp_policy="class_isolation",
+            fdp_class_granularity="fine",
+            fdp_class_placement_map=explicit_map,
+        ),
+    )
+    try:
+        adapter.on_engine_context_registered(instance_id=3, placement_hint="cold_rag")
+        task_id = adapter.submit_store_task_with_context(
+            [make_object_key(1, "rag-model")],
+            [make_memory_obj(b"r")],
+            instance_id=3,
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        result = adapter.pop_completed_store_tasks()[task_id]
+
+        assert result.is_successful()
+        assert fake_core.put_many_calls == [[8]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_class_isolation_unregister_releases_instance() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (2, 12), (3, 13), (4, 14)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(fdp_policy="class_isolation"),
+    )
+    try:
+        adapter.on_engine_context_registered(instance_id=5, placement_hint="hot_churn")
+        adapter.on_engine_context_unregistered(instance_id=5)
+        with pytest.raises(RuntimeError, match="no placement handle for instance_id"):
+            adapter.submit_store_task_with_context(
+                [make_object_key(1, "gone")], [make_memory_obj(b"x")], instance_id=5
+            )
     finally:
         adapter.close()
 

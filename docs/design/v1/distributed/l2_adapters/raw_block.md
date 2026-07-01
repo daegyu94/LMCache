@@ -141,7 +141,8 @@ The MP adapter is configured through `--l2-adapter` JSON:
 }
 ```
 
-For FDP configuration examples, see `docs/source/mp/l2_storage/raw_block.rst`.
+For FDP configuration examples and the class-selection table, see
+`docs/source/mp/l2_storage/raw_block.rst`.
 
 Important validation rules:
 
