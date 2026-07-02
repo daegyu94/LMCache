@@ -69,6 +69,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_STORE_DRAIN_TIMEOUT_S = 60.0
+_STORE_DRAIN_POLL_INTERVAL_S = 0.05
+_STORE_DRAIN_STABLE_IDLE_S = 2.0
+
 
 def _append_cache_salt_suffix(cache_salt: str, suffix: str) -> str:
     """Return ``cache_salt`` with a replay-specific suffix appended.
@@ -300,6 +304,42 @@ class StorageReplayDriver:
 
     # ------------------------------------------------------------------
 
+    def wait_for_store_drain(
+        self,
+        *,
+        timeout_s: float = _STORE_DRAIN_TIMEOUT_S,
+        poll_interval_s: float = _STORE_DRAIN_POLL_INTERVAL_S,
+        stable_idle_s: float = _STORE_DRAIN_STABLE_IDLE_S,
+    ) -> bool:
+        """Wait until asynchronous L2 stores submitted during replay are idle.
+
+        Args:
+            timeout_s: Maximum seconds to wait for pending and in-flight store
+                tasks to drain.
+            poll_interval_s: Sleep interval between status checks.
+            stable_idle_s: Required continuous idle time before returning.
+
+        Returns:
+            ``True`` if the store controller became idle before the timeout,
+            otherwise ``False``.
+        """
+        deadline = time.monotonic() + timeout_s
+        idle_since: float | None = None
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            status = self._sm.report_status().get("store_controller", {})
+            pending = int(status.get("pending_keys_count", 0))
+            in_flight = int(status.get("in_flight_task_count", 0))
+            if pending == 0 and in_flight == 0:
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= stable_idle_s:
+                    return True
+            else:
+                idle_since = None
+            time.sleep(poll_interval_s)
+        return False
+
     def run(
         self,
         on_record: RecordCallback | None = None,
@@ -405,6 +445,11 @@ class StorageReplayDriver:
                         exc_info=True,
                     )
             context.open_read_contexts.pop(key_tuple, None)
+
+        if not self.wait_for_store_drain():
+            logger.warning(
+                "trace replay: timed out waiting for asynchronous store drain"
+            )
 
         stats.mark_end(time.time())
 

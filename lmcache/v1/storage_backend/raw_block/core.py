@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 _DEFAULT_META_MAGIC = b"LMCIDX01"
 _DEFAULT_META_VERSION = 1
 _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
-_URING_CMD_MAX_IO_BYTES = 256 * 1024
+_URING_CMD_MAX_IO_BYTES = 128 * 1024
 
 
 def round_up(x: int, align: int) -> int:

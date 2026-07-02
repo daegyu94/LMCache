@@ -817,6 +817,47 @@ def extract_media_write_bytes(payload: Any) -> int | None:
     return None
 
 
+def extract_xnvme_fdp_counter(payload: Any, counter_name: str) -> int | None:
+    """Extract a first-lane FDP statistics counter from xNVMe output.
+
+    Args:
+        payload: xNVMe command result, stdout text, or parsed structure.
+        counter_name: FDP counter name such as ``hbmw`` or ``mbmw``.
+
+    Returns:
+        The first numeric lane for the requested counter, or ``None``.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        if "stdout" in payload:
+            parsed = extract_xnvme_fdp_counter(payload.get("stdout"), counter_name)
+            if parsed is not None:
+                return parsed
+        for key, value in payload.items():
+            if key == counter_name:
+                if isinstance(value, list) and value:
+                    return _safe_int(value[0])
+                return _safe_int(value)
+            parsed = extract_xnvme_fdp_counter(value, counter_name)
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            parsed = extract_xnvme_fdp_counter(item, counter_name)
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(payload, str):
+        pattern = rf"^\s*{re.escape(counter_name)}:\s*\[\s*([^,\]\s]+)"
+        for line in payload.splitlines():
+            match = re.search(pattern, line)
+            if match:
+                return _safe_int(match.group(1))
+    return None
+
+
 def capture_measurement(config: dict[str, Any], label: str) -> dict[str, Any]:
     measurement_cfg = config.get("measurement", {})
     if not bool(measurement_cfg.get("enabled", True)):
@@ -853,16 +894,21 @@ def capture_measurement(config: dict[str, Any], label: str) -> dict[str, Any]:
         result["warnings"].append("vendor media-write command not configured")
 
     if bool(measurement_cfg.get("collect_fdp_logs", True)):
-        if shutil.which("xnvme") and block_device:
+        fdp_device = (
+            measurement_cfg.get("fdp_log_device_path")
+            or config.get("device_path")
+            or block_device
+        )
+        if shutil.which("xnvme") and fdp_device:
             result["fdp_logs"] = {
                 "stats": run_capture(
-                    ["xnvme", "log-fdp-stats", str(block_device), "--lsi", "0x1"]
+                    ["xnvme", "log-fdp-stats", str(fdp_device), "--lsi", "0x1"]
                 ),
                 "ruhu": run_capture(
                     [
                         "xnvme",
                         "log-ruhu",
-                        str(block_device),
+                        str(fdp_device),
                         "--lsi",
                         "0x1",
                         "--limit",
@@ -870,13 +916,88 @@ def capture_measurement(config: dict[str, Any], label: str) -> dict[str, Any]:
                     ]
                 ),
                 "ruhs": run_capture(
-                    ["xnvme", "fdp-ruhs", str(block_device), "--limit", "16"]
+                    ["xnvme", "fdp-ruhs", str(fdp_device), "--limit", "16"]
                 ),
             }
+            fdp_hbmw = extract_xnvme_fdp_counter(
+                result["fdp_logs"].get("stats"), "hbmw"
+            )
+            if fdp_hbmw is not None:
+                result["fdp_host_write_bytes"] = fdp_hbmw
+                if measurement_cfg.get("host_write_source") == "fdp_hbmw":
+                    result["host_write_bytes"] = fdp_hbmw
+                    result["host_write_source"] = "fdp_hbmw"
         else:
             result["warnings"].append("xnvme unavailable; skipped FDP logs")
 
     return result
+
+
+def capture_measurement_after_media_write_change(
+    config: dict[str, Any],
+    label: str,
+    baseline: dict[str, Any],
+    *,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 2.0,
+) -> dict[str, Any]:
+    """Capture measurement after the media-write counter changes or times out.
+
+    Args:
+        config: Benchmark configuration.
+        label: Label for the captured measurement.
+        baseline: Measurement snapshot whose ``media_write_bytes`` is the baseline.
+        timeout_s: Maximum seconds to wait for a media-write change.
+        poll_interval_s: Seconds between measurement attempts.
+
+    Returns:
+        The first measurement whose media-write counter differs from the baseline,
+        or the final measurement captured before timeout.
+    """
+    baseline_media = _safe_int(baseline.get("media_write_bytes"))
+    started = time.monotonic()
+    attempts = 0
+    last: dict[str, Any] | None = None
+
+    while True:
+        attempts += 1
+        current = capture_measurement(config, label)
+        elapsed = time.monotonic() - started
+        current_media = _safe_int(current.get("media_write_bytes"))
+        changed = (
+            baseline_media is not None
+            and current_media is not None
+            and current_media != baseline_media
+        )
+        current["media_write_wait"] = {
+            "baseline_media_write_bytes": baseline_media,
+            "current_media_write_bytes": current_media,
+            "changed": changed,
+            "attempts": attempts,
+            "elapsed_seconds": round(elapsed, 3),
+            "timeout_seconds": timeout_s,
+            "poll_interval_seconds": poll_interval_s,
+        }
+        last = current
+
+        if baseline_media is None:
+            current.setdefault("warnings", []).append(
+                "media-write wait skipped because baseline counter is missing"
+            )
+            return current
+        if changed:
+            return current
+        if elapsed >= timeout_s:
+            current.setdefault("warnings", []).append(
+                "media-write counter did not change before timeout"
+            )
+            return current
+
+        remaining = timeout_s - elapsed
+        time.sleep(min(poll_interval_s, max(0.0, remaining)))
+
+    assert last is not None
+    return last
 
 
 def _count_failed_jsonl(path: str) -> int | None:
@@ -1425,7 +1546,11 @@ def main(argv: list[str] | None = None) -> int:
         start_iteration=args.warmup_iterations,
     )
 
-    measurement_after = capture_measurement(config, "after_measurement")
+    measurement_after = capture_measurement_after_media_write_change(
+        config,
+        "after_measurement",
+        measurement_after_warmup,
+    )
     write_json(os.path.join(output_dir, "measurement_after.json"), measurement_after)
 
     all_results = warmup_results + measurement_results
