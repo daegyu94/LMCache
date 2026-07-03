@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 # Third Party
@@ -654,6 +655,12 @@ def write_json(path: str | Path, payload: Any) -> None:
         file_obj.write("\n")
 
 
+def append_jsonl(path: str | Path, payload: Any) -> None:
+    with open(path, "a") as file_obj:
+        json.dump(payload, file_obj, sort_keys=True)
+        file_obj.write("\n")
+
+
 def write_text(path: str | Path, text: str) -> None:
     with open(path, "w") as file_obj:
         file_obj.write(text)
@@ -1249,6 +1256,92 @@ def _delta(after: dict[str, Any], before: dict[str, Any], key: str) -> int | Non
     return after_value - before_value
 
 
+def _waf_from_deltas(
+    host_delta: int | None,
+    media_delta: int | None,
+) -> float | None:
+    if host_delta is None or host_delta <= 0 or media_delta is None:
+        return None
+    return media_delta / host_delta
+
+
+def build_waf_sample(
+    *,
+    sample: dict[str, Any],
+    baseline: dict[str, Any],
+    previous: dict[str, Any] | None,
+    sample_index: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    host_delta = _delta(sample, baseline, "host_write_bytes")
+    media_delta = _delta(sample, baseline, "media_write_bytes")
+    interval_host_delta = (
+        _delta(sample, previous, "host_write_bytes") if previous is not None else None
+    )
+    interval_media_delta = (
+        _delta(sample, previous, "media_write_bytes") if previous is not None else None
+    )
+    return {
+        "sample_index": sample_index,
+        "captured_at": sample.get("captured_at"),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "host_write_bytes": _safe_int(sample.get("host_write_bytes")),
+        "media_write_bytes": _safe_int(sample.get("media_write_bytes")),
+        "cumulative_host_write_bytes_delta": host_delta,
+        "cumulative_media_write_bytes_delta": media_delta,
+        "cumulative_waf": _waf_from_deltas(host_delta, media_delta),
+        "interval_host_write_bytes_delta": interval_host_delta,
+        "interval_media_write_bytes_delta": interval_media_delta,
+        "interval_waf": _waf_from_deltas(
+            interval_host_delta,
+            interval_media_delta,
+        ),
+        "warnings": sample.get("warnings", []),
+    }
+
+
+def start_waf_sampler(
+    *,
+    config: dict[str, Any],
+    output_dir: str,
+    baseline: dict[str, Any],
+    interval_seconds: int | None,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    if interval_seconds is None or interval_seconds <= 0:
+        return None, None
+
+    stop_event = threading.Event()
+    samples_path = os.path.join(output_dir, "waf_samples.jsonl")
+
+    def _sample_loop() -> None:
+        started = time.monotonic()
+        previous = baseline
+        sample_index = 0
+        while not stop_event.wait(interval_seconds):
+            sample_index += 1
+            sample = capture_measurement(config, f"sample_{sample_index:04d}")
+            elapsed = time.monotonic() - started
+            append_jsonl(
+                samples_path,
+                build_waf_sample(
+                    sample=sample,
+                    baseline=baseline,
+                    previous=previous,
+                    sample_index=sample_index,
+                    elapsed_seconds=elapsed,
+                ),
+            )
+            previous = sample
+
+    thread = threading.Thread(
+        target=_sample_loop,
+        name="fdp-waf-sampler",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
 def build_summary(
     *,
     config: dict[str, Any],
@@ -1440,6 +1533,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup-iterations", type=int, default=2)
     parser.add_argument("--duration-seconds", type=int, default=None)
+    parser.add_argument(
+        "--sample-interval-seconds",
+        type=int,
+        default=None,
+        help="Capture FDP WAF counter samples every N seconds during measurement.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
     parser.add_argument("--dry-run", action="store_true")
@@ -1455,6 +1554,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError(
                 "--iterations and --duration-seconds are mutually exclusive"
             )
+    if args.sample_interval_seconds is not None and args.sample_interval_seconds <= 0:
+        raise ValueError("--sample-interval-seconds must be > 0")
     return args
 
 
@@ -1534,17 +1635,29 @@ def main(argv: list[str] | None = None) -> int:
         measurement_after_warmup,
     )
 
-    measurement_results, completed_measurement_iterations = run_iterations(
-        workers,
-        config,
-        mode=args.mode,
-        run_id=args.run_id,
+    sampler_stop, sampler_thread = start_waf_sampler(
+        config=config,
         output_dir=output_dir,
-        warmup_iterations=0,
-        measurement_iterations=args.iterations,
-        duration_seconds=args.duration_seconds,
-        start_iteration=args.warmup_iterations,
+        baseline=measurement_after_warmup,
+        interval_seconds=args.sample_interval_seconds,
     )
+    try:
+        measurement_results, completed_measurement_iterations = run_iterations(
+            workers,
+            config,
+            mode=args.mode,
+            run_id=args.run_id,
+            output_dir=output_dir,
+            warmup_iterations=0,
+            measurement_iterations=args.iterations,
+            duration_seconds=args.duration_seconds,
+            start_iteration=args.warmup_iterations,
+        )
+    finally:
+        if sampler_stop is not None:
+            sampler_stop.set()
+        if sampler_thread is not None:
+            sampler_thread.join(timeout=10)
 
     measurement_after = capture_measurement_after_media_write_change(
         config,
