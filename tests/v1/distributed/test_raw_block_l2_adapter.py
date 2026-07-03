@@ -48,11 +48,13 @@ requires_raw_block_ext = pytest.mark.skipif(
 class _RecordingListener(L2AdapterListener):
     def __init__(self):
         self.stored: list[list[ObjectKey]] = []
+        self.stored_sizes: list[list[int]] = []
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
 
     def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]):
         self.stored.append(list(keys))
+        self.stored_sizes.append(list(sizes))
 
     def on_l2_keys_accessed(self, keys: list[ObjectKey]):
         self.accessed.append(list(keys))
@@ -138,6 +140,8 @@ def _make_config(
     capacity_bytes: int = 0,
     io_engine: str = "posix",
     use_uring_cmd: bool = False,
+    allocator: str = "fixed",
+    min_subslot_bytes: int = 0,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path=device_path,
@@ -153,6 +157,8 @@ def _make_config(
         num_store_workers=2,
         num_lookup_workers=1,
         num_load_workers=2,
+        allocator=allocator,
+        min_subslot_bytes=min_subslot_bytes,
     )
 
 
@@ -170,6 +176,39 @@ def test_raw_block_l2_adapter_config_default_io_engine():
     config = RawBlockL2AdapterConfig.from_dict(_config_dict())
 
     assert config.io_engine == "posix"
+
+
+def test_raw_block_l2_adapter_config_accepts_buddy_allocator():
+    config = RawBlockL2AdapterConfig.from_dict(
+        _config_dict(
+            allocator="buddy",
+            min_subslot_bytes=8 * 1024,
+        )
+    )
+
+    assert config.allocator == "buddy"
+    assert config.min_subslot_bytes == 8 * 1024
+    assert config.to_core_config().allocator == "buddy"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("min_subslot_bytes", 12 * 1024),
+        ("slot_bytes", 96 * 1024),
+    ],
+)
+def test_raw_block_l2_adapter_config_rejects_non_power_of_two_buddy_blocks(
+    field,
+    value,
+):
+    config = {
+        "allocator": "buddy",
+        "min_subslot_bytes": 8 * 1024,
+        field: value,
+    }
+    with pytest.raises(ValueError, match=f"{field} must be a power of two"):
+        RawBlockL2AdapterConfig.from_dict(_config_dict(**config))
 
 
 @pytest.mark.parametrize("io_engine", ["posix", "io_uring"])
@@ -205,11 +244,15 @@ def test_raw_block_l2_adapter_config_validates_iouring_queue_depth():
 
 
 def _run_store(adapter: RawBlockL2Adapter, keys, objects) -> bool:
+    return _run_store_result(adapter, keys, objects).is_successful()
+
+
+def _run_store_result(adapter: RawBlockL2Adapter, keys, objects):
     task_id = adapter.submit_store_task(keys, objects)
     assert _wait_event_fd(adapter.get_store_event_fd())
     completed = adapter.pop_completed_store_tasks()
     assert task_id in completed
-    return completed[task_id].is_successful()
+    return completed[task_id]
 
 
 def _run_lookup(adapter: RawBlockL2Adapter, keys):
@@ -406,6 +449,91 @@ def test_raw_block_l2_adapter_uses_global_eviction_accounting():
             adapter.submit_unlock([key1, key2])
         finally:
             adapter.close()
+
+
+@requires_raw_block_ext
+def test_raw_block_l2_adapter_buddy_accounts_allocated_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                slot_bytes=64 * 1024,
+                allocator="buddy",
+                min_subslot_bytes=8 * 1024,
+            )
+        )
+        listener = _RecordingListener()
+        adapter.register_listener(listener)
+
+        try:
+            small_key = _create_object_key(121, cache_salt="u1")
+            medium_key = _create_object_key(122, cache_salt="u1")
+            small_obj = _create_memory_obj(size=1024, fill_value=1.0)
+            medium_obj = _create_memory_obj(size=3000, fill_value=2.0)
+
+            result = _run_store_result(
+                adapter,
+                [small_key, medium_key],
+                [small_obj, medium_obj],
+            )
+
+            assert result.is_successful() is True
+            assert result.bytes_transferred() == (8 * 1024) + (16 * 1024)
+            assert listener.stored == [[small_key, medium_key]]
+            assert listener.stored_sizes == [[8 * 1024, 16 * 1024]]
+
+            usage = adapter.get_usage()
+            assert usage.total_bytes_used == (8 * 1024) + (16 * 1024)
+            assert dict(usage.bytes_by_cache_salt) == {"u1": (8 * 1024) + (16 * 1024)}
+
+            adapter.delete([small_key])
+            usage = adapter.get_usage()
+            assert usage.total_bytes_used == 16 * 1024
+            assert dict(usage.bytes_by_cache_salt) == {"u1": 16 * 1024}
+        finally:
+            adapter.close()
+
+
+@requires_raw_block_ext
+def test_raw_block_l2_adapter_buddy_recovery_seeds_allocated_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        config = _make_config(
+            dev_path,
+            slot_bytes=64 * 1024,
+            allocator="buddy",
+            min_subslot_bytes=8 * 1024,
+        )
+        key = _create_object_key(131, cache_salt="u2")
+        obj = _create_memory_obj(size=3000, fill_value=3.0)
+
+        adapter1 = RawBlockL2Adapter(config)
+        try:
+            assert _run_store_result(adapter1, [key], [obj]).bytes_transferred() == (
+                16 * 1024
+            )
+        finally:
+            adapter1.close()
+
+        adapter2 = RawBlockL2Adapter(config)
+        listener = _RecordingListener()
+        try:
+            usage = adapter2.get_usage()
+            assert usage.total_bytes_used == 16 * 1024
+            assert dict(usage.bytes_by_cache_salt) == {"u2": 16 * 1024}
+
+            adapter2.register_listener(listener)
+            assert listener.stored == [[key]]
+            assert listener.stored_sizes == [[16 * 1024]]
+        finally:
+            adapter2.close()
 
 
 @requires_raw_block_ext

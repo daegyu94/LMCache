@@ -56,6 +56,10 @@ RawBlockStoreTaskResult = tuple[
 ]
 
 
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
     from lmcache.native_storage_ops import Bitmap
@@ -88,6 +92,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH,
         use_uring_cmd: bool = False,
         max_data_transfer_size: int = 0,
+        allocator: str = "fixed",
+        min_subslot_bytes: int = 0,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
@@ -114,6 +120,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth: Queue depth for the Rust io_uring engine.
             use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
             max_data_transfer_size: Max data transfer size for a single request.
+            allocator: Raw-block allocator policy, ``"fixed"`` or ``"buddy"``.
+            min_subslot_bytes: Smallest slot buddy subslot size.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -141,6 +149,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
         self.use_uring_cmd = bool(use_uring_cmd)
         self.max_data_transfer_size = int(max_data_transfer_size)
+        self.allocator = str(allocator or "fixed").lower()
+        self.min_subslot_bytes = int(min_subslot_bytes)
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
         self.num_load_workers = int(num_load_workers)
@@ -176,6 +186,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         max_data_transfer_size = int(d.get("max_data_transfer_size", 0))
+        allocator = str(d.get("allocator", "fixed")).lower()
+        min_subslot_bytes = int(d.get("min_subslot_bytes", 0))
 
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
@@ -187,6 +199,21 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("meta_total_bytes must be a multiple of block_align")
         if slot_bytes < header_bytes + 1:
             raise ValueError("slot_bytes must be >= header_bytes + 1")
+        if allocator not in {"fixed", "buddy"}:
+            raise ValueError("allocator must be 'fixed' or 'buddy'")
+        if allocator == "buddy":
+            if min_subslot_bytes <= 0:
+                min_subslot_bytes = block_align
+                while min_subslot_bytes < header_bytes + 1:
+                    min_subslot_bytes *= 2
+            if min_subslot_bytes > slot_bytes:
+                raise ValueError("min_subslot_bytes must be <= slot_bytes")
+            if not _is_power_of_two(min_subslot_bytes):
+                raise ValueError("min_subslot_bytes must be a power of two")
+            if not _is_power_of_two(slot_bytes):
+                raise ValueError("slot_bytes must be a power of two for buddy")
+            if min_subslot_bytes % block_align != 0:
+                raise ValueError("min_subslot_bytes must be a multiple of block_align")
         if capacity_bytes > 0 and capacity_bytes <= meta_total_bytes:
             raise ValueError("capacity_bytes must leave space for at least one slot")
         validate_raw_block_io_options(
@@ -227,6 +254,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth=iouring_queue_depth,
             use_uring_cmd=use_uring_cmd,
             max_data_transfer_size=max_data_transfer_size,
+            allocator=allocator,
+            min_subslot_bytes=min_subslot_bytes,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
@@ -240,6 +269,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- device_path (str): raw device or file path (required)\n"
             "- slot_bytes (int): slot size in bytes, aligned to block_align "
             "(required)\n"
+            "- allocator (str): fixed or buddy (default fixed)\n"
+            "- min_subslot_bytes (int): minimum slot buddy subslot size "
+            "(default: next power-of-two allocation that fits header)\n"
             "- capacity_bytes (int): optional usable capacity cap "
             "(default 0 = device size)\n"
             "- use_odirect (bool): enable O_DIRECT raw I/O (default true)\n"
@@ -295,6 +327,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth=self.iouring_queue_depth,
             use_uring_cmd=self.use_uring_cmd,
             max_data_transfer_size=self.max_data_transfer_size,
+            allocator=self.allocator,
+            min_subslot_bytes=self.min_subslot_bytes,
         )
 
 
@@ -533,15 +567,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def delete(self, keys: list[ObjectKey]) -> None:
         """Delete keys from raw-block L2 and notify listeners for removals."""
         encoded_keys = [encode_object_key(key).encoded for key in keys]
-        metas = self._core.get_metadata_many(encoded_keys)
+        allocated_sizes = self._core.allocated_bytes_many(encoded_keys)
         deleted_bitmap = self._core.delete_many(encoded_keys, force=False)
         deleted_keys: list[ObjectKey] = []
         deleted_sizes: list[int] = []
-        for key, meta, deleted in zip(keys, metas, deleted_bitmap, strict=False):
+        for key, allocated_size, deleted in zip(
+            keys,
+            allocated_sizes,
+            deleted_bitmap,
+            strict=False,
+        ):
             if not deleted:
                 continue
             deleted_keys.append(key)
-            deleted_sizes.append(0 if meta is None else int(self._core.slot_bytes))
+            deleted_sizes.append(int(allocated_size))
         if deleted_keys:
             try:
                 self._notify_keys_deleted(deleted_keys, deleted_sizes)
@@ -551,11 +590,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def register_listener(self, listener: "L2AdapterListener") -> None:
         """Register a listener and seed it with currently indexed keys."""
         super().register_listener(listener)
-        keys = self._snapshot_indexed_object_keys()
+        indexed = self._snapshot_indexed_object_key_allocations()
+        keys = [key for key, _size in indexed]
         if not keys:
             return
+        sizes = [size for _key, size in indexed]
         try:
-            listener.on_l2_keys_stored(keys, [0] * len(keys))
+            listener.on_l2_keys_stored(keys, sizes)
         except Exception as e:
             logger.warning(
                 "RawBlockL2Adapter listener recovery bootstrap failed: %s", e
@@ -616,15 +657,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
     def _seed_usage_from_core_snapshot(self) -> None:
         """Seed byte counters for entries recovered by RawBlockCore startup."""
-        recovered_keys = self._snapshot_indexed_object_keys()
-        if not recovered_keys:
+        recovered = self._snapshot_indexed_object_key_allocations()
+        if not recovered:
             return
 
-        slot_bytes = int(self._core.slot_bytes)
-        total_delta = len(recovered_keys) * slot_bytes
+        total_delta = sum(size for _key, size in recovered)
         by_salt: dict[str, int] = {}
-        for key in recovered_keys:
-            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + slot_bytes
+        for key, size in recovered:
+            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + size
 
         with self._usage_lock:
             self._total_bytes_used += total_delta
@@ -635,10 +675,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
     def _snapshot_indexed_object_keys(self) -> list[ObjectKey]:
         """Return decoded ObjectKeys for all indexed raw-block entries."""
-        keys: list[ObjectKey] = []
-        for encoded_key in self._core.snapshot_indexed_keys():
+        return [key for key, _size in self._snapshot_indexed_object_key_allocations()]
+
+    def _snapshot_indexed_object_key_allocations(self) -> list[tuple[ObjectKey, int]]:
+        """Return decoded ObjectKeys and allocated byte counts for indexed entries."""
+        encoded_keys = self._core.snapshot_indexed_keys()
+        allocated_sizes = self._core.allocated_bytes_many(encoded_keys)
+        keys: list[tuple[ObjectKey, int]] = []
+        for encoded_key, allocated_size in zip(
+            encoded_keys,
+            allocated_sizes,
+            strict=False,
+        ):
             try:
-                keys.append(decode_object_key(encoded_key))
+                keys.append((decode_object_key(encoded_key), int(allocated_size)))
             except Exception as e:
                 logger.warning(
                     "RawBlockL2Adapter could not decode indexed key %r: %s",
@@ -668,14 +718,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
         stored_encoded = set(put_result.stored_keys)
-        slot_bytes = int(self._core.slot_bytes)
+        allocated_by_encoded = dict(
+            zip(
+                put_result.stored_keys,
+                self._core.allocated_bytes_many(put_result.stored_keys),
+                strict=False,
+            )
+        )
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
         for key, spec in zip(keys, specs, strict=False):
             if spec.encoded not in stored_encoded:
                 continue
             stored_keys.append(key)
-            stored_sizes.append(slot_bytes)
+            stored_sizes.append(int(allocated_by_encoded.get(spec.encoded, 0)))
         return all(put_result.results), stored_keys, stored_sizes
 
     def _finish_store_task(
