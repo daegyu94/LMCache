@@ -252,6 +252,8 @@ class RustRawBlockBackend(StoragePluginInterface):
         max_data_transfer_size = int(
             extra.get("rust_raw_block.max_data_transfer_size", 0)
         )
+        allocator = str(extra.get("rust_raw_block.allocator", "fixed")).lower()
+        min_subslot_bytes = int(extra.get("rust_raw_block.min_subslot_bytes", 0))
         validate_raw_block_io_options(
             iouring_queue_depth=iouring_queue_depth,
         )
@@ -283,6 +285,10 @@ class RustRawBlockBackend(StoragePluginInterface):
             full_chunk_bytes = int(get_full_chunk_size())
         default_slot_bytes = round_up(header_bytes + full_chunk_bytes, block_align)
         slot_bytes = int(extra.get("rust_raw_block.slot_bytes", default_slot_bytes))
+        if allocator == "buddy" and min_subslot_bytes <= 0:
+            min_subslot_bytes = block_align
+            while min_subslot_bytes < header_bytes + 1:
+                min_subslot_bytes *= 2
 
         return RawBlockCoreConfig(
             device_path=self.device_path,
@@ -314,6 +320,8 @@ class RustRawBlockBackend(StoragePluginInterface):
             io_engine=io_engine,
             iouring_queue_depth=iouring_queue_depth,
             use_uring_cmd=use_uring_cmd,
+            allocator=allocator,
+            min_subslot_bytes=min_subslot_bytes,
         )
 
     def _warn_if_loaded_metadata_looks_cross_rank(self) -> None:

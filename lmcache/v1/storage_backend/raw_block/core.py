@@ -30,7 +30,9 @@ from lmcache.utils import (
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.raw_block.allocator import (
     FixedSlotAllocator,
+    RawBlockAllocation,
     RawBlockAllocator,
+    SlotBuddyAllocator,
 )
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
@@ -153,6 +155,8 @@ class RawBlockCoreConfig:
     io_engine: str = "posix"
     iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH
     use_uring_cmd: bool = False
+    allocator: str = "fixed"
+    min_subslot_bytes: int = 0
 
 
 @dataclass
@@ -160,12 +164,14 @@ class _Entry:
     offset: int
     size: int
     meta: DiskCacheMetadata
+    allocated_bytes: int = 0
 
 
 @dataclass
 class _Inflight:
     offset: int
     meta: DiskCacheMetadata
+    allocated_bytes: int = 0
     canceled: bool = False
 
 
@@ -214,6 +220,8 @@ class RawBlockCore:
         self.slot_bytes = int(config.slot_bytes)
         self.use_odirect = bool(config.use_odirect)
         self.enable_zero_copy = bool(config.enable_zero_copy)
+        self.allocator = str(config.allocator or "fixed").lower()
+        self.min_subslot_bytes = int(config.min_subslot_bytes)
 
         self.meta_total_bytes = int(config.meta_total_bytes)
         self.meta_magic = bytes(config.meta_magic)
@@ -246,6 +254,10 @@ class RawBlockCore:
             raise ValueError("slot_bytes must be >= header_bytes + 1")
         if self.slot_bytes % self.block_align != 0:
             raise ValueError("slot_bytes must be a multiple of block_align")
+        if self.allocator not in {"fixed", "buddy"}:
+            raise ValueError("allocator must be 'fixed' or 'buddy'")
+        if self.allocator == "buddy":
+            self._validate_buddy_config()
         if self.meta_total_bytes <= self.block_align:
             raise ValueError("meta_total_bytes must provide room for metadata header")
         if self.meta_total_bytes % self.block_align != 0:
@@ -483,6 +495,21 @@ class RawBlockCore:
             len(buffers),
         )
 
+    def _validate_buddy_config(self) -> None:
+        """Validate buddy allocator config fields."""
+        if self.min_subslot_bytes <= 0:
+            raise ValueError("buddy allocator requires min subslot bytes")
+        if self.min_subslot_bytes % self.block_align != 0:
+            raise ValueError("min_subslot_bytes must be a multiple of block_align")
+        if self.min_subslot_bytes < self.header_bytes + 1:
+            raise ValueError("min_subslot_bytes must be >= header_bytes + 1")
+        SlotBuddyAllocator(
+            data_base_offset=0,
+            min_subslot_bytes=self.min_subslot_bytes,
+            slot_bytes=self.slot_bytes,
+            managed_bytes=self.slot_bytes,
+        )
+
     def contains_key(self, encoded_key: str, *, lock: bool = False) -> bool:
         """Return whether one encoded key is present in the raw-block index.
 
@@ -657,10 +684,13 @@ class RawBlockCore:
                     continue
 
                 try:
-                    offset = self._allocate_slot_locked()
+                    allocation = self._allocate_storage_locked(
+                        self._required_allocation_bytes(obj)
+                    )
+                    offset = allocation.offset
                 except RuntimeError:
                     logger.warning(
-                        "RawBlockCore: no free slot available for key %s",
+                        "RawBlockCore: no suitable allocation available for key %s",
                         key.encoded,
                     )
                     continue
@@ -674,9 +704,18 @@ class RawBlockCore:
                     fmt=obj.metadata.fmt,
                     pin_count=0,
                 )
-                self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
+                self._inflight[key.encoded] = _Inflight(
+                    offset=offset,
+                    meta=meta,
+                    allocated_bytes=allocation.allocated_bytes,
+                )
 
-            success = self._write_one(key, obj, offset)
+            success = self._write_one(
+                key,
+                obj,
+                offset,
+                allocation.allocated_bytes,
+            )
 
             with self._lock:
                 inflight = self._inflight.pop(key.encoded, None)
@@ -693,6 +732,7 @@ class RawBlockCore:
                     offset=inflight.offset,
                     size=inflight.meta.size,
                     meta=inflight.meta,
+                    allocated_bytes=inflight.allocated_bytes,
                 )
                 self._meta_dirty_total += 1
                 results[i] = True
@@ -910,9 +950,10 @@ class RawBlockCore:
     def report_status(self) -> dict:
         """Return raw-block health, layout, metadata, and in-flight counters."""
         with self._lock:
-            return {
+            status = {
                 "is_healthy": not self._closed,
                 "type": "RawBlockCore",
+                "allocator": self.allocator,
                 "key_namespace": self.key_namespace,
                 "device_path": self.device_path,
                 "block_align": self.block_align,
@@ -925,9 +966,6 @@ class RawBlockCore:
                 "locked_key_count": sum(
                     1 for refcnt in self._lock_refcnt.values() if refcnt > 0
                 ),
-                "free_slot_count": len(self._free_slots),
-                "next_slot": self._next_slot,
-                "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
                 "metadata_dirty_total": self._meta_dirty_total,
                 "metadata_persisted": self._meta_persisted,
@@ -938,6 +976,44 @@ class RawBlockCore:
                 "iouring_queue_depth": self.iouring_queue_depth,
                 "use_uring_cmd": self.use_uring_cmd,
             }
+            if isinstance(self._allocator, FixedSlotAllocator):
+                status.update(
+                    {
+                        "free_slot_count": len(self._free_slots),
+                        "next_slot": self._next_slot,
+                        "max_slots": self._max_slots,
+                    }
+                )
+            elif isinstance(self._allocator, SlotBuddyAllocator):
+                status.update(
+                    {
+                        "min_subslot_bytes": self.min_subslot_bytes,
+                        "slot_count": self._allocator_usable_capacity_bytes()
+                        // self.slot_bytes,
+                        "max_subslot_count": self._max_slots,
+                        "free_block_count": sum(
+                            len(offsets)
+                            for offsets in self._allocator.free_blocks.values()
+                        ),
+                    }
+                )
+            return status
+
+    def allocated_bytes_many(self, encoded_keys: Sequence[str]) -> list[int]:
+        """Return allocated bytes for encoded keys.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys.
+
+        Returns:
+            Allocated bytes for each present key, or zero for missing keys.
+        """
+        with self._lock:
+            values: list[int] = []
+            for encoded_key in encoded_keys:
+                entry = self._index.get(encoded_key)
+                values.append(0 if entry is None else int(entry.allocated_bytes))
+            return values
 
     def close(self) -> None:
         """Stop checkpointing, write a final checkpoint, and close the device."""
@@ -1071,27 +1147,39 @@ class RawBlockCore:
         except Exception:
             return None
 
-    def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
+    def _prepare_write_payload(
+        self,
+        memory_obj: MemoryObj,
+        allocation_bytes: int | None = None,
+    ) -> tuple[Any, int, int]:
         """Prepare the payload buffer and lengths for a raw-block write.
 
         Args:
             memory_obj: Source object to persist.
+            allocation_bytes: Allocated byte range including header reservation.
 
         Returns:
             A tuple of ``(buffer, payload_len, total_len)`` where ``total_len``
             includes any O_DIRECT padding.
 
         Raises:
-            RuntimeError: If the aligned payload would exceed slot capacity.
+            RuntimeError: If the aligned payload would exceed allocation capacity.
         """
         buf = memory_obj.byte_array
         if hasattr(buf, "cast"):
             buf = buf.cast("B")
         payload_len = len(memory_obj.byte_array)
-        payload_capacity = self.slot_bytes - self.header_bytes
+        uses_default_slot_capacity = allocation_bytes is None
+        capacity_bytes = self.slot_bytes
+        if allocation_bytes is not None:
+            capacity_bytes = allocation_bytes
+        payload_capacity = int(capacity_bytes) - self.header_bytes
+        capacity_label = (
+            "slot capacity" if uses_default_slot_capacity else "allocation capacity"
+        )
         if payload_len > payload_capacity:
             raise RuntimeError(
-                f"RawBlockCore payload {payload_len} exceeds slot capacity "
+                f"RawBlockCore payload {payload_len} exceeds {capacity_label} "
                 f"{payload_capacity}"
             )
         total_len = payload_len
@@ -1099,7 +1187,7 @@ class RawBlockCore:
             total_len = round_up(payload_len, self.block_align)
             if total_len > payload_capacity:
                 raise RuntimeError(
-                    f"Aligned payload {total_len} exceeds slot capacity "
+                    f"Aligned payload {total_len} exceeds {capacity_label} "
                     f"{payload_capacity}"
                 )
             direct_view = self._build_direct_odirect_view(
@@ -1352,7 +1440,11 @@ class RawBlockCore:
             raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
 
     def _write_one(
-        self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
+        self,
+        key: RawBlockKeySpec,
+        memory_obj: MemoryObj,
+        offset: int,
+        allocation_bytes: int,
     ) -> bool:
         """Write one object header and payload into a raw-block slot.
 
@@ -1360,13 +1452,17 @@ class RawBlockCore:
             key: Raw-block key spec with the slot-header identity.
             memory_obj: Source object to write.
             offset: Slot byte offset on the raw device.
+            allocation_bytes: Allocated byte range including header reservation.
 
         Returns:
             True when both header and payload writes complete; false otherwise.
         """
         try:
             header = self._encode_header(key.slot_identity, len(memory_obj.byte_array))
-            buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
+            buf, payload_len, total_len = self._prepare_write_payload(
+                memory_obj,
+                allocation_bytes,
+            )
 
             with self._lock:
                 self._inflight_io_count += 1
@@ -1458,12 +1554,15 @@ class RawBlockCore:
 
         self._data_base_offset = self.meta_total_bytes
         data_bytes = self._effective_capacity_bytes - self._data_base_offset
-        self._max_slots = data_bytes // self.slot_bytes
-        if self._max_slots <= 0:
-            raise RuntimeError(
-                "raw block capacity too small for slot size after metadata"
-            )
-        self._reset_fixed_allocator_locked()
+        if self.allocator == "buddy":
+            self._reset_buddy_allocator_locked(data_bytes)
+        else:
+            self._max_slots = data_bytes // self.slot_bytes
+            if self._max_slots <= 0:
+                raise RuntimeError(
+                    "raw block capacity too small for slot size after metadata"
+                )
+            self._reset_fixed_allocator_locked()
 
     def _reset_fixed_allocator_locked(self) -> None:
         """Recreate the fixed-slot allocator from compatibility state fields."""
@@ -1476,8 +1575,25 @@ class RawBlockCore:
         )
         self._sync_fixed_allocator_state_locked()
 
+    def _reset_buddy_allocator_locked(self, data_bytes: int) -> None:
+        """Create the buddy allocator for the current data layout."""
+        managed_bytes = (int(data_bytes) // self.slot_bytes) * self.slot_bytes
+        if managed_bytes < self.slot_bytes:
+            raise RuntimeError(
+                "raw block capacity too small for max allocation after metadata"
+            )
+        self._max_slots = managed_bytes // self.min_subslot_bytes
+        self._next_slot = self._max_slots
+        self._free_slots = []
+        self._allocator = SlotBuddyAllocator(
+            data_base_offset=self._data_base_offset,
+            min_subslot_bytes=self.min_subslot_bytes,
+            slot_bytes=self.slot_bytes,
+            managed_bytes=managed_bytes,
+        )
+
     def _sync_fixed_allocator_state_locked(self) -> None:
-        """Mirror fixed allocator state into v1 checkpoint/status fields."""
+        """Mirror fixed allocator state into checkpoint/status fields."""
         if not isinstance(self._allocator, FixedSlotAllocator):
             return
         self._next_slot = self._allocator.next_slot
@@ -1497,30 +1613,23 @@ class RawBlockCore:
             return self._allocator.allocated_bytes(indexed_count, inflight_count)
         return (int(indexed_count) + int(inflight_count)) * self.slot_bytes
 
-    def _slot_to_offset(self, slot: int) -> int:
-        """Convert a data-slot index to its byte offset."""
-        return self._data_base_offset + slot * self.slot_bytes
+    def _required_allocation_bytes(self, memory_obj: MemoryObj) -> int:
+        payload_len = len(memory_obj.byte_array)
+        total_len = (
+            round_up(payload_len, self.block_align)
+            if self._requires_transfer_alignment
+            else payload_len
+        )
+        return self.header_bytes + total_len
 
-    def _offset_to_slot(self, offset: int) -> int:
-        """Convert a data-slot byte offset to its slot index."""
-        return (offset - self._data_base_offset) // self.slot_bytes
-
-    def _allocate_slot_locked(self) -> int:
-        """Allocate a slot offset while ``self._lock`` is held."""
+    def _allocate_storage_locked(self, required_bytes: int) -> RawBlockAllocation:
+        """Allocate storage bytes while ``self._lock`` is held."""
         self._ensure_capacity_and_layout()
         if self._allocator is None:
             raise RuntimeError("raw block allocator is not initialized")
-        allocation = self._allocator.allocate(self.slot_bytes)
+        allocation = self._allocator.allocate(required_bytes)
         self._sync_fixed_allocator_state_locked()
-        return allocation.offset
-
-    def _append_free_slot_locked(self, slot: int) -> None:
-        """Add a slot to the free list while ``self._lock`` is held."""
-        self._ensure_capacity_and_layout()
-        if not isinstance(self._allocator, FixedSlotAllocator):
-            return
-        self._allocator.free_slot(slot)
-        self._sync_fixed_allocator_state_locked()
+        return allocation
 
     def _free_allocation_locked(self, offset: int) -> int:
         """Recycle an allocation by offset while ``self._lock`` is held."""
@@ -1625,6 +1734,34 @@ class RawBlockCore:
                     "free_slots": list(self._free_slots),
                 }
             )
+            entries: dict[str, dict[str, Any]] = {}
+            for encoded_key, entry in self._index.items():
+                entry_state: dict[str, Any] = {
+                    "offset": entry.offset,
+                    "size": entry.meta.size,
+                    "shape": list(entry.meta.shape)
+                    if entry.meta.shape is not None
+                    else None,
+                    "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
+                    "fmt": (
+                        entry.meta.fmt.name
+                        if entry.meta.fmt is not None
+                        and hasattr(entry.meta.fmt, "name")
+                        else str(entry.meta.fmt)
+                        if entry.meta.fmt is not None
+                        else None
+                    ),
+                    "cached_positions": (
+                        entry.meta.cached_positions.tolist()
+                        if entry.meta.cached_positions is not None
+                        and hasattr(entry.meta.cached_positions, "tolist")
+                        else None
+                    ),
+                }
+                if self.allocator == "buddy":
+                    entry_state["allocated_bytes"] = int(entry.allocated_bytes)
+                entries[encoded_key] = entry_state
+
             snapshot = {
                 "version": 1,
                 "device_path": self.device_path,
@@ -1632,38 +1769,18 @@ class RawBlockCore:
                 "block_align": self.block_align,
                 "header_bytes": self.header_bytes,
                 "slot_bytes": self.slot_bytes,
+                "allocator": self.allocator,
                 "meta_total_bytes": self.meta_total_bytes,
                 "meta_magic": self.meta_magic_text,
                 "meta_version": self.meta_version,
                 "data_base_offset": self._data_base_offset,
-                "next_slot": allocator_state["next_slot"],
-                "free_slots": allocator_state["free_slots"],
-                "entries": {
-                    encoded_key: {
-                        "offset": entry.offset,
-                        "size": entry.meta.size,
-                        "shape": list(entry.meta.shape)
-                        if entry.meta.shape is not None
-                        else None,
-                        "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
-                        "fmt": (
-                            entry.meta.fmt.name
-                            if entry.meta.fmt is not None
-                            and hasattr(entry.meta.fmt, "name")
-                            else str(entry.meta.fmt)
-                            if entry.meta.fmt is not None
-                            else None
-                        ),
-                        "cached_positions": (
-                            entry.meta.cached_positions.tolist()
-                            if entry.meta.cached_positions is not None
-                            and hasattr(entry.meta.cached_positions, "tolist")
-                            else None
-                        ),
-                    }
-                    for encoded_key, entry in self._index.items()
-                },
+                "entries": entries,
             }
+            if self.allocator == "buddy":
+                snapshot.update(allocator_state)
+            else:
+                snapshot["next_slot"] = allocator_state["next_slot"]
+                snapshot["free_slots"] = allocator_state["free_slots"]
         return snapshot, dirty_total
 
     def _checkpoint_dtype_name(self, dtype: torch.dtype | None) -> str | None:
@@ -1741,23 +1858,75 @@ class RawBlockCore:
         )
         return self._write_checkpoint(payload, dirty_total_snapshot)
 
-    def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
-        """Return whether a checkpoint entry references a valid data slot."""
-        if offset < self._data_base_offset:
-            return False
-        rel = offset - self._data_base_offset
-        if rel % self.slot_bytes != 0:
-            return False
-        slot = rel // self.slot_bytes
-        if slot >= self._max_slots:
-            return False
-        return 0 < size <= (self.slot_bytes - self.header_bytes)
+    def _decode_checkpoint_entry(
+        self,
+        encoded_key: str,
+        raw_entry: Any,
+        allocator: RawBlockAllocator,
+        allocated_bytes: int,
+    ) -> _Entry | None:
+        """Decode one checkpoint entry with allocator layout validation."""
+        if not isinstance(raw_entry, dict):
+            return None
+        try:
+            offset = int(raw_entry.get("offset", 0))
+            size = int(raw_entry.get("size", 0))
+            allocated_bytes = int(allocated_bytes)
+        except Exception:
+            return None
+
+        if not allocator.is_valid_allocation(offset, allocated_bytes):
+            return None
+        if size <= 0 or size > allocated_bytes - self.header_bytes:
+            return None
+
+        shape_list = raw_entry.get("shape")
+        fmt_name = raw_entry.get("fmt")
+        cached_positions_list = raw_entry.get("cached_positions")
+        dtype_name = raw_entry.get("dtype")
+        try:
+            shape = torch.Size(list(shape_list)) if shape_list is not None else None
+            cached_positions = (
+                torch.tensor(cached_positions_list, dtype=torch.long)
+                if cached_positions_list is not None
+                else None
+            )
+        except Exception:
+            return None
+        fmt = (
+            MemoryFormat[fmt_name]
+            if isinstance(fmt_name, str) and fmt_name in MemoryFormat.__members__
+            else MemoryFormat.UNDEFINED
+        )
+        dtype = self._recover_checkpoint_dtype(encoded_key, dtype_name)
+        meta = DiskCacheMetadata(
+            path=f"{self.device_path}@{offset}",
+            size=size,
+            shape=shape,
+            dtype=dtype,
+            cached_positions=cached_positions,
+            fmt=fmt,
+            pin_count=0,
+        )
+        return _Entry(
+            offset=offset,
+            size=size,
+            meta=meta,
+            allocated_bytes=allocated_bytes,
+        )
 
     def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Apply decoded checkpoint state after validating layout fields."""
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
+            return False
+        checkpoint_allocator = str(data.get("allocator", "fixed"))
+        if checkpoint_allocator == "buddy":
+            return self._apply_loaded_buddy_state(data)
+        if checkpoint_allocator != "fixed":
+            return False
+        if self.allocator != "fixed":
             return False
         checkpoint_device_path = data.get("device_path")
         if checkpoint_device_path and checkpoint_device_path != self.device_path:
@@ -1807,7 +1976,7 @@ class RawBlockCore:
                     "Device metadata free_slots contains non-integer; ignoring metadata"
                 )
                 return False
-            if slot < 0 or slot >= self._max_slots:
+            if slot < 0 or slot >= self._max_slots or slot >= next_slot:
                 logger.warning(
                     "Device metadata free_slots contains out-of-range slot %d; "
                     "ignoring metadata",
@@ -1819,6 +1988,10 @@ class RawBlockCore:
             seen_slots.add(slot)
             free_slots.append(slot)
 
+        allocator = self._allocator
+        if allocator is None:
+            return False
+
         with self._lock:
             self._next_slot = next_slot
             self._free_slots = free_slots
@@ -1827,56 +2000,28 @@ class RawBlockCore:
 
             entries = data.get("entries", {})
             if isinstance(entries, dict):
-                for encoded_key, entry in entries.items():
-                    if not isinstance(entry, dict):
-                        continue
-
-                    offset = int(entry.get("offset", 0))
-                    size = int(entry.get("size", 0))
-                    shape_list = entry.get("shape")
-                    fmt_name = entry.get("fmt")
-                    cached_positions_list = entry.get("cached_positions")
-                    dtype_name = entry.get("dtype")
-
-                    if not self._is_valid_checkpoint_entry(offset, size):
-                        continue
-
-                    shape = (
-                        torch.Size(list(shape_list)) if shape_list is not None else None
-                    )
-                    fmt = (
-                        MemoryFormat[fmt_name]
-                        if isinstance(fmt_name, str)
-                        and fmt_name in MemoryFormat.__members__
-                        else MemoryFormat.UNDEFINED
-                    )
-                    cached_positions = (
-                        torch.tensor(cached_positions_list, dtype=torch.long)
-                        if cached_positions_list is not None
-                        else None
-                    )
-                    dtype = self._recover_checkpoint_dtype(
+                for encoded_key, raw_entry in entries.items():
+                    entry = self._decode_checkpoint_entry(
                         str(encoded_key),
-                        dtype_name,
+                        raw_entry,
+                        allocator,
+                        self.slot_bytes,
                     )
+                    if entry is None:
+                        continue
+                    if (
+                        isinstance(allocator, FixedSlotAllocator)
+                        and allocator.offset_to_slot(int(entry.offset)) >= next_slot
+                    ):
+                        continue
+                    self._index[str(encoded_key)] = entry
 
-                    meta = DiskCacheMetadata(
-                        path=f"{self.device_path}@{offset}",
-                        size=size,
-                        shape=shape,
-                        dtype=dtype,
-                        cached_positions=cached_positions,
-                        fmt=fmt,
-                        pin_count=0,
-                    )
-                    self._index[encoded_key] = _Entry(
-                        offset=offset, size=size, meta=meta
-                    )
-
-            used_slots = {
-                self._offset_to_slot(int(entry.offset))
-                for entry in self._index.values()
-            }
+            used_slots = set()
+            if isinstance(allocator, FixedSlotAllocator):
+                used_slots = {
+                    allocator.offset_to_slot(int(entry.offset))
+                    for entry in self._index.values()
+                }
             self._free_slots = [
                 slot for slot in self._free_slots if slot not in used_slots
             ]
@@ -1888,6 +2033,134 @@ class RawBlockCore:
         if self.meta_verify_on_load:
             self._validate_loaded_entries()
         return True
+
+    def _apply_loaded_buddy_state(self, data: dict[str, Any]) -> bool:
+        """Apply a buddy allocator checkpoint payload."""
+        if str(data.get("allocator", "")) != "buddy":
+            return False
+        if self.allocator != "buddy":
+            return False
+        checkpoint_device_path = data.get("device_path")
+        if checkpoint_device_path and checkpoint_device_path != self.device_path:
+            logger.warning("Device metadata device_path mismatch; ignoring metadata")
+            return False
+        if int(data.get("header_bytes", self.header_bytes)) != self.header_bytes:
+            logger.warning("Device metadata header_bytes mismatch; ignoring metadata")
+            return False
+        if int(data.get("slot_bytes", self.slot_bytes)) != self.slot_bytes:
+            logger.warning("Device metadata slot_bytes mismatch; ignoring metadata")
+            return False
+        if int(data.get("min_subslot_bytes", 0)) != self.min_subslot_bytes:
+            logger.warning("Device metadata slot buddy config mismatch")
+            return False
+        if (
+            int(data.get("meta_total_bytes", self.meta_total_bytes))
+            != self.meta_total_bytes
+        ):
+            logger.warning(
+                "Device metadata meta_total_bytes mismatch; ignoring metadata"
+            )
+            return False
+        if str(data.get("meta_magic", self.meta_magic_text)) != self.meta_magic_text:
+            logger.warning("Device metadata meta_magic mismatch; ignoring metadata")
+            return False
+        if int(data.get("meta_version", self.meta_version)) != self.meta_version:
+            logger.warning("Device metadata meta_version mismatch; ignoring metadata")
+            return False
+
+        try:
+            managed_bytes = int(data.get("managed_bytes", 0))
+        except Exception:
+            return False
+        if managed_bytes <= 0:
+            return False
+        current_managed_bytes = self._allocator_usable_capacity_bytes()
+        if managed_bytes != current_managed_bytes:
+            logger.warning(
+                "Device metadata buddy managed_bytes mismatch; ignoring metadata"
+            )
+            return False
+
+        free_blocks = self._parse_buddy_free_blocks(data.get("free_blocks", {}))
+        if free_blocks is None:
+            return False
+
+        validator = self._allocator
+        if validator is None:
+            return False
+
+        index: dict[str, _Entry] = {}
+        allocated_blocks: dict[int, int] = {}
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            return False
+        for encoded_key, raw_entry in entries.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            try:
+                allocated_bytes = int(raw_entry.get("allocated_bytes", 0))
+            except Exception:
+                continue
+            entry = self._decode_checkpoint_entry(
+                str(encoded_key),
+                raw_entry,
+                validator,
+                allocated_bytes,
+            )
+            if entry is None:
+                continue
+            index[str(encoded_key)] = entry
+            allocated_blocks[int(entry.offset)] = int(entry.allocated_bytes)
+
+        try:
+            allocator = SlotBuddyAllocator(
+                data_base_offset=self._data_base_offset,
+                min_subslot_bytes=self.min_subslot_bytes,
+                slot_bytes=self.slot_bytes,
+                managed_bytes=managed_bytes,
+                free_blocks=free_blocks,
+                allocated_blocks=allocated_blocks,
+            )
+        except ValueError:
+            return False
+
+        with self._lock:
+            self._allocator = allocator
+            self._max_slots = managed_bytes // self.min_subslot_bytes
+            self._next_slot = self._max_slots
+            self._free_slots = []
+            self._index.clear()
+            self._index.update(index)
+            self._lock_refcnt.clear()
+            self._meta_dirty_total = 0
+            self._meta_persisted = 0
+
+        if self.meta_verify_on_load:
+            self._validate_loaded_entries()
+        return True
+
+    def _parse_buddy_free_blocks(
+        self,
+        raw_free_blocks: Any,
+    ) -> dict[int, set[int]] | None:
+        if not isinstance(raw_free_blocks, dict):
+            return None
+        free_blocks: dict[int, set[int]] = {}
+        for raw_order, raw_offsets in raw_free_blocks.items():
+            try:
+                order = int(raw_order)
+            except Exception:
+                return None
+            if not isinstance(raw_offsets, list):
+                return None
+            offsets: set[int] = set()
+            for raw_offset in raw_offsets:
+                try:
+                    offsets.add(int(raw_offset))
+                except Exception:
+                    return None
+            free_blocks[order] = offsets
+        return free_blocks
 
     def _recover_checkpoint_dtype(
         self,

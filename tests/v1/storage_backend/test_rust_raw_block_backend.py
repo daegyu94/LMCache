@@ -122,6 +122,46 @@ def _make_byte_obj(size: int) -> TensorMemoryObj:
     return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
 
 
+def test_rust_raw_block_backend_builds_slot_buddy_core_config():
+    local_cpu = types.SimpleNamespace(get_full_chunk_size_bytes=lambda: 1024)
+    backend = RustRawBlockBackend.__new__(RustRawBlockBackend)
+    backend.device_path = "/tmp/raw-block-slot-buddy-config"
+    backend.local_cpu_backend = local_cpu
+
+    core_config = backend._build_core_config(
+        {
+            "rust_raw_block.allocator": "buddy",
+            "rust_raw_block.slot_bytes": 64 * 1024,
+            "rust_raw_block.min_subslot_bytes": 8 * 1024,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+        }
+    )
+
+    assert core_config.allocator == "buddy"
+    assert core_config.slot_bytes == 64 * 1024
+    assert core_config.min_subslot_bytes == 8 * 1024
+
+
+def test_rust_raw_block_backend_defaults_slot_buddy_min_subslot_bytes():
+    local_cpu = types.SimpleNamespace(get_full_chunk_size_bytes=lambda: 1024)
+    backend = RustRawBlockBackend.__new__(RustRawBlockBackend)
+    backend.device_path = "/tmp/raw-block-slot-buddy-default"
+    backend.local_cpu_backend = local_cpu
+
+    core_config = backend._build_core_config(
+        {
+            "rust_raw_block.allocator": "buddy",
+            "rust_raw_block.slot_bytes": 64 * 1024,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+        }
+    )
+
+    assert core_config.allocator == "buddy"
+    assert core_config.min_subslot_bytes == 8 * 1024
+
+
 def test_raw_block_core_passes_io_engine_options_to_rust_binding(monkeypatch):
     calls: list[dict[str, object]] = []
 
