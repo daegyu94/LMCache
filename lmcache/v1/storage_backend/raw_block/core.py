@@ -28,6 +28,10 @@ from lmcache.utils import (
     DiskCacheMetadata,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.storage_backend.raw_block.allocator import (
+    FixedSlotAllocator,
+    RawBlockAllocator,
+)
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
     RawBlockKeySpec,
@@ -308,6 +312,7 @@ class RawBlockCore:
         self._next_slot: int = 0
         self._free_slots: list[int] = []
         self._max_slots: int = 0
+        self._allocator: RawBlockAllocator | None = None
         self._effective_capacity_bytes: int = 0
         self._data_base_offset: int = 0
 
@@ -679,9 +684,7 @@ class RawBlockCore:
                     results[i] = False
                     continue
                 if inflight.canceled or not success:
-                    self._append_free_slot_locked(
-                        self._offset_to_slot(int(inflight.offset))
-                    )
+                    self._free_allocation_locked(int(inflight.offset))
                     self._meta_dirty_total += 1
                     results[i] = False
                     continue
@@ -864,9 +867,7 @@ class RawBlockCore:
                     inflight.canceled = True
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
-                        self._offset_to_slot(int(removed_entry.offset))
-                    )
+                    self._free_allocation_locked(int(removed_entry.offset))
                     self._meta_dirty_total += 1
                 deleted.append(removed_entry is not None or inflight is not None)
         return deleted
@@ -880,11 +881,14 @@ class RawBlockCore:
             indicates that usable capacity is unknown.
         """
         with self._lock:
-            usable_capacity = self._max_slots * self.slot_bytes
+            usable_capacity = self._allocator_usable_capacity_bytes()
             if usable_capacity <= 0:
                 return (-1.0, -1.0)
-            used_slots = len(self._index) + len(self._inflight)
-            usage = (used_slots * self.slot_bytes) / usable_capacity
+            allocated = self._allocator_allocated_bytes(
+                len(self._index),
+                len(self._inflight),
+            )
+            usage = allocated / usable_capacity
             return (usage, usage)
 
     def checkpoint_now(self) -> None:
@@ -915,7 +919,7 @@ class RawBlockCore:
                 "header_bytes": self.header_bytes,
                 "slot_bytes": self.slot_bytes,
                 "meta_total_bytes": self.meta_total_bytes,
-                "usable_capacity_bytes": self._max_slots * self.slot_bytes,
+                "usable_capacity_bytes": self._allocator_usable_capacity_bytes(),
                 "indexed_key_count": len(self._index),
                 "inflight_key_count": len(self._inflight),
                 "locked_key_count": sum(
@@ -1437,7 +1441,11 @@ class RawBlockCore:
 
     def _ensure_capacity_and_layout(self) -> None:
         """Open the device if needed and compute metadata/data layout."""
-        if self._effective_capacity_bytes > 0 and self._max_slots > 0:
+        if (
+            self._effective_capacity_bytes > 0
+            and self._max_slots > 0
+            and self._allocator is not None
+        ):
             return
 
         device_size = int(self._rawdev().size_bytes())
@@ -1455,6 +1463,39 @@ class RawBlockCore:
             raise RuntimeError(
                 "raw block capacity too small for slot size after metadata"
             )
+        self._reset_fixed_allocator_locked()
+
+    def _reset_fixed_allocator_locked(self) -> None:
+        """Recreate the fixed-slot allocator from compatibility state fields."""
+        self._allocator = FixedSlotAllocator(
+            data_base_offset=self._data_base_offset,
+            slot_bytes=self.slot_bytes,
+            max_slots=self._max_slots,
+            next_slot=self._next_slot,
+            free_slots=self._free_slots,
+        )
+        self._sync_fixed_allocator_state_locked()
+
+    def _sync_fixed_allocator_state_locked(self) -> None:
+        """Mirror fixed allocator state into v1 checkpoint/status fields."""
+        if not isinstance(self._allocator, FixedSlotAllocator):
+            return
+        self._next_slot = self._allocator.next_slot
+        self._free_slots = list(self._allocator.free_slots)
+
+    def _allocator_usable_capacity_bytes(self) -> int:
+        if self._allocator is not None:
+            return self._allocator.usable_capacity_bytes()
+        return self._max_slots * self.slot_bytes
+
+    def _allocator_allocated_bytes(
+        self,
+        indexed_count: int,
+        inflight_count: int,
+    ) -> int:
+        if self._allocator is not None:
+            return self._allocator.allocated_bytes(indexed_count, inflight_count)
+        return (int(indexed_count) + int(inflight_count)) * self.slot_bytes
 
     def _slot_to_offset(self, slot: int) -> int:
         """Convert a data-slot index to its byte offset."""
@@ -1467,21 +1508,28 @@ class RawBlockCore:
     def _allocate_slot_locked(self) -> int:
         """Allocate a slot offset while ``self._lock`` is held."""
         self._ensure_capacity_and_layout()
-        if self._free_slots:
-            return self._slot_to_offset(self._free_slots.pop())
-        if self._next_slot < self._max_slots:
-            slot = self._next_slot
-            self._next_slot += 1
-            return self._slot_to_offset(slot)
-        raise RuntimeError("No free slots available")
+        if self._allocator is None:
+            raise RuntimeError("raw block allocator is not initialized")
+        allocation = self._allocator.allocate(self.slot_bytes)
+        self._sync_fixed_allocator_state_locked()
+        return allocation.offset
 
     def _append_free_slot_locked(self, slot: int) -> None:
         """Add a slot to the free list while ``self._lock`` is held."""
-        if slot < 0 or slot >= self._max_slots:
+        self._ensure_capacity_and_layout()
+        if not isinstance(self._allocator, FixedSlotAllocator):
             return
-        if slot in self._free_slots:
-            return
-        self._free_slots.append(slot)
+        self._allocator.free_slot(slot)
+        self._sync_fixed_allocator_state_locked()
+
+    def _free_allocation_locked(self, offset: int) -> int:
+        """Recycle an allocation by offset while ``self._lock`` is held."""
+        self._ensure_capacity_and_layout()
+        if self._allocator is None:
+            return 0
+        freed_bytes = self._allocator.free_offset(offset)
+        self._sync_fixed_allocator_state_locked()
+        return freed_bytes
 
     def _checkpoint_loop(self) -> None:
         """Periodically checkpoint dirty metadata until shutdown."""
@@ -1569,6 +1617,14 @@ class RawBlockCore:
         """Build a JSON-serializable checkpoint state snapshot."""
         with self._lock:
             dirty_total = self._meta_dirty_total
+            allocator_state = (
+                self._allocator.checkpoint_state()
+                if self._allocator is not None
+                else {
+                    "next_slot": self._next_slot,
+                    "free_slots": list(self._free_slots),
+                }
+            )
             snapshot = {
                 "version": 1,
                 "device_path": self.device_path,
@@ -1580,8 +1636,8 @@ class RawBlockCore:
                 "meta_magic": self.meta_magic_text,
                 "meta_version": self.meta_version,
                 "data_base_offset": self._data_base_offset,
-                "next_slot": self._next_slot,
-                "free_slots": list(self._free_slots),
+                "next_slot": allocator_state["next_slot"],
+                "free_slots": allocator_state["free_slots"],
                 "entries": {
                     encoded_key: {
                         "offset": entry.offset,
@@ -1824,6 +1880,7 @@ class RawBlockCore:
             self._free_slots = [
                 slot for slot in self._free_slots if slot not in used_slots
             ]
+            self._reset_fixed_allocator_locked()
 
             self._meta_dirty_total = 0
             self._meta_persisted = 0
@@ -1908,9 +1965,7 @@ class RawBlockCore:
                 removed_entry = self._index.pop(encoded_key, None)
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
-                        self._offset_to_slot(int(removed_entry.offset))
-                    )
+                    self._free_allocation_locked(int(removed_entry.offset))
             self._meta_dirty_total += 1
 
         logger.warning(
