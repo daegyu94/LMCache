@@ -1,20 +1,28 @@
 Raw Block (Rust)
 ================
 
-A built-in L2 adapter that stores KV objects in fixed-size slots on a raw block
-device or pre-sized file using the Rust raw-device I/O bindings. It reuses the
-existing raw-block metadata checkpoint model and writes directly into the
-caller-provided load buffers during prefetch.
+A built-in L2 adapter that stores KV objects on a raw block device or pre-sized
+file using the Rust raw-device I/O bindings. By default it stores objects in
+fixed-size slots, where each object consumes one whole ``slot_bytes`` slot. Set
+``allocator="buddy"`` to keep the same top-level slots but split each slot into
+power-of-two subslots for variable-size payloads. The store, lookup, load, and
+delete adapter API stays the same.
 
 **Required fields:**
 
 - ``device_path``: Raw device path or pre-sized file path.
-- ``slot_bytes``: Fixed slot size in bytes. Must be aligned to ``block_align``.
+- ``slot_bytes``: Fixed slot size in bytes. For ``allocator="buddy"``, this is
+  also the buddy root size. Must be aligned to ``block_align``.
 
 **Optional fields:**
 
 - ``capacity_bytes``: Optional cap on the usable device bytes. Default ``0``
   means use the full device/file size.
+- ``allocator``: ``"fixed"`` (default) or ``"buddy"``.
+- ``min_subslot_bytes``: Smallest slot-buddy subslot size. It must be a
+  power-of-two value aligned to ``block_align``. If omitted for
+  ``allocator="buddy"``, it defaults to the smallest aligned power-of-two
+  allocation that can hold the raw-block header plus at least one payload byte.
 - ``use_odirect``: ``true`` or ``false`` (default ``true``).
 - ``block_align``: Device alignment in bytes (default ``4096``).
 - ``header_bytes``: Per-slot header reservation (default ``4096``).
@@ -45,9 +53,23 @@ caller-provided load buffers during prefetch.
 - ``raw_block`` is a server-owned MP adapter. It does **not** support
   per-TP device-path mappings in MP mode.
 - ``raw_block`` remains ``"type": "raw_block"`` for all supported engines.
-- ``raw_block`` owns on-device slot allocation, checkpointing, and recovery
-  through ``RawBlockCore``. Slot reclamation is driven by the shared/global
+- ``raw_block`` owns on-device allocation, checkpointing, and recovery through
+  ``RawBlockCore``. Reclamation is driven by the shared/global
   L2 eviction controller or explicit ``delete()`` calls.
+- Fixed allocation preserves the original checkpoint payload shape. Slot buddy
+  allocation extends that payload with buddy-specific fields; it does not
+  auto-migrate fixed-slot checkpoints.
+- In fixed mode, one object always consumes one whole ``slot_bytes`` slot. In
+  slot-buddy mode, one object consumes one power-of-two subslot inside a
+  ``slot_bytes`` buddy arena.
+- Slot buddy allocation charges store, delete, recovery, and eviction accounting by
+  allocated block bytes, not logical payload bytes.
+- Slot buddy allocation does not compact or split one object across multiple
+  blocks. Watermark eviction reduces total L2 capacity pressure, but it does
+  not guarantee that a specific block size is available inside a buddy arena.
+  If no single suitable free block exists, storing that key fails even when
+  total free capacity is below the eviction watermark. A later retry can
+  succeed after normal eviction frees a large enough block.
 - If ``use_odirect`` is enabled, the server's ``--l1-align-bytes`` should be
   at least ``block_align``.
 - ``persist_enabled`` must remain ``true`` for this adapter.
@@ -65,6 +87,9 @@ caller-provided load buffers during prefetch.
 
     # Basic raw_block with posix I/O
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "block_align": 4096, "header_bytes": 4096, "meta_total_bytes": 268435456, "use_odirect": true, "num_store_workers": 2, "num_lookup_workers": 1, "num_load_workers": 4}'
+
+    # Slot buddy allocation for variable-size payloads
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "allocator": "buddy", "min_subslot_bytes": 8192, "block_align": 4096, "header_bytes": 4096, "meta_total_bytes": 268435456, "use_odirect": true}'
 
     # With io_uring
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "iouring_queue_depth": 256, "use_odirect": true}'
