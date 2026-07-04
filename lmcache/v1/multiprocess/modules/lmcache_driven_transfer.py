@@ -9,6 +9,7 @@ import threading
 import time
 
 # Third Party
+import msgspec
 import torch
 
 # First Party
@@ -383,6 +384,13 @@ def transfer_kv_per_object_group(
                 )
 
 
+class FinishWritePayload(msgspec.Struct):
+    """Stream callback payload for finishing writes with placement hints."""
+
+    keys: list[ObjectKey]
+    lifetime_hint: str | None = None
+
+
 @dataclass
 class ContextEntry:
     """Registered cache context metadata for a single worker instance.
@@ -444,11 +452,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
+            "finish_write_with_lifetime_hint",
+            self._finish_write_with_lifetime_hint,
+            payload_type=FinishWritePayload,
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.start()
+
+    def _finish_write_with_lifetime_hint(self, payload: FinishWritePayload) -> None:
+        """Finish writes from a stream callback with an L2 lifetime hint."""
+        self._ctx.storage_manager.finish_write(
+            payload.keys, lifetime_hint=payload.lifetime_hint
+        )
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -769,6 +788,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise ValueError(f"No GPU context registered for instance ID {instance_id}")
         cache_context = entry.cache_context
         model_name = entry.model_name
+        lifetime_hint = entry.lifetime_hint
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
@@ -904,11 +924,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
                 if stored_count:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_write",
-                        list(all_dict.keys()),
-                    )
+                    if lifetime_hint is None:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write",
+                            list(all_dict.keys()),
+                        )
+                    else:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write_with_lifetime_hint",
+                            FinishWritePayload(
+                                keys=list(all_dict.keys()),
+                                lifetime_hint=lifetime_hint,
+                            ),
+                        )
                 else:
                     total_bytes = 0
                 self._ctx.event_bus.publish_on_stream(
