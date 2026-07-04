@@ -627,3 +627,272 @@ def test_raw_block_l2_adapter_error_bitmaps_keep_submitted_size():
             assert str(load_bitmap) == "00"
         finally:
             adapter.close()
+
+
+class _FakePutResult:
+    def __init__(self, stored_keys: list[str], results: list[bool]) -> None:
+        self.stored_keys = stored_keys
+        self.results = results
+
+
+class _FakeRawBlockCoreForFDP:
+    instances: list["_FakeRawBlockCoreForFDP"] = []
+
+    def __init__(self, config, key_namespace: str) -> None:
+        del config, key_namespace
+        self.slot_bytes = 64 * 1024
+        self.placement_id_batches: list[list[int] | None] = []
+        self.closed = False
+        type(self).instances.append(self)
+
+    def fetch_fdp_status(self) -> list[tuple[int, int]]:
+        return [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0)]
+
+    def report_status(self) -> dict[str, object]:
+        return {"is_healthy": True, "usable_capacity_bytes": 8 * self.slot_bytes}
+
+    def snapshot_indexed_keys(self) -> list[str]:
+        return []
+
+    def put_many(self, specs, objects, placement_ids=None):
+        del objects
+        self.placement_id_batches.append(placement_ids)
+        return _FakePutResult([spec.encoded for spec in specs], [True] * len(specs))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_fdp_config() -> RawBlockL2AdapterConfig:
+    return RawBlockL2AdapterConfig(
+        device_path="/dev/fake-ng0n1",
+        slot_bytes=64 * 1024,
+        use_odirect=False,
+        io_engine="io_uring",
+        use_uring_cmd=True,
+        block_align=4096,
+        header_bytes=4096,
+        meta_total_bytes=1 * 1024 * 1024,
+        meta_enable_periodic=False,
+        num_store_workers=1,
+        num_lookup_workers=1,
+        num_load_workers=1,
+        fdp_enabled=True,
+    )
+
+
+def test_raw_block_l2_adapter_reserves_rank_slices_for_cohorts():
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
+
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+        _FakeRawBlockCoreForFDP,
+    ):
+        _FakeRawBlockCoreForFDP.instances.clear()
+        adapter = RawBlockL2Adapter(_make_fdp_config())
+        try:
+            for rank in range(4):
+                adapter.register_instance_placement(
+                    100 + rank,
+                    "VLLM",
+                    "llm1",
+                    RankPlacementInfo(local_rank=rank, local_world_size=4),
+                )
+            for rank in range(2):
+                adapter.register_instance_placement(
+                    200 + rank,
+                    "VLLM",
+                    "llm2",
+                    RankPlacementInfo(local_rank=rank, local_world_size=2),
+                )
+
+            status = adapter.report_status()
+            allocator = status["fdp_placement_allocator"]
+            assert allocator is not None
+            cohorts = allocator["cohorts"]
+            assert cohorts["auto:0"]["placement_ids"] == [1, 2, 3, 4]
+            assert cohorts["auto:1"]["placement_ids"] == [5, 6]
+
+            key = _create_object_key(901)
+            task_id = adapter.submit_store_task_for_instance(
+                101, [key], [_create_memory_obj()]
+            )
+            assert _wait_event_fd(adapter.get_store_event_fd())
+            assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+            core = _FakeRawBlockCoreForFDP.instances[-1]
+            assert core.placement_id_batches[-1] == [2]
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_uses_explicit_placement_group_id():
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
+
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+        _FakeRawBlockCoreForFDP,
+    ):
+        _FakeRawBlockCoreForFDP.instances.clear()
+        adapter = RawBlockL2Adapter(_make_fdp_config())
+        try:
+            adapter.register_instance_placement(
+                10,
+                "VLLM",
+                "same-model",
+                RankPlacementInfo(
+                    local_rank=0, local_world_size=2, placement_group_id="replica-a"
+                ),
+            )
+            adapter.register_instance_placement(
+                20,
+                "VLLM",
+                "same-model",
+                RankPlacementInfo(
+                    local_rank=0, local_world_size=2, placement_group_id="replica-b"
+                ),
+            )
+            adapter.register_instance_placement(
+                11,
+                "VLLM",
+                "same-model",
+                RankPlacementInfo(
+                    local_rank=1, local_world_size=2, placement_group_id="replica-a"
+                ),
+            )
+            adapter.register_instance_placement(
+                21,
+                "VLLM",
+                "same-model",
+                RankPlacementInfo(
+                    local_rank=1, local_world_size=2, placement_group_id="replica-b"
+                ),
+            )
+
+            status = adapter.report_status()
+            allocator = status["fdp_placement_allocator"]
+            assert allocator is not None
+            cohorts = allocator["cohorts"]
+            assert cohorts["group:replica-a"]["placement_ids"] == [1, 2]
+            assert cohorts["group:replica-b"]["placement_ids"] == [3, 4]
+
+            with pytest.raises(ValueError, match="rank 0 is already"):
+                adapter.register_instance_placement(
+                    12,
+                    "VLLM",
+                    "same-model",
+                    RankPlacementInfo(
+                        local_rank=0,
+                        local_world_size=2,
+                        placement_group_id="replica-a",
+                    ),
+                )
+
+            key = _create_object_key(903)
+            task_id = adapter.submit_store_task_for_instance(
+                21, [key], [_create_memory_obj()]
+            )
+            assert _wait_event_fd(adapter.get_store_event_fd())
+            assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+            core = _FakeRawBlockCoreForFDP.instances[-1]
+            assert core.placement_id_batches[-1] == [4]
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_fdp_placement_fail_fast():
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
+
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+        _FakeRawBlockCoreForFDP,
+    ):
+        _FakeRawBlockCoreForFDP.instances.clear()
+        adapter = RawBlockL2Adapter(_make_fdp_config())
+        try:
+            with pytest.raises(ValueError, match="local_rank"):
+                adapter.register_instance_placement(
+                    1,
+                    "VLLM",
+                    "bad-rank",
+                    RankPlacementInfo(local_rank=2, local_world_size=2),
+                )
+
+            adapter.register_instance_placement(
+                10,
+                "VLLM",
+                "duplicate-rank",
+                RankPlacementInfo(local_rank=0, local_world_size=2),
+            )
+            with pytest.raises(ValueError, match="rank 0 is already"):
+                adapter.register_instance_placement(
+                    11,
+                    "VLLM",
+                    "duplicate-rank",
+                    RankPlacementInfo(local_rank=0, local_world_size=2),
+                )
+            adapter.unregister_instance_placement(10)
+
+            for rank in range(8):
+                adapter.register_instance_placement(
+                    100 + rank,
+                    "VLLM",
+                    "fills-identifiers",
+                    RankPlacementInfo(local_rank=rank, local_world_size=8),
+                )
+            with pytest.raises(ValueError, match="not enough free FDP placement"):
+                adapter.register_instance_placement(
+                    999,
+                    "SGLANG",
+                    "no-identifiers-left",
+                    RankPlacementInfo(local_rank=0, local_world_size=1),
+                )
+
+            with pytest.raises(RuntimeError, match="registered origin instance"):
+                adapter.submit_store_task(
+                    [_create_object_key(902)], [_create_memory_obj()]
+                )
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_reuses_freed_fdp_slice():
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
+
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+        _FakeRawBlockCoreForFDP,
+    ):
+        _FakeRawBlockCoreForFDP.instances.clear()
+        adapter = RawBlockL2Adapter(_make_fdp_config())
+        try:
+            adapter.register_instance_placement(
+                1,
+                "VLLM",
+                "first",
+                RankPlacementInfo(local_rank=0, local_world_size=2),
+            )
+            adapter.register_instance_placement(
+                2,
+                "VLLM",
+                "first",
+                RankPlacementInfo(local_rank=1, local_world_size=2),
+            )
+            adapter.unregister_instance_placement(1)
+            adapter.unregister_instance_placement(2)
+
+            adapter.register_instance_placement(
+                3,
+                "TRTLLM",
+                "second",
+                RankPlacementInfo(local_rank=0, local_world_size=1),
+            )
+            status = adapter.report_status()
+            allocator = status["fdp_placement_allocator"]
+            assert allocator is not None
+            assert allocator["cohorts"]["auto:1"]["placement_ids"] == [1]
+        finally:
+            adapter.close()

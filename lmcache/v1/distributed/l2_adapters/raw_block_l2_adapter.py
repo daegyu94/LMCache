@@ -12,6 +12,7 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
 import threading
@@ -36,6 +37,7 @@ from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
 from lmcache.v1.platform import EventNotifier, create_event_notifier
 from lmcache.v1.storage_backend.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
@@ -107,6 +109,224 @@ def _make_bitmap(size: int) -> "Bitmap":
     from lmcache.native_storage_ops import Bitmap
 
     return Bitmap(size)
+
+
+@dataclass
+class _PlacementCohort:
+    key: str
+    signature: tuple[str, str, int] | None
+    local_world_size: int
+    placement_ids: list[int]
+    instance_ranks: dict[int, int]
+    rank_instances: dict[int, int]
+
+
+class _RawBlockPlacementAllocator:
+    """Reserve non-overlapping FDP placement-identifier slices per LLM cohort."""
+
+    def __init__(self, placement_ids: list[int]) -> None:
+        if not placement_ids:
+            raise ValueError("placement_ids must be non-empty")
+        self._placement_ids = list(placement_ids)
+        self._free_ranges: list[tuple[int, int]] = [(0, len(placement_ids))]
+        self._cohorts: dict[str, _PlacementCohort] = {}
+        self._instance_to_cohort: dict[int, str] = {}
+        self._open_by_signature: dict[tuple[str, str, int], str] = {}
+        self._next_auto_id = 0
+
+    def register(
+        self,
+        instance_id: int,
+        engine_type: str,
+        model_name: str,
+        placement_info: RankPlacementInfo,
+    ) -> None:
+        """Register one instance and reserve a cohort slice if needed."""
+        local_rank = int(placement_info.local_rank)
+        local_world_size = int(placement_info.local_world_size)
+        if local_world_size <= 0:
+            raise ValueError("local_world_size must be positive")
+        if local_rank < 0 or local_rank >= local_world_size:
+            raise ValueError(
+                "local_rank must be in [0, local_world_size), got "
+                f"{local_rank} / {local_world_size}"
+            )
+
+        existing_key = self._instance_to_cohort.get(instance_id)
+        if existing_key is not None:
+            cohort = self._cohorts[existing_key]
+            existing_rank = cohort.instance_ranks[instance_id]
+            if existing_rank != local_rank:
+                raise ValueError(
+                    f"instance {instance_id} already registered as rank "
+                    f"{existing_rank}, got {local_rank}"
+                )
+            if cohort.local_world_size != local_world_size:
+                raise ValueError(
+                    f"instance {instance_id} already registered with "
+                    f"local_world_size={cohort.local_world_size}, got "
+                    f"{local_world_size}"
+                )
+            return
+
+        cohort = self._get_or_create_cohort(
+            engine_type,
+            model_name,
+            local_world_size,
+            placement_info.placement_group_id,
+        )
+        if cohort.local_world_size != local_world_size:
+            raise ValueError(
+                f"cohort {cohort.key!r} has local_world_size "
+                f"{cohort.local_world_size}, got {local_world_size}"
+            )
+        rank_owner = cohort.rank_instances.get(local_rank)
+        if rank_owner is not None and rank_owner != instance_id:
+            raise ValueError(
+                f"cohort {cohort.key!r} rank {local_rank} is already "
+                f"registered by instance {rank_owner}"
+            )
+
+        cohort.instance_ranks[instance_id] = local_rank
+        cohort.rank_instances[local_rank] = instance_id
+        self._instance_to_cohort[instance_id] = cohort.key
+        if (
+            cohort.signature is not None
+            and len(cohort.rank_instances) >= cohort.local_world_size
+            and self._open_by_signature.get(cohort.signature) == cohort.key
+        ):
+            self._open_by_signature.pop(cohort.signature, None)
+
+    def unregister(self, instance_id: int) -> None:
+        """Unregister an instance and free its cohort slice when empty."""
+        cohort_key = self._instance_to_cohort.pop(instance_id, None)
+        if cohort_key is None:
+            return
+        cohort = self._cohorts.get(cohort_key)
+        if cohort is None:
+            return
+        local_rank = cohort.instance_ranks.pop(instance_id, None)
+        if local_rank is not None:
+            cohort.rank_instances.pop(local_rank, None)
+        if cohort.instance_ranks:
+            if (
+                cohort.signature is not None
+                and len(cohort.rank_instances) < cohort.local_world_size
+            ):
+                self._open_by_signature.setdefault(cohort.signature, cohort.key)
+            return
+
+        self._cohorts.pop(cohort.key, None)
+        if cohort.signature is not None:
+            self._open_by_signature.pop(cohort.signature, None)
+        self._free_slice(cohort.placement_ids)
+
+    def placement_for_instance(self, instance_id: int) -> int:
+        """Return the placement identifier assigned to ``instance_id``."""
+        cohort_key = self._instance_to_cohort.get(instance_id)
+        if cohort_key is None:
+            raise ValueError(f"instance {instance_id} has no FDP placement cohort")
+        cohort = self._cohorts[cohort_key]
+        local_rank = cohort.instance_ranks[instance_id]
+        return cohort.placement_ids[local_rank]
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return debug status for report_status."""
+        return {
+            "free_ids": [
+                self._placement_ids[start + i]
+                for start, size in self._free_ranges
+                for i in range(size)
+            ],
+            "cohorts": {
+                key: {
+                    "signature": cohort.signature,
+                    "local_world_size": cohort.local_world_size,
+                    "placement_ids": list(cohort.placement_ids),
+                    "instance_ranks": dict(cohort.instance_ranks),
+                }
+                for key, cohort in self._cohorts.items()
+            },
+        }
+
+    def _get_or_create_cohort(
+        self,
+        engine_type: str,
+        model_name: str,
+        local_world_size: int,
+        placement_group_id: str | None,
+    ) -> _PlacementCohort:
+        if placement_group_id is not None:
+            if not placement_group_id:
+                raise ValueError("placement_group_id must be non-empty when set")
+            group_id = cast(str, placement_group_id)
+            cohort_key = f"group:{group_id}"
+            cohort = self._cohorts.get(cohort_key)
+            if cohort is not None:
+                return cohort
+            signature = ("placement_group_id", group_id, local_world_size)
+            return self._create_cohort(cohort_key, signature, local_world_size)
+
+        signature = (engine_type, model_name, local_world_size)
+        open_cohort_key = self._open_by_signature.get(signature)
+        if open_cohort_key is not None:
+            return self._cohorts[open_cohort_key]
+        cohort_key = f"auto:{self._next_auto_id}"
+        self._next_auto_id += 1
+        cohort = self._create_cohort(cohort_key, signature, local_world_size)
+        self._open_by_signature[signature] = cohort_key
+        return cohort
+
+    def _create_cohort(
+        self,
+        key: str,
+        signature: tuple[str, str, int] | None,
+        local_world_size: int,
+    ) -> _PlacementCohort:
+        placement_ids = self._allocate_slice(local_world_size)
+        cohort = _PlacementCohort(
+            key=key,
+            signature=signature,
+            local_world_size=local_world_size,
+            placement_ids=placement_ids,
+            instance_ranks={},
+            rank_instances={},
+        )
+        self._cohorts[key] = cohort
+        return cohort
+
+    def _allocate_slice(self, size: int) -> list[int]:
+        for idx, (start, length) in enumerate(self._free_ranges):
+            if length < size:
+                continue
+            allocated = self._placement_ids[start : start + size]
+            if length == size:
+                self._free_ranges.pop(idx)
+            else:
+                self._free_ranges[idx] = (start + size, length - size)
+            return allocated
+        raise ValueError(
+            f"not enough free FDP placement identifiers for local_world_size={size}"
+        )
+
+    def _free_slice(self, placement_ids: list[int]) -> None:
+        if not placement_ids:
+            return
+        start = self._placement_ids.index(placement_ids[0])
+        size = len(placement_ids)
+        self._free_ranges.append((start, size))
+        self._free_ranges.sort()
+        merged: list[tuple[int, int]] = []
+        for range_start, range_size in self._free_ranges:
+            if not merged:
+                merged.append((range_start, range_size))
+                continue
+            prev_start, prev_size = merged[-1]
+            if prev_start + prev_size == range_start:
+                merged[-1] = (prev_start, prev_size + range_size)
+            else:
+                merged.append((range_start, range_size))
+        self._free_ranges = merged
 
 
 class RawBlockL2AdapterConfig(L2AdapterConfigBase):
@@ -425,8 +645,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._fdp_enabled = bool(config.fdp_enabled)
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_ids: list[int] = []
+            self._fdp_allocator: _RawBlockPlacementAllocator | None = None
             if self._fdp_enabled:
                 self._configure_fdp(config.fdp_placement_ids)
+                self._fdp_allocator = _RawBlockPlacementAllocator(
+                    self._fdp_placement_ids
+                )
             if config.io_engine == "io_uring":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
@@ -504,6 +728,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
         Raises:
             ValueError: If either list is empty or the lengths differ.
         """
+        return self.submit_store_task_for_instance(None, keys, objects)
+
+    def submit_store_task_for_instance(
+        self,
+        instance_id: int | None,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> L2TaskId:
+        """Submit a raw-block store task with optional source-instance placement."""
         if not keys or not objects:
             raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
@@ -511,11 +744,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         with self._lock:
             self._raise_if_closed_locked()
+            placement_ids = self._assign_fdp_placement_ids_locked(
+                instance_id, len(keys)
+            )
             task_id = self._get_next_task_id_locked()
             self._store_inflight_tasks += 1
         try:
             future = self._store_pool.submit(
-                self._run_store_task, list(keys), list(objects)
+                self._run_store_task, list(keys), list(objects), placement_ids
             )
         except Exception:
             with self._lock:
@@ -685,6 +921,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "fdp_enabled": self._fdp_enabled,
                 "fdp_discovered_status": list(self._fdp_discovered_status),
                 "fdp_placement_ids": list(self._fdp_placement_ids),
+                "fdp_placement_allocator": (
+                    None
+                    if self._fdp_allocator is None
+                    else self._fdp_allocator.snapshot()
+                ),
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
@@ -740,17 +981,46 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._next_task_id += 1
         return task_id
 
-    def _assign_fdp_placement_ids(self, count: int) -> list[int] | None:
-        """Return FDP placement identifiers for a store batch.
+    def register_instance_placement(
+        self,
+        instance_id: int,
+        engine_type: str,
+        model_name: str,
+        placement_info: RankPlacementInfo,
+    ) -> None:
+        """Register a serving-engine instance for FDP rank isolation."""
+        if not self._fdp_enabled:
+            return
+        with self._lock:
+            self._raise_if_closed_locked()
+            if self._fdp_allocator is None:
+                raise RuntimeError("raw_block FDP placement allocator is unavailable")
+            self._fdp_allocator.register(
+                instance_id, engine_type, model_name, placement_info
+            )
 
-        TODO: implement the placement policy that maps KV writes onto the
-        registered non-zero FDP placement identifiers. Until that policy lands,
-        return None so data writes omit the NVMe placement directive.
-        """
-        del count
-        if self._fdp_enabled and not self._fdp_placement_ids:
+    def unregister_instance_placement(self, instance_id: int) -> None:
+        """Release a serving-engine instance's FDP placement registration."""
+        if not self._fdp_enabled:
+            return
+        with self._lock:
+            if self._fdp_allocator is not None:
+                self._fdp_allocator.unregister(instance_id)
+
+    def _assign_fdp_placement_ids_locked(
+        self, instance_id: int | None, count: int
+    ) -> list[int] | None:
+        """Return one FDP placement identifier repeated for the store batch."""
+        if not self._fdp_enabled:
+            return None
+        if not self._fdp_placement_ids or self._fdp_allocator is None:
             raise RuntimeError("raw_block FDP placement identifiers are not configured")
-        return None
+        if instance_id is None:
+            raise RuntimeError(
+                "raw_block FDP placement requires a registered origin instance"
+            )
+        placement_id = self._fdp_allocator.placement_for_instance(instance_id)
+        return [placement_id] * count
 
     def _seed_usage_from_core_snapshot(self) -> None:
         """Seed byte counters for entries recovered by RawBlockCore startup."""
@@ -789,6 +1059,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        placement_ids: list[int] | None,
     ) -> RawBlockStoreTaskResult:
         """Persist one submitted store batch in the worker pool.
 
@@ -804,7 +1075,6 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - raw-block slot byte charges aligned with the newly stored keys
         """
         specs = [encode_object_key(key) for key in keys]
-        placement_ids = self._assign_fdp_placement_ids(len(specs))
         put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
         stored_encoded = set(put_result.stored_keys)
         slot_bytes = int(self._core.slot_bytes)

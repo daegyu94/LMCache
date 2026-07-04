@@ -253,19 +253,17 @@ def test_raw_block_fdp_status_reports_registered_nonzero_placement_ids() -> None
         adapter.close()
 
 
-def test_raw_block_fdp_store_does_not_assign_placement_ids_yet() -> None:
+def test_raw_block_fdp_store_requires_registered_origin_instance() -> None:
     fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
     adapter = _make_fdp_adapter(fake_core, _make_fdp_config())
     try:
         keys = [make_object_key(i) for i in range(4)]
         objects: list[Any] = [make_memory_obj(bytes([i + 1])) for i in range(4)]
 
-        task_id = adapter.submit_store_task(keys, objects)
-        assert wait_for_event_fd(adapter.get_store_event_fd())
-        result = adapter.pop_completed_store_tasks()[task_id]
+        with pytest.raises(RuntimeError, match="registered origin instance"):
+            adapter.submit_store_task(keys, objects)
 
-        assert result.is_successful()
-        assert fake_core.put_many_calls == [None]
+        assert fake_core.put_many_calls == []
     finally:
         adapter.close()
 
