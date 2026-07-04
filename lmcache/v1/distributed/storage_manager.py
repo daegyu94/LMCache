@@ -228,16 +228,23 @@ class StorageManager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        source_instance_id: int | None = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
 
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
+            source_instance_id: Optional serving-engine instance that produced
+                these keys. Used by placement-aware L2 adapters.
         """
+        if source_instance_id is not None:
+            self._store_controller.record_key_origin(keys, source_instance_id)
         finish_result = self._l1_manager.finish_write(keys)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        if source_instance_id is not None and failed_keys:
+            self._store_controller.clear_key_origin(failed_keys)
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_FINISHED,

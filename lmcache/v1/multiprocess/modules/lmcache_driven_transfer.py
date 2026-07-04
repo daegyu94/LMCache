@@ -443,11 +443,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
+            "finish_write_with_origin",
+            self._finish_write_with_origin,
+            payload_type=tuple[list[ObjectKey], int],
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.start()
+
+    def _finish_write_with_origin(self, payload: tuple[list[ObjectKey], int]) -> None:
+        """Finish writes and preserve their source instance for L2 placement."""
+        keys, instance_id = payload
+        self._ctx.storage_manager.finish_write(keys, source_instance_id=instance_id)
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -910,8 +920,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 if stored_count:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
-                        "finish_write",
-                        list(all_dict.keys()),
+                        "finish_write_with_origin",
+                        (list(all_dict.keys()), instance_id),
                     )
                 else:
                     total_bytes = 0

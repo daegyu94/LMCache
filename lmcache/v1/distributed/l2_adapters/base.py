@@ -553,6 +553,25 @@ class L2AdapterInterface(ABC):
         """Drop optional placement metadata for an unregistered instance."""
         del instance_id
 
+    def submit_store_task_for_instance(
+        self,
+        instance_id: int | None,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> L2TaskId:
+        """Submit a store task with optional origin-instance metadata.
+
+        Args:
+            instance_id: Origin serving-engine instance, or ``None`` when the
+                origin is unknown.
+            keys: Object keys to persist.
+            objects: Memory objects containing payloads for ``keys``.
+
+        Returns:
+            The submitted L2 task id.
+        """
+        del instance_id
+        return self.submit_store_task(keys, objects)
 
     #####################
     # Cleanup Interface

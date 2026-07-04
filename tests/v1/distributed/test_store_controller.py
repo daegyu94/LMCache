@@ -38,6 +38,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     DefaultStorePolicy,
     StorePolicy,
 )
+from lmcache.v1.memory_management import MemoryObj
 
 # Skip all tests in this module if CUDA is not available
 pytestmark = pytest.mark.skipif(
@@ -147,6 +148,26 @@ def l1_manager():
     mgr.close()
 
 
+class RecordingOriginAdapter(MockL2Adapter):
+    """Mock adapter that records origin-instance store submissions."""
+
+    def __init__(self, config: MockL2AdapterConfig):
+        super().__init__(config)
+        self.origin_instance_ids: list[int | None] = []
+        self.origin_key_batches: list[list[ObjectKey]] = []
+
+    def submit_store_task_for_instance(
+        self,
+        instance_id: int | None,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> int:
+        """Record the origin instance before delegating to MockL2Adapter."""
+        self.origin_instance_ids.append(instance_id)
+        self.origin_key_batches.append(list(keys))
+        return super().submit_store_task(keys, objects)
+
+
 def make_adapter() -> MockL2Adapter:
     """Create a MockL2Adapter with fast bandwidth."""
     config = MockL2AdapterConfig(
@@ -154,6 +175,15 @@ def make_adapter() -> MockL2Adapter:
         mock_bandwidth_gb=10.0,
     )
     return MockL2Adapter(config)
+
+
+def make_recording_origin_adapter() -> RecordingOriginAdapter:
+    """Create a MockL2Adapter that records origin-instance metadata."""
+    config = MockL2AdapterConfig(
+        max_size_gb=0.01,
+        mock_bandwidth_gb=10.0,
+    )
+    return RecordingOriginAdapter(config)
 
 
 def make_descriptor(index: int) -> AdapterDescriptor:
@@ -319,6 +349,63 @@ class TestStoreControllerSingleAdapter:
         ctrl.stop()
         adapter.close()
 
+    def test_recorded_origin_instance_reaches_l2_adapter(self, l1_manager):
+        """StoreController should preserve source instance for L2 placement."""
+        adapter = make_recording_origin_adapter()
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultStorePolicy(),
+        )
+        ctrl.start()
+
+        layout = make_layout()
+        keys = [make_object_key(90)]
+        ctrl.record_key_origin(keys, instance_id=1234)
+        write_keys_to_l1(l1_manager, keys, layout)
+
+        ok = wait_for_condition(
+            lambda: adapter.origin_instance_ids == [1234],
+            timeout=5.0,
+        )
+        assert ok
+        assert adapter.debug_has_key(keys[0])
+
+        ctrl.stop()
+        adapter.close()
+
+    def test_mixed_origin_batch_splits_by_origin_instance(self, l1_manager):
+        """StoreController should split one adapter batch by source instance."""
+        adapter = make_recording_origin_adapter()
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultStorePolicy(),
+        )
+
+        layout = make_layout()
+        keys = [make_object_key(91), make_object_key(92)]
+        ctrl.record_key_origin([keys[0]], instance_id=111)
+        write_keys_to_l1(l1_manager, [keys[0]], layout)
+        ctrl.record_key_origin([keys[1]], instance_id=222)
+        write_keys_to_l1(l1_manager, [keys[1]], layout)
+
+        ctrl.start()
+        ok = wait_for_condition(
+            lambda: sorted(adapter.origin_instance_ids) == [111, 222],
+            timeout=5.0,
+        )
+        assert ok
+        assert all(len(batch) == 1 for batch in adapter.origin_key_batches)
+        assert {batch[0] for batch in adapter.origin_key_batches} == set(keys)
+        for key in keys:
+            assert adapter.debug_has_key(key)
+
+        ctrl.stop()
+        adapter.close()
+
     def test_read_lock_released_after_store(self, l1_manager):
         """After L2 store completes, L1 read locks should be released."""
         adapter = make_adapter()
@@ -343,13 +430,15 @@ class TestStoreControllerSingleAdapter:
 
         # Verify read lock is released: the key should be updatable
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="update",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="update",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be updatable after store controller releases read lock"
@@ -467,13 +556,15 @@ class TestStoreControllerMultipleAdapters:
         assert ok
 
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="update",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="update",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be updatable after all adapter stores complete"
@@ -587,13 +678,15 @@ class TestStoreControllerCustomPolicy:
 
         # After deletion, reserve_write with mode="new" should succeed
         ok = wait_for_condition(
-            lambda: l1_manager.reserve_write(
-                keys=keys,
-                is_temporary=[False],
-                layout_desc=layout,
-                mode="new",
-            )[keys[0]][1]
-            is not None,
+            lambda: (
+                l1_manager.reserve_write(
+                    keys=keys,
+                    is_temporary=[False],
+                    layout_desc=layout,
+                    mode="new",
+                )[keys[0]][1]
+                is not None
+            ),
             timeout=5.0,
         )
         assert ok, "Key should be re-creatable after L1 deletion by policy"

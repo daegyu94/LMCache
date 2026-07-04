@@ -32,6 +32,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     StorePolicy,
 )
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
@@ -254,6 +255,9 @@ class StoreController(StorageControllerInterface):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
 
+        self._key_origin_lock = threading.Lock()
+        self._key_origin_instance_ids: dict[ObjectKey, int] = {}
+
         # (adapter_index, task_id) -> InFlightStoreTask
         # Composite key is needed because task IDs are only unique
         # within a single adapter, not across adapters.
@@ -299,6 +303,46 @@ class StoreController(StorageControllerInterface):
             target=self._store_loop,
             daemon=True,
         )
+
+    def record_key_origin(self, keys: list[ObjectKey], instance_id: int) -> None:
+        """Record the source instance for keys that just finished writing."""
+        if not keys:
+            return
+        with self._key_origin_lock:
+            for key in keys:
+                self._key_origin_instance_ids[key] = instance_id
+
+    def _consume_origin_groups(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> list[tuple[int | None, list[ObjectKey], list[MemoryObj]]]:
+        """Group keys/objects by source instance and forget consumed origins."""
+        grouped: dict[int | None, tuple[list[ObjectKey], list[MemoryObj]]] = {}
+        with self._key_origin_lock:
+            for key, obj in zip(keys, objects, strict=True):
+                instance_id = self._key_origin_instance_ids.pop(key, None)
+                group_keys, group_objs = grouped.setdefault(instance_id, ([], []))
+                group_keys.append(key)
+                group_objs.append(obj)
+
+        if len(grouped) > 1:
+            logger.debug(
+                "Splitting L2 store batch by origin instances: %s",
+                sorted(str(instance_id) for instance_id in grouped),
+            )
+        return [
+            (instance_id, group_keys, group_objs)
+            for instance_id, (group_keys, group_objs) in grouped.items()
+        ]
+
+    def clear_key_origin(self, keys: list[ObjectKey]) -> None:
+        """Forget source-instance metadata for keys that will not be stored."""
+        if not keys:
+            return
+        with self._key_origin_lock:
+            for key in keys:
+                self._key_origin_instance_ids.pop(key, None)
 
     def start(self) -> None:
         """Start the background store loop thread."""
@@ -653,41 +697,49 @@ class StoreController(StorageControllerInterface):
                 continue
 
             adapter = self._l2_adapters[adapter_index]
-            task_id = adapter.submit_store_task(successful_keys, successful_objs)
-
-            self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
-                adapter_index=adapter_index,
-                keys=successful_keys,
-                read_locked_keys=list(successful_keys),
+            origin_groups = self._consume_origin_groups(
+                successful_keys, successful_objs
             )
-            self._status_in_flight_count += 1
-
-            # All objects for a single store task share one layout (L1
-            # allocates uniform MemoryObjs per chunk), so total bytes is
-            # size * count — avoids summing N identical values.
-            total_bytes = successful_objs[0].get_size() * len(successful_objs)
-            self._event_bus.publish(
-                Event(
-                    event_type=EventType.L2_STORE_SUBMITTED,
-                    metadata={
-                        "adapter_index": adapter_index,
-                        "task_id": task_id,
-                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
-                        "key_count": len(successful_keys),
-                        "total_bytes": total_bytes,
-                        "key_count_per_salt": Counter(
-                            k.cache_salt for k in successful_keys
-                        ),
-                    },
+            for origin_instance_id, group_keys, group_objs in origin_groups:
+                task_id = adapter.submit_store_task_for_instance(
+                    origin_instance_id, group_keys, group_objs
                 )
-            )
 
-            logger.debug(
-                "Submitted store task %d to adapter %d with %d keys.",
-                task_id,
-                adapter_index,
-                len(successful_keys),
-            )
+                self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
+                    adapter_index=adapter_index,
+                    keys=group_keys,
+                    read_locked_keys=list(group_keys),
+                )
+                self._status_in_flight_count += 1
+
+                # All objects for a single store task share one layout (L1
+                # allocates uniform MemoryObjs per chunk), so total bytes is
+                # size * count — avoids summing N identical values.
+                total_bytes = group_objs[0].get_size() * len(group_objs)
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L2_STORE_SUBMITTED,
+                        metadata={
+                            "adapter_index": adapter_index,
+                            "task_id": task_id,
+                            "l2_name": self._adapter_descriptors[
+                                adapter_index
+                            ].type_name,
+                            "key_count": len(group_keys),
+                            "total_bytes": total_bytes,
+                            "key_count_per_salt": Counter(
+                                k.cache_salt for k in group_keys
+                            ),
+                        },
+                    )
+                )
+
+                logger.debug(
+                    "Submitted store task %d to adapter %d with %d keys.",
+                    task_id,
+                    adapter_index,
+                    len(group_keys),
+                )
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
