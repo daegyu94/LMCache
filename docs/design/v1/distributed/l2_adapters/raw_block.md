@@ -46,13 +46,18 @@ queries FDP reclaim unit handle status from the device and reports the
 discovered mapping. Startup fails if the query fails or the device reports no
 placement identifiers.
 
-FDP plumbing is split by layer: `RawBlockL2Adapter` discovers and registers
-non-zero placement identifiers, while `RawBlockCore` enforces that explicit
-placement identifier 0 is never used. The placement policy that assigns
-placement identifiers to KV writes is a follow-up; for now KV data and
-checkpoint metadata omit placement identifiers and use default NVMe writes with
-no directive. User-facing FDP configuration rules
-live in `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command
+FDP plumbing is split by layer: `RawBlockL2Adapter` discovers non-zero
+placement identifiers and reserves non-overlapping contiguous identifier slices
+for placement cohorts, while `RawBlockCore` enforces that explicit placement
+identifier 0 is never used. The rank domain is integration-defined; vLLM
+currently provides its TP-aware KV-shard rank/world size, and other
+integrations are future work.
+When `placement_group_id` is provided,
+it is the explicit cohort key; otherwise cohorts are inferred from
+engine/model/world-size metadata. Each registered rank writes KV data with the
+identifier at `reserved_slice[local_rank]`; checkpoint metadata continues to
+use default NVMe placement with no directive. User-facing FDP configuration
+rules live in `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command
 encoding details live in `rust/raw_block/README.md`.
 
 ## Key Design Choice

@@ -66,9 +66,15 @@ caller-provided load buffers during prefetch.
 - FDP registers only non-zero placement identifiers. If ``fdp_placement_ids`` is
   omitted, all discovered non-zero placement identifiers are used; if provided,
   the list must exactly match the device's non-zero placement-identifier set and
-  must not contain 0. Current writes still omit FDP placement identifiers until
-  the placement policy is added; checkpoint metadata writes also use default
-  NVMe placement with no directive.
+  must not contain 0. ``raw_block`` reserves one contiguous identifier slice per
+  placement cohort and writes each rank with ``reserved_slice[local_rank]``.
+  The rank domain is integration-defined; vLLM currently provides its
+  TP-aware KV-shard rank/world size, and other integrations are future work.
+  If ``placement_group_id`` is set, it is the explicit cohort
+  key; otherwise ``raw_block`` infers cohorts from engine/model/world-size
+  metadata. Registration fails if the placement world size is larger than the
+  remaining free placement-identifier count. Checkpoint metadata writes use
+  default NVMe placement with no directive.
 
 **Configuration examples:**
 
