@@ -58,6 +58,7 @@ from lmcache.v1.mp_observability.trace.decorator import (
     is_tracing_enabled,
     publish_call_event,
 )
+from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
 from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
@@ -743,6 +744,28 @@ class StorageManager:
             good_keys.append(key)
             good_objs.append(obj)
         return good_keys, good_objs
+
+    def register_instance_placement(
+        self,
+        instance_id: int,
+        engine_type: str,
+        model_name: str,
+        placement_info: RankPlacementInfo,
+    ) -> None:
+        """Forward per-instance placement metadata to L2 adapters."""
+        with self._adapters_lock:
+            adapters = list(self._l2_adapters.values())
+        for adapter in adapters:
+            adapter.register_instance_placement(
+                instance_id, engine_type, model_name, placement_info
+            )
+
+    def unregister_instance_placement(self, instance_id: int) -> None:
+        """Remove per-instance placement metadata from L2 adapters."""
+        with self._adapters_lock:
+            adapters = list(self._l2_adapters.values())
+        for adapter in adapters:
+            adapter.unregister_instance_placement(instance_id)
 
     @property
     def quota_manager(self) -> QuotaManager:

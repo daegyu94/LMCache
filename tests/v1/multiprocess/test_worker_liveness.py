@@ -18,6 +18,7 @@ import pytest
 
 # First Party
 from lmcache.v1.multiprocess.config import MPServerConfig
+from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
 from lmcache.v1.multiprocess.modules import engine_driven_transfer as non_gpu_mod
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as gpu_mod
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
@@ -29,6 +30,11 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
 )
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.periodic_thread import PeriodicThreadRegistry
+
+
+def _rank_placement() -> RankPlacementInfo:
+    """Return single-rank placement metadata for liveness-only tests."""
+    return RankPlacementInfo(local_rank=0, local_world_size=1)
 
 
 def _bare_gpu_module() -> LMCacheDrivenTransferModule:
@@ -65,7 +71,9 @@ def test_gpu_register_inserts_unlatched_entry(monkeypatch) -> None:
     monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
     module = _bare_gpu_module()
 
-    module.register_kv_cache(1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [])
+    module.register_kv_cache(
+        1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [], _rank_placement()
+    )
 
     assert module.tracked_instance_count() == 1
     entry = module.get_and_touch_context_entry(1)
@@ -79,10 +87,14 @@ def test_gpu_noop_register_refreshes_without_latching(monkeypatch) -> None:
     monkeypatch.setattr(gpu_mod, "create_cache_context", create)
     monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
     module = _bare_gpu_module()
-    module.register_kv_cache(1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [])
+    module.register_kv_cache(
+        1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [], _rank_placement()
+    )
     module._cache_contexts[1].last_seen = 0.0
 
-    module.register_kv_cache(1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [])
+    module.register_kv_cache(
+        1, MagicMock(), "model", 1, MagicMock(), MagicMock(), [], _rank_placement()
+    )
 
     assert create.call_count == 1  # not rebuilt
     assert module._cache_contexts[1].last_seen > 0.0  # refreshed

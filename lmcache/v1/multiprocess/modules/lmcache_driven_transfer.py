@@ -535,6 +535,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             for iid in stale_ids:
                 reaped.append((iid, self._cache_contexts.pop(iid)))
         for iid, entry in reaped:
+            self._ctx.storage_manager.unregister_instance_placement(iid)
             self._release_entry(entry)
             logger.warning(
                 "Reaped GPU instance %d: silent for %.1fs (pinged=%s)",
@@ -615,9 +616,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.stop()
 
         with self._lock:
-            entries = list(self._cache_contexts.values())
+            entries = list(self._cache_contexts.items())
             self._cache_contexts.clear()
-        for entry in entries:
+        for instance_id, entry in entries:
+            self._ctx.storage_manager.unregister_instance_placement(instance_id)
             entry.cache_context.close()
         if entries:
             torch_dev.empty_cache()
@@ -664,23 +666,35 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 )
                 return
 
+        if engine_type == EngineType.VLLM:
+            self._ctx.storage_manager.register_instance_placement(
+                instance_id, engine_type.name, model_name, placement_info
+            )
+
         # Build the context and layout descriptor outside the lock.
-        cache_context = create_cache_context(
-            kv_caches,
-            self._ctx.chunk_size,
-            layout_hints=layout_hints or None,
-            engine_group_infos=engine_group_infos,
-            engine_type=engine_type,
-            separate_object_groups=self._ctx.separate_object_groups,
-        )
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
-        kv_groups_manager = cache_context.kv_layer_groups_manager
-        attn_desc = kv_groups_manager.get_attn_desc()
-        self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
-        )
+        cache_context = None
+        try:
+            cache_context = create_cache_context(
+                kv_caches,
+                self._ctx.chunk_size,
+                layout_hints=layout_hints or None,
+                engine_group_infos=engine_group_infos,
+                engine_type=engine_type,
+                separate_object_groups=self._ctx.separate_object_groups,
+            )
+            layout_desc = get_layout_desc(
+                cache_context, self._ctx.chunk_size, object_group_id=0
+            )
+            kv_groups_manager = cache_context.kv_layer_groups_manager
+            attn_desc = kv_groups_manager.get_attn_desc()
+            self._ctx.layout_desc_registry.register(
+                model_name, world_size, layout_desc, attn_desc
+            )
+        except Exception:
+            self._ctx.storage_manager.unregister_instance_placement(instance_id)
+            if cache_context is not None:
+                cache_context.close()
+            raise
 
         with self._lock:
             self._cache_contexts[instance_id] = ContextEntry(
@@ -711,6 +725,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
             return
 
+        self._ctx.storage_manager.unregister_instance_placement(instance_id)
         self._release_entry(entry)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 

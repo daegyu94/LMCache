@@ -74,6 +74,7 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     # First Party
     from lmcache.utils import EngineType
     from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
     from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
     from lmcache.v1.multiprocess.modules import (
         lmcache_driven_transfer as lmcache_driven_transfer_mod,
@@ -129,8 +130,26 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     )
 
     module = lmcache_driven_transfer_mod.LMCacheDrivenTransferModule(ctx)
-    module.register_kv_cache(1, [], "shared-model", 1, EngineType.VLLM, {}, [])
-    module.register_kv_cache(2, [], "shared-model", 1, EngineType.VLLM, {}, [])
+    module.register_kv_cache(
+        1,
+        [],
+        "shared-model",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
+        RankPlacementInfo(local_rank=0, local_world_size=1),
+    )
+    module.register_kv_cache(
+        2,
+        [],
+        "shared-model",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
+        RankPlacementInfo(local_rank=0, local_world_size=1),
+    )
     assert ctx.layout_desc_registry.find("shared-model", 1) is layout_desc
 
     module.unregister_kv_cache(1)

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.api import KeyListPage, MemoryLayoutDesc, ObjectKey
     from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
     from lmcache.v1.memory_management import MemoryObj
+    from lmcache.v1.multiprocess.custom_types import RankPlacementInfo
 
 # First Party
 from lmcache.logging import init_logger
@@ -522,6 +523,36 @@ class L2AdapterInterface(ABC):
                 # view is fully detached from the adapter's live state.
                 bytes_by_cache_salt=MappingProxyType(per_salt_snapshot),
             )
+
+    #######################
+    # Placement Interface
+    #######################
+
+    def register_instance_placement(
+        self,
+        instance_id: int,
+        engine_type: str,
+        model_name: str,
+        placement_info: "RankPlacementInfo",
+    ) -> None:
+        """Register optional per-instance placement metadata.
+
+        Args:
+            instance_id: Serving-engine process identifier.
+            engine_type: Serving engine name, used for automatic grouping.
+            model_name: Registered model name, used for automatic grouping.
+            placement_info: Placement-rank metadata from the integration.
+
+        Note:
+            Most adapters ignore placement metadata. Adapters that need it
+            should override this method.
+        """
+        del instance_id, engine_type, model_name, placement_info
+
+    def unregister_instance_placement(self, instance_id: int) -> None:
+        """Drop optional placement metadata for an unregistered instance."""
+        del instance_id
+
 
     #####################
     # Cleanup Interface
