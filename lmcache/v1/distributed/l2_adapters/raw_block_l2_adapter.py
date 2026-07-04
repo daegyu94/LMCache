@@ -11,6 +11,7 @@ lookup, and load.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -102,6 +103,39 @@ def _resolve_fdp_placement_ids_from_dict(
     return raw_fdp_placement_ids if fdp_enabled else None
 
 
+def _resolve_fdp_lifetime_hints_from_dict(
+    d: dict, *, fdp_enabled: bool
+) -> list[str] | None:
+    """Resolve optional FDP lifetime hint config."""
+    raw_fdp_lifetime_hints = d.get("fdp_lifetime_hints")
+    if raw_fdp_lifetime_hints is not None and not isinstance(
+        raw_fdp_lifetime_hints, list
+    ):
+        raise ValueError("fdp_lifetime_hints must be a list")
+    return raw_fdp_lifetime_hints if fdp_enabled else None
+
+
+def _normalize_fdp_lifetime_hints(
+    lifetime_hints: Optional[list[str]],
+) -> Optional[list[str]]:
+    """Validate optional FDP lifetime hint names from user configuration."""
+    if lifetime_hints is None:
+        return None
+    if not lifetime_hints:
+        raise ValueError("fdp_lifetime_hints must not be empty")
+
+    normalized: list[str] = []
+    for hint in lifetime_hints:
+        if not isinstance(hint, str):
+            raise ValueError("fdp_lifetime_hints must contain strings")
+        if hint == "":
+            raise ValueError("fdp_lifetime_hints must not contain empty strings")
+        normalized.append(hint)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("fdp_lifetime_hints must not contain duplicates")
+    return normalized
+
+
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
     from lmcache.native_storage_ops import Bitmap
@@ -136,6 +170,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         max_data_transfer_size: int = 0,
         fdp_enabled: bool = False,
         fdp_placement_ids: Optional[list[int]] = None,
+        fdp_lifetime_hints: Optional[list[str]] = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
@@ -165,8 +200,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             fdp_enabled: Enable NVMe Flexible Data Placement discovery and
                 non-zero placement-identifier registration for raw-block writes.
             fdp_placement_ids: Optional exact non-zero FDP placement identifier
-                list to use for data writes. If omitted, all device-reported
-                placement identifiers except 0 are used.
+                list used for FDP status registration and lifetime-hint mapping.
+                If omitted, all device-reported placement identifiers except 0
+                are used.
+            fdp_lifetime_hints: Optional admin-defined hint names mapped
+                positionally to FDP placement identifiers after startup discovery.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -203,6 +241,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             )
         self.fdp_placement_ids = (
             _normalize_fdp_placement_ids(fdp_placement_ids)
+            if self.fdp_enabled
+            else None
+        )
+        self.fdp_lifetime_hints = (
+            _normalize_fdp_lifetime_hints(fdp_lifetime_hints)
             if self.fdp_enabled
             else None
         )
@@ -243,6 +286,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         max_data_transfer_size = int(d.get("max_data_transfer_size", 0))
         fdp_enabled = bool(d.get("fdp_enabled", False))
         fdp_placement_ids = _resolve_fdp_placement_ids_from_dict(
+            d, fdp_enabled=fdp_enabled
+        )
+        fdp_lifetime_hints = _resolve_fdp_lifetime_hints_from_dict(
             d, fdp_enabled=fdp_enabled
         )
         if block_align <= 0:
@@ -301,6 +347,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             max_data_transfer_size=max_data_transfer_size,
             fdp_enabled=fdp_enabled,
             fdp_placement_ids=fdp_placement_ids,
+            fdp_lifetime_hints=fdp_lifetime_hints,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
@@ -344,8 +391,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "< 0: auto detect limit splitting)\n"
             "- fdp_enabled (bool): enable FDP discovery (default false)\n"
             "- fdp_placement_ids (list[int]): exact non-zero FDP placement "
-            "identifiers to use; omitted uses all device-reported non-zero "
+            "identifiers to register; omitted uses all device-reported non-zero "
             "identifiers\n"
+            "- fdp_lifetime_hints (list[str]): optional admin-defined hint "
+            "names mapped by list order to FDP placement identifiers\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
             "- num_load_workers (int): load worker threads (default 4)"
@@ -425,8 +474,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._fdp_enabled = bool(config.fdp_enabled)
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_ids: list[int] = []
+            self._fdp_lifetime_hints: list[str] = []
+            self._fdp_lifetime_hint_to_placement: dict[str, int] = {}
             if self._fdp_enabled:
                 self._configure_fdp(config.fdp_placement_ids)
+                self._configure_fdp_lifetime_hints(config.fdp_lifetime_hints)
             if config.io_engine == "io_uring":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
@@ -504,25 +556,45 @@ class RawBlockL2Adapter(L2AdapterInterface):
         Raises:
             ValueError: If either list is empty or the lengths differ.
         """
-        if not keys or not objects:
-            raise ValueError("keys and objects must be non-empty")
-        if len(keys) != len(objects):
-            raise ValueError("keys and objects must have the same length")
+        return self._submit_store_task(keys, objects, placement_ids=None)
 
-        with self._lock:
-            self._raise_if_closed_locked()
-            task_id = self._get_next_task_id_locked()
-            self._store_inflight_tasks += 1
-        try:
-            future = self._store_pool.submit(
-                self._run_store_task, list(keys), list(objects)
-            )
-        except Exception:
-            with self._lock:
-                self._store_inflight_tasks -= 1
-            raise
-        future.add_done_callback(partial(self._finish_store_task, task_id))
-        return task_id
+    def supports_lifetime_hint(self, lifetime_hint: str) -> bool:
+        """Return whether ``lifetime_hint`` maps to an FDP placement identifier.
+
+        Args:
+            lifetime_hint: Admin-defined L2 placement hint name supplied during
+                ``REGISTER_KV_CACHE``.
+
+        Returns:
+            ``True`` when the hint is configured for this raw-block adapter.
+        """
+        return lifetime_hint in self._fdp_lifetime_hint_to_placement
+
+    def submit_store_task_with_lifetime_hints(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        lifetime_hints: list[str | None],
+    ) -> L2TaskId:
+        """Submit a raw-block store task with optional FDP lifetime hints.
+
+        Args:
+            keys: Object keys to persist.
+            objects: Memory objects containing payloads for ``keys``.
+            lifetime_hints: Per-key admin-defined lifetime hint names. ``None``
+                omits the placement directive for that key.
+
+        Returns:
+            Task ID that can be observed through ``pop_completed_store_tasks``.
+
+        Raises:
+            ValueError: If input lengths differ or an unknown configured hint is
+                provided.
+        """
+        if len(lifetime_hints) != len(keys):
+            raise ValueError("lifetime_hints must have the same length as keys")
+        placement_ids = self._resolve_fdp_placement_ids(lifetime_hints)
+        return self._submit_store_task(keys, objects, placement_ids=placement_ids)
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         """Drain and return completed store task results."""
@@ -685,6 +757,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "fdp_enabled": self._fdp_enabled,
                 "fdp_discovered_status": list(self._fdp_discovered_status),
                 "fdp_placement_ids": list(self._fdp_placement_ids),
+                "fdp_lifetime_hints": list(self._fdp_lifetime_hints),
+                "fdp_lifetime_hint_to_placement": dict(
+                    self._fdp_lifetime_hint_to_placement
+                ),
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
@@ -731,6 +807,34 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._fdp_placement_ids,
         )
 
+    def _configure_fdp_lifetime_hints(
+        self,
+        lifetime_hints: Optional[list[str]],
+    ) -> None:
+        """Map admin-defined lifetime hints to FDP placement identifiers."""
+        if lifetime_hints is None:
+            return
+        if len(self._fdp_placement_ids) < len(lifetime_hints):
+            logger.error(
+                "raw_block FDP lifetime hint count exceeds usable placement "
+                "identifiers: hints=%s identifiers=%s",
+                lifetime_hints,
+                self._fdp_placement_ids,
+            )
+            raise RuntimeError(
+                "raw_block FDP lifetime hints require at least as many usable "
+                "placement identifiers"
+            )
+        self._fdp_lifetime_hints = list(lifetime_hints)
+        self._fdp_lifetime_hint_to_placement = {
+            hint: self._fdp_placement_ids[i]
+            for i, hint in enumerate(self._fdp_lifetime_hints)
+        }
+        logger.info(
+            "RawBlockL2Adapter mapped FDP lifetime hints to placement identifiers: %s",
+            self._fdp_lifetime_hint_to_placement,
+        )
+
     def _raise_if_closed_locked(self) -> None:
         if self._closed:
             raise RuntimeError("RawBlockL2Adapter is closed")
@@ -740,16 +844,70 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._next_task_id += 1
         return task_id
 
-    def _assign_fdp_placement_ids(self, count: int) -> list[int] | None:
-        """Return FDP placement identifiers for a store batch.
+    def _resolve_fdp_placement_ids(
+        self,
+        lifetime_hints: Sequence[str | None] | None,
+    ) -> list[int | None] | None:
+        """Return per-key FDP placement identifiers for configured hints."""
+        if lifetime_hints is None:
+            return None
+        if not self._fdp_lifetime_hint_to_placement:
+            unsupported_hint = next(
+                (hint for hint in lifetime_hints if hint is not None), None
+            )
+            if unsupported_hint is not None:
+                raise ValueError(f"unknown FDP lifetime hint: {unsupported_hint!r}")
+            return None
 
-        TODO: implement the placement policy that maps KV writes onto the
-        registered non-zero FDP placement identifiers. Until that policy lands,
-        return None so data writes omit the NVMe placement directive.
-        """
-        del count
+        placement_ids: list[int | None] = []
+        for hint in lifetime_hints:
+            if hint is None:
+                placement_ids.append(None)
+                continue
+            placement_id = self._fdp_lifetime_hint_to_placement.get(hint)
+            if placement_id is None:
+                raise ValueError(f"unknown FDP lifetime hint: {hint!r}")
+            placement_ids.append(placement_id)
+        return placement_ids
+
+    def _submit_store_task(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        *,
+        placement_ids: list[int | None] | None,
+    ) -> L2TaskId:
+        if not keys or not objects:
+            raise ValueError("keys and objects must be non-empty")
+        if len(keys) != len(objects):
+            raise ValueError("keys and objects must have the same length")
+        if placement_ids is not None and len(placement_ids) != len(keys):
+            raise ValueError("placement_ids must have the same length as keys")
+
         if self._fdp_enabled and not self._fdp_placement_ids:
             raise RuntimeError("raw_block FDP placement identifiers are not configured")
+
+        with self._lock:
+            self._raise_if_closed_locked()
+            task_id = self._get_next_task_id_locked()
+            self._store_inflight_tasks += 1
+        try:
+            future = self._store_pool.submit(
+                self._run_store_task,
+                list(keys),
+                list(objects),
+                None if placement_ids is None else list(placement_ids),
+            )
+        except Exception:
+            with self._lock:
+                self._store_inflight_tasks -= 1
+            raise
+        future.add_done_callback(partial(self._finish_store_task, task_id))
+        return task_id
+
+    def _assign_fdp_placement_ids(self, count: int) -> list[int | None] | None:
+        """Return no placement directive for legacy store submissions."""
+        del count
         return None
 
     def _seed_usage_from_core_snapshot(self) -> None:
@@ -789,6 +947,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        placement_ids: list[int | None] | None = None,
     ) -> RawBlockStoreTaskResult:
         """Persist one submitted store batch in the worker pool.
 
@@ -804,7 +963,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - raw-block slot byte charges aligned with the newly stored keys
         """
         specs = [encode_object_key(key) for key in keys]
-        placement_ids = self._assign_fdp_placement_ids(len(specs))
+        if placement_ids is None:
+            placement_ids = self._assign_fdp_placement_ids(len(specs))
         put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
         stored_encoded = set(put_result.stored_keys)
         slot_bytes = int(self._core.slot_bytes)

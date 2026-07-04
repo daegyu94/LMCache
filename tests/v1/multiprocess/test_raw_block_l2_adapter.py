@@ -127,7 +127,7 @@ class _FakeFdpCore:
     def __init__(self, status: list[tuple[int, int]] | None = None) -> None:
         self.status = status if status is not None else [(0, 10), (7, 17)]
         self.slot_bytes = RAW_BLOCK_CI_SLOT_BYTES
-        self.put_many_calls: list[list[int] | None] = []
+        self.put_many_calls: list[list[int | None] | None] = []
 
     def fetch_fdp_status(self) -> list[tuple[int, int]]:
         return self.status
@@ -142,7 +142,7 @@ class _FakeFdpCore:
         self,
         specs: list[Any],
         objects: list[Any],
-        placement_ids: list[int] | None = None,
+        placement_ids: list[int | None] | None = None,
     ) -> RawBlockPutManyResult:
         self.put_many_calls.append(
             None if placement_ids is None else list(placement_ids)
@@ -162,6 +162,7 @@ class _FakeFdpCore:
 def _make_fdp_config(
     *,
     placement_ids: list[int] | None = None,
+    lifetime_hints: list[str] | None = None,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path="/dev/ng0n1",
@@ -179,6 +180,7 @@ def _make_fdp_config(
         iouring_queue_depth=8,
         fdp_enabled=True,
         fdp_placement_ids=placement_ids,
+        fdp_lifetime_hints=lifetime_hints,
         num_store_workers=1,
         num_lookup_workers=1,
         num_load_workers=1,
@@ -266,6 +268,92 @@ def test_raw_block_fdp_store_does_not_assign_placement_ids_yet() -> None:
 
         assert result.is_successful()
         assert fake_core.put_many_calls == [None]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_rejects_invalid_lifetime_hints() -> None:
+    with pytest.raises(ValueError, match="must not contain empty"):
+        _make_fdp_config(lifetime_hints=["transient", ""])
+
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        _make_fdp_config(lifetime_hints=["transient", "transient"])
+
+
+def test_raw_block_fdp_requires_enough_ids_for_lifetime_hints() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11)])
+
+    with pytest.raises(RuntimeError, match="at least as many"):
+        _make_fdp_adapter(
+            fake_core,
+            _make_fdp_config(lifetime_hints=["transient", "session_local"]),
+        )
+
+
+def test_raw_block_fdp_lifetime_hints_map_to_placement_ids_in_order() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(lifetime_hints=["transient", "session_local"]),
+    )
+    try:
+        keys = [make_object_key(i) for i in range(3)]
+        objects: list[Any] = [make_memory_obj(bytes([i + 1])) for i in range(3)]
+
+        task_id = adapter.submit_store_task_with_lifetime_hints(
+            keys,
+            objects,
+            ["transient", None, "session_local"],
+        )
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        result = adapter.pop_completed_store_tasks()[task_id]
+
+        assert result.is_successful()
+        assert fake_core.put_many_calls == [[1, None, 7]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_unknown_lifetime_hint_fails_store() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(lifetime_hints=["transient"]),
+    )
+    try:
+        with pytest.raises(ValueError, match="unknown FDP lifetime hint"):
+            adapter.submit_store_task_with_lifetime_hints(
+                [make_object_key(1)],
+                [make_memory_obj(b"payload")],
+                ["typo"],
+            )
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_rejects_hint_without_configured_mapping() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
+    adapter = _make_fdp_adapter(fake_core, _make_fdp_config())
+    try:
+        with pytest.raises(ValueError, match="unknown FDP lifetime hint"):
+            adapter.submit_store_task_with_lifetime_hints(
+                [make_object_key(1)],
+                [make_memory_obj(b"payload")],
+                ["transient"],
+            )
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_reports_lifetime_hint_support() -> None:
+    fake_core = _FakeFdpCore(status=[(0, 10), (1, 11), (7, 17)])
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(lifetime_hints=["transient", "session_local"]),
+    )
+    try:
+        assert adapter.supports_lifetime_hint("transient") is True
+        assert adapter.supports_lifetime_hint("unknown") is False
     finally:
         adapter.close()
 
