@@ -342,6 +342,7 @@ def registered_instance(
             EngineType.VLLM,
             {},
             [],
+            None,
         ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )
@@ -401,6 +402,7 @@ def test_register_unregister_kv_cache(
             EngineType.VLLM,
             {},
             [],
+            None,
         ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )

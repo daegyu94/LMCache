@@ -118,6 +118,10 @@ class TransferContext(ABC):
     gather/scatter synchronously and return already-resolved futures.
     """
 
+    def can_forward_lifetime_hint(self) -> bool:
+        """Return whether this context can forward lifetime hints to the server."""
+        return False
+
     @abstractmethod
     def register(
         self,
@@ -131,6 +135,7 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        lifetime_hint: str | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -145,6 +150,7 @@ class TransferContext(ABC):
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            lifetime_hint: Optional admin-defined L2 placement lifetime hint.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -230,6 +236,10 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._mq_client: MessageQueueClient | None = None
         self._send_request: SendRequest | None = None
 
+    def can_forward_lifetime_hint(self) -> bool:
+        """Return whether this context can forward lifetime hints to the server."""
+        return True
+
     def register(
         self,
         instance_id: int,
@@ -242,6 +252,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        lifetime_hint: str | None = None,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
@@ -259,6 +270,7 @@ class LMCacheDrivenTransferContext(TransferContext):
                 EngineType.VLLM,
                 layout_hints,
                 list(engine_group_infos),
+                lifetime_hint,
             ],
         )
         future.result(timeout=mq_timeout)
@@ -349,14 +361,22 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        lifetime_hint: str | None = None,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
         ``engine_group_infos`` is accepted to satisfy the base interface but
         is currently a no-op: the non-GPU transfer path does not support
         hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        retrieve time (see ``_single_group_block_ids``). Lifetime hints are
+        also unsupported on this engine-driven path; callers must use the
+        GPU ``REGISTER_KV_CACHE`` path to request FDP placement hints.
         """
+        if lifetime_hint is not None:
+            raise ValueError(
+                "lifetime_hint is not supported for engine-driven transfer"
+            )
+
         # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
         # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
         # on the CUDA path. The non-CUDA path is yet to be implemented.

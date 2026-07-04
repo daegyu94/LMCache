@@ -365,6 +365,7 @@ def _send_register_kv_cache(
             EngineType.VLLM,
             hints,
             list(engine_group_infos or ()),
+            None,
         ]
         result = _call(client, RequestType.REGISTER_KV_CACHE, payloads)
         return result is not _TIMEOUT

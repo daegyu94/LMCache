@@ -8,7 +8,7 @@ are stubbed.
 """
 
 # Standard
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock
 import threading
 import time
@@ -72,6 +72,32 @@ def test_gpu_register_inserts_unlatched_entry(monkeypatch) -> None:
     assert entry is not None and entry.has_liveness_signal is False
 
 
+def test_gpu_register_rejects_unsupported_lifetime_hint(monkeypatch) -> None:
+    """REGISTER_KV_CACHE fails before context creation for unsupported hints."""
+    create = MagicMock(return_value=MagicMock(num_layers=2))
+    monkeypatch.setattr(gpu_mod, "create_cache_context", create)
+    monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
+    module = _bare_gpu_module()
+    validate_lifetime_hint = MagicMock(side_effect=ValueError("unsupported hint"))
+    storage_manager = cast(Any, module._ctx.storage_manager)
+    storage_manager.validate_lifetime_hint = validate_lifetime_hint
+
+    with pytest.raises(ValueError, match="unsupported hint"):
+        module.register_kv_cache(
+            1,
+            MagicMock(),
+            "model",
+            1,
+            MagicMock(),
+            MagicMock(),
+            [],
+            lifetime_hint="transient",
+        )
+
+    create.assert_not_called()
+    assert module.tracked_instance_count() == 0
+
+
 def test_gpu_noop_register_refreshes_without_latching(monkeypatch) -> None:
     """Re-registering a known instance refreshes last_seen but does not
     rebuild the context or latch the ping-proven flag."""
@@ -87,6 +113,39 @@ def test_gpu_noop_register_refreshes_without_latching(monkeypatch) -> None:
     assert create.call_count == 1  # not rebuilt
     assert module._cache_contexts[1].last_seen > 0.0  # refreshed
     assert module._cache_contexts[1].has_liveness_signal is False
+
+
+def test_gpu_reregister_rejects_lifetime_hint_change(monkeypatch) -> None:
+    """Re-registering an instance cannot silently change its placement hint."""
+    monkeypatch.setattr(
+        gpu_mod, "create_cache_context", lambda *a, **kw: MagicMock(num_layers=2)
+    )
+    monkeypatch.setattr(gpu_mod, "get_layout_desc", lambda *a, **kw: MagicMock())
+    module = _bare_gpu_module()
+    module.register_kv_cache(
+        1,
+        MagicMock(),
+        "model",
+        1,
+        MagicMock(),
+        MagicMock(),
+        [],
+        lifetime_hint="transient",
+    )
+
+    with pytest.raises(ValueError, match="Cannot change lifetime hint"):
+        module.register_kv_cache(
+            1,
+            MagicMock(),
+            "model",
+            1,
+            MagicMock(),
+            MagicMock(),
+            [],
+            lifetime_hint="session",
+        )
+
+    assert module._cache_contexts[1].lifetime_hint == "transient"
 
 
 def test_gpu_touch_latches_get_does_not() -> None:

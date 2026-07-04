@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 
 DEFAULT_SERVER_URL = "ipc:///tmp/lmcache.sock"
 DEFAULT_MQ_TIMEOUT: float = 300.0
+FDP_LIFETIME_HINT_ENV = "LMCACHE_FDP_LIFETIME_HINT"
 
 
 def _get_server_url(llm_args: "TorchLlmArgs") -> str:
@@ -53,6 +54,15 @@ def _get_server_url(llm_args: "TorchLlmArgs") -> str:
     if cfg is not None and cfg.server_url is not None:
         return cfg.server_url
     return os.environ.get("LMCACHE_SERVER_URL", DEFAULT_SERVER_URL)
+
+
+def _reject_unsupported_lifetime_hint() -> None:
+    """Reject TRT-LLM lifetime hints until this adapter supports them."""
+    if FDP_LIFETIME_HINT_ENV in os.environ:
+        raise ValueError(
+            f"{FDP_LIFETIME_HINT_ENV} is only supported for "
+            "vLLM MP LMCache-driven GPU transfers"
+        )
 
 
 def _send_request(
@@ -82,6 +92,7 @@ class LMCacheMPKvConnectorScheduler(KvCacheConnectorScheduler):
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
+        _reject_unsupported_lifetime_hint()
         self._block_size: int = self._llm_args.kv_cache_config.tokens_per_block
         # request_id -> (all_tokens, num_matched).
         self._pending: dict = {}
@@ -278,6 +289,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
+        _reject_unsupported_lifetime_hint()
         self._block_size: int = self._llm_args.kv_cache_config.tokens_per_block
 
         self._zmq_context = zmq.Context()
@@ -369,6 +381,7 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 EngineType.TRTLLM,
                 layout_hints,
                 [],
+                None,
             ],
         )
         try:

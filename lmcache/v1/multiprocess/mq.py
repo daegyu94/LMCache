@@ -297,7 +297,9 @@ class MessageQueueClient:
                 )
                 payload_classes = get_payload_classes(wrapped_request.request_type)
                 if len(payload_classes) != len(wrapped_request.request_payloads):
-                    expected_classes = [cls.__name__ for cls in payload_classes]
+                    expected_classes = [
+                        getattr(cls, "__name__", str(cls)) for cls in payload_classes
+                    ]
                     actual_classes = [
                         type(p).__name__ for p in wrapped_request.request_payloads
                     ]

@@ -69,6 +69,7 @@ DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
 DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
+_FDP_LIFETIME_HINT_CONFIG_KEY = "lmcache.fdp.lifetime_hint"
 
 # Floor (seconds) of the MP server's worker reap timeout. It only covers the
 # default 10 s heartbeat interval (3 x 10 s); the adapter warns at startup
@@ -1080,7 +1081,14 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        self._lifetime_hint: str | None = None
         if extra_config is not None:
+            raw_lifetime_hint = extra_config.get(_FDP_LIFETIME_HINT_CONFIG_KEY)
+            if raw_lifetime_hint is not None and not isinstance(raw_lifetime_hint, str):
+                raise ValueError(
+                    f"{_FDP_LIFETIME_HINT_CONFIG_KEY} must be a string or None"
+                )
+            self._lifetime_hint = raw_lifetime_hint
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
@@ -1297,6 +1305,9 @@ class LMCacheMPWorkerAdapter:
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                lifetime_hint=self._resolve_lifetime_hint_for_context(
+                    transfer_ctx, kv_caches
+                ),
             )
         except TimeoutError:
             raise ConnectionError(
@@ -1304,6 +1315,23 @@ class LMCacheMPWorkerAdapter:
                 "register_kv_caches within "
                 f"{self._mq_timeout}s. Is the server running?"
             ) from None
+
+    def _resolve_lifetime_hint_for_context(
+        self,
+        transfer_ctx: TransferContext,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> str | None:
+        """Return the FDP lifetime hint allowed for this transfer context."""
+        if self._lifetime_hint is None:
+            return None
+        if not transfer_ctx.can_forward_lifetime_hint() or not all(
+            kv_cache.device.type == "cuda" for kv_cache in kv_caches.values()
+        ):
+            raise ValueError(
+                f"{_FDP_LIFETIME_HINT_CONFIG_KEY} is only supported for "
+                "vLLM LMCache-driven GPU transfers"
+            )
+        return self._lifetime_hint
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.

@@ -404,6 +404,7 @@ class ContextEntry:
         has_liveness_signal: True once the instance has sent at least one
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
+        lifetime_hint: Optional admin-defined L2 placement lifetime hint.
     """
 
     cache_context: BaseCacheContext
@@ -411,6 +412,7 @@ class ContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    lifetime_hint: str | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -600,6 +602,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "model_name": entry.model_name,
                 "world_size": entry.world_size,
                 "kv_cache_layout": ctx.report_status(),
+                "lifetime_hint": entry.lifetime_hint,
             }
 
         return {
@@ -630,6 +633,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
+        lifetime_hint: str | None = None,
     ) -> None:
         """Register the KV cache tensors for a given GPU instance ID.
 
@@ -645,6 +649,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+            lifetime_hint: Optional admin-defined L2 placement lifetime hint.
         """
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
@@ -654,12 +659,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             existing = self._cache_contexts.get(instance_id)
             if existing is not None:
+                if existing.lifetime_hint != lifetime_hint:
+                    raise ValueError(
+                        "Cannot change lifetime hint when re-registering instance "
+                        f"{instance_id}: existing={existing.lifetime_hint!r}, "
+                        f"requested={lifetime_hint!r}"
+                    )
                 existing.last_seen = now
                 logger.info(
                     "Instance %d already registered; refreshing liveness",
                     instance_id,
                 )
                 return
+
+        self._ctx.storage_manager.validate_lifetime_hint(lifetime_hint)
 
         # Build the context and layout descriptor outside the lock.
         cache_context = create_cache_context(
@@ -684,6 +697,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 cache_context=cache_context,
                 model_name=model_name,
                 world_size=world_size,
+                lifetime_hint=lifetime_hint,
                 last_seen=now,
                 has_liveness_signal=False,
             )

@@ -396,6 +396,37 @@ def test_create_transfer_context_handle_mode_unsupported_device_raises(
         platform_registry.restore(snapshot)
 
 
+def test_engine_driven_register_rejects_lifetime_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine-driven transfer does not support lifetime hints."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import (
+        EngineDrivenTransferContext,
+        worker_transfer,
+    )
+
+    monkeypatch.setattr(
+        worker_transfer,
+        "compute_kv_layout",
+        lambda *_args, **_kwargs: (4, 2, 16, "float32", object()),
+    )
+    ctx = EngineDrivenTransferContext()
+
+    with pytest.raises(ValueError, match="not supported for engine-driven"):
+        ctx.register(
+            instance_id=1,
+            kv_caches=_make_kv_caches(),
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=2,
+            mq_client=MagicMock(),
+            mq_timeout=1.0,
+            send_request=MagicMock(),
+            lifetime_hint="transient",
+        )
+
+
 def test_musa_data_context_keeps_layout_validation_device_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -162,6 +162,7 @@ class LMCacheMPConnector:
                 EngineType.SGLANG,
                 {"tokens_per_block": self.page_size},
                 [],
+                None,
             ],
         ).result(timeout=self._mq_timeout)
         self._registered = True

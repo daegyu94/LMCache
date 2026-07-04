@@ -42,6 +42,7 @@ def register_kv_cache_handler(
     engine_type: EngineType,
     layout_hints: LayoutHints,
     engine_group_infos: list[EngineGroupInfo],
+    lifetime_hint: str | None,
 ) -> None:
     """
     Dummy handler for REGISTER_KV_CACHE requests.
@@ -55,6 +56,7 @@ def register_kv_cache_handler(
         layout_hints: Engine-provided hints dict.
         engine_group_infos: Engine-neutral KV cache group metadata,
             msgspec-decoded from the request payload.
+        lifetime_hint: Optional admin-defined L2 placement lifetime hint.
 
     Returns:
         None
@@ -80,6 +82,7 @@ def register_kv_cache_handler(
     assert isinstance(engine_group_infos, list), (
         f"Expected engine_group_infos to be a list, got {type(engine_group_infos)}"
     )
+    assert lifetime_hint is None or isinstance(lifetime_hint, str)
     # No return value (returns None implicitly)
 
 

@@ -79,13 +79,10 @@ caller-provided load buffers during prefetch.
   non-zero placement-identifier set and must not contain 0. If
   ``fdp_lifetime_hints`` is provided inline or through a ``file://`` JSON list,
   there must be at least as many usable placement identifiers as hint names.
-- Lifetime hints are supported for MP ``REGISTER_KV_CACHE`` GPU
-  LMCache-driven workers. Unsupported hint names fail registration before the
+- Lifetime hints are supported for vLLM MP LMCache-driven GPU
+  workers. Unsupported hint names fail registration before the
   worker starts using the cache. The engine-driven non-GPU path does not support
   lifetime hints.
-- TensorRT-LLM workers read their lifetime hint from the
-  ``LMCACHE_FDP_LIFETIME_HINT`` environment variable. Leave it unset to use
-  default NVMe placement.
 - KV data writes with a registered lifetime hint use the mapped FDP placement
   identifier; checkpoint metadata writes use default NVMe placement with no
   directive.

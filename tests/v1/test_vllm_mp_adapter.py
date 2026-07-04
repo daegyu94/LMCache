@@ -132,7 +132,11 @@ def _patch_transfer_context_factory(
     def fake_create_transfer_context(
         kv_caches: dict[str, torch.Tensor], mode: str
     ) -> MagicMock:
-        ctx = MagicMock(name=f"transfer_ctx_{len(contexts)}")
+        ctx = MagicMock(
+            name=f"transfer_ctx_{len(contexts)}",
+            spec=adapter_mod.TransferContext,
+        )
+        ctx.can_forward_lifetime_hint.return_value = True
         contexts.append(ctx)
         return ctx
 
@@ -678,6 +682,80 @@ def test_register_uses_local_context_when_self_transfer_ctx_nulled(
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     local_ctx.register.assert_called_once()
+
+
+def test_lifetime_hint_extra_config_passed_to_lmcache_driven_transfer_register(
+    monkeypatch,
+) -> None:
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    future = MagicMock(name="future")
+    future.result.return_value = None
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", lambda *a, **kw: future)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    monkeypatch.setattr(adapter_mod, "wrap_kv_caches", lambda kv: list(kv.values()))
+    monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
+    contexts = _patch_transfer_context_factory(monkeypatch)
+
+    adapter = _make_worker_adapter(
+        extra_config={"lmcache.fdp.lifetime_hint": "transient"}
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert contexts[0].register.call_args.kwargs["lifetime_hint"] == "transient"
+
+
+def test_lifetime_hint_extra_config_rejected_for_engine_driven_transfer(
+    monkeypatch,
+) -> None:
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
+    engine_ctx = MagicMock(spec=adapter_mod.EngineDrivenTransferContext)
+    engine_ctx.can_forward_lifetime_hint.return_value = False
+    monkeypatch.setattr(
+        adapter_mod, "create_transfer_context", lambda _kv, mode=None: engine_ctx
+    )
+
+    adapter = _make_worker_adapter(
+        extra_config={"lmcache.fdp.lifetime_hint": "transient"}
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cpu"
+
+    with pytest.raises(ValueError, match="only supported for vLLM LMCache-driven"):
+        adapter.register_kv_caches({"layer.0": fake_tensor})
+    engine_ctx.register.assert_not_called()
+
+
+def test_lifetime_hint_extra_config_rejected_for_forced_lmcache_driven_cpu_transfer(
+    monkeypatch,
+) -> None:
+    fake_client = MagicMock(name="mq_client")
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", lambda *a, **kw: fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    monkeypatch.setattr("lmcache.integration.vllm.utils.vllm_layout_hints", lambda: {})
+    contexts = _patch_transfer_context_factory(monkeypatch)
+
+    adapter = _make_worker_adapter(
+        extra_config={
+            "lmcache.mp.mp_transfer_mode": "lmcache_driven",
+            "lmcache.fdp.lifetime_hint": "transient",
+        }
+    )
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cpu"
+
+    with pytest.raises(ValueError, match="only supported for vLLM LMCache-driven"):
+        adapter.register_kv_caches({"layer.0": fake_tensor})
+    contexts[0].register.assert_not_called()
 
 
 def test_startup_warns_when_heartbeat_interval_exceeds_reap_floor(

@@ -8,12 +8,128 @@ format, format-aware accessors in ``gpu_connector/utils.py``, the
 TensorRT-LLM to be installed.
 """
 
+# Standard
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+import importlib.util
+import sys
+
 # Third Party
 import pytest
 import torch
 
 # First Party
 from lmcache.utils import EngineType
+
+
+def _load_trtllm_mp_adapter(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Load the TRT-LLM MP adapter against minimal connector API stubs."""
+
+    class _ConnectorBase:
+        def __init__(self, llm_args: object) -> None:
+            self._llm_args = llm_args
+
+    modules = {
+        name: ModuleType(name)
+        for name in (
+            "tensorrt_llm",
+            "tensorrt_llm._torch",
+            "tensorrt_llm._torch.pyexecutor",
+            "tensorrt_llm._torch.pyexecutor.connectors",
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector",
+            "tensorrt_llm.bindings",
+            "tensorrt_llm.bindings.internal",
+            "tensorrt_llm.bindings.internal.batch_manager",
+            "tensorrt_llm.llmapi",
+            "tensorrt_llm.llmapi.llm_args",
+        )
+    }
+    modules["tensorrt_llm"].__dict__["mpi_rank"] = lambda: 0
+    connector_module = modules[
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector"
+    ]
+    connector_module.__dict__.update(
+        KvCacheConnectorScheduler=_ConnectorBase,
+        KvCacheConnectorWorker=_ConnectorBase,
+        SchedulerOutput=object,
+    )
+    modules["tensorrt_llm.bindings.internal.batch_manager"].__dict__["LlmRequest"] = (
+        object
+    )
+    modules["tensorrt_llm.llmapi.llm_args"].__dict__["TorchLlmArgs"] = object
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    module_name = "_test_lmcache_tensorrt_mp_adapter"
+    module_path = (
+        Path(__file__).parents[2]
+        / "lmcache/integration/tensorrt_llm/tensorrt_mp_adapter.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_trtllm_mp_worker_rejects_unsupported_lifetime_hint_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TRT-LLM fails fast when an out-of-scope lifetime hint is configured."""
+    monkeypatch.setenv("LMCACHE_FDP_LIFETIME_HINT", "transient")
+    module = _load_trtllm_mp_adapter(monkeypatch)
+    llm_args: Any = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(tokens_per_block=16),
+        kv_connector_config=None,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        model="model",
+    )
+
+    with pytest.raises(ValueError, match="only supported for vLLM MP"):
+        module.LMCacheMPKvConnectorWorker(llm_args)
+
+
+def test_trtllm_mp_worker_registers_without_lifetime_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TRT-LLM is not part of the FDP lifetime-hint scope yet."""
+    module = _load_trtllm_mp_adapter(monkeypatch)
+    future = MagicMock()
+    future.result.return_value = 256
+    send_request = MagicMock(return_value=future)
+    monkeypatch.setattr(module, "MessageQueueClient", MagicMock())
+    monkeypatch.setattr(module, "_send_request", send_request)
+    monkeypatch.setattr(module.zmq, "Context", MagicMock(return_value=MagicMock()))
+    transformers = ModuleType("transformers")
+    auto_config = MagicMock()
+    auto_config.from_pretrained.return_value = SimpleNamespace(
+        head_dim=64,
+        hidden_size=512,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+    )
+    transformers.__dict__["AutoConfig"] = auto_config
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(module, "RawCudaIPCWrapper", MagicMock())
+    llm_args: Any = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(tokens_per_block=16),
+        kv_connector_config=None,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        model="model",
+    )
+
+    worker = module.LMCacheMPKvConnectorWorker(llm_args)
+    kv_cache_tensor = MagicMock(shape=(4, 2, 2, 8192))
+
+    worker.register_kv_caches(kv_cache_tensor)
+
+    register_payload = send_request.call_args_list[-1].args[2]
+    assert register_payload[-1] is None
 
 
 def _has_lmc_ops() -> bool:
