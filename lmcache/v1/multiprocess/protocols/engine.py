@@ -22,6 +22,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    RankPlacementInfo,
     RegisterEngineDrivenContextPayload,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -99,6 +100,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - layout_hints: LayoutHints - See custom_types.LayoutHints.
         #   - engine_group_infos: list[EngineGroupInfo] - Engine-neutral KV cache
         #     group metadata (msgspec-encoded by the message queue).
+        #   - placement_info: RankPlacementInfo - Rank-local placement metadata.
         # Returns: None
         "REGISTER_KV_CACHE": ProtocolDefinition(
             payload_classes=[
@@ -109,6 +111,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 EngineType,
                 LayoutHints,
                 list[EngineGroupInfo],
+                RankPlacementInfo,
             ],
             response_class=None,
             handler_type=HandlerType.SYNC,

@@ -36,6 +36,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType, check_interprocess_event_support
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -369,6 +370,9 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                 EngineType.TRTLLM,
                 layout_hints,
                 [],
+                # TODO: Define TensorRT-LLM's placement rank domain before enabling
+                # L2 placement-aware policies for this integration.
+                RankPlacementInfo(local_rank=0, local_world_size=1),
             ],
         )
         try:

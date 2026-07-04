@@ -16,7 +16,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    RankPlacementInfo,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -131,6 +134,7 @@ class TransferContext(ABC):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        placement_info: RankPlacementInfo | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -145,6 +149,7 @@ class TransferContext(ABC):
             send_request: Request sender callable used to issue MQ requests.
             layout_hints: Optional inference-engine-provided layout hints.
             engine_group_infos: LMCache-owned engine KV cache group metadata.
+            placement_info: Optional rank-local placement metadata.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -242,6 +247,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        placement_info: RankPlacementInfo | None = None,
     ) -> None:
         # First Party
         from lmcache.integration.vllm.vllm_multi_process_adapter import wrap_kv_caches
@@ -259,6 +265,7 @@ class LMCacheDrivenTransferContext(TransferContext):
                 EngineType.VLLM,
                 layout_hints,
                 list(engine_group_infos),
+                placement_info or RankPlacementInfo(local_rank=0, local_world_size=1),
             ],
         )
         future.result(timeout=mq_timeout)
@@ -349,6 +356,7 @@ class EngineDrivenTransferContext(TransferContext):
         send_request: SendRequest,
         layout_hints: LayoutHints | None = None,
         engine_group_infos: Sequence[EngineGroupInfo] = (),
+        placement_info: RankPlacementInfo | None = None,
     ) -> None:
         """Register KV caches with the non-GPU context server.
 

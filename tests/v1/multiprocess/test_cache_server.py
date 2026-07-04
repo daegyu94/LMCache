@@ -23,6 +23,7 @@ from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import (
@@ -342,6 +343,7 @@ def registered_instance(
             EngineType.VLLM,
             {},
             [],
+            RankPlacementInfo(local_rank=0, local_world_size=1),
         ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )
@@ -401,6 +403,7 @@ def test_register_unregister_kv_cache(
             EngineType.VLLM,
             {},
             [],
+            RankPlacementInfo(local_rank=0, local_world_size=1),
         ],
         get_response_class(RequestType.REGISTER_KV_CACHE),
     )

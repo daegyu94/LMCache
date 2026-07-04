@@ -32,6 +32,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
@@ -162,6 +163,9 @@ class LMCacheMPConnector:
                 EngineType.SGLANG,
                 {"tokens_per_block": self.page_size},
                 [],
+                # TODO: Define SGLang's placement rank domain before enabling
+                # L2 placement-aware policies for this integration.
+                RankPlacementInfo(local_rank=0, local_world_size=1),
             ],
         ).result(timeout=self._mq_timeout)
         self._registered = True

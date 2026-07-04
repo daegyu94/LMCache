@@ -12,6 +12,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     KVCache,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import KeyType
@@ -42,6 +43,7 @@ def register_kv_cache_handler(
     engine_type: EngineType,
     layout_hints: LayoutHints,
     engine_group_infos: list[EngineGroupInfo],
+    placement_info: RankPlacementInfo,
 ) -> None:
     """
     Dummy handler for REGISTER_KV_CACHE requests.
@@ -55,6 +57,7 @@ def register_kv_cache_handler(
         layout_hints: Engine-provided hints dict.
         engine_group_infos: Engine-neutral KV cache group metadata,
             msgspec-decoded from the request payload.
+        placement_info: Rank-local placement metadata.
 
     Returns:
         None
@@ -79,6 +82,9 @@ def register_kv_cache_handler(
     )
     assert isinstance(engine_group_infos, list), (
         f"Expected engine_group_infos to be a list, got {type(engine_group_infos)}"
+    )
+    assert isinstance(placement_info, RankPlacementInfo), (
+        f"Expected placement_info to be RankPlacementInfo, got {type(placement_info)}"
     )
     # No return value (returns None implicitly)
 

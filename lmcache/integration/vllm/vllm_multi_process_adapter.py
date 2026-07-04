@@ -21,6 +21,7 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
     KVCache,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
@@ -1297,6 +1298,10 @@ class LMCacheMPWorkerAdapter:
                 send_request=send_lmcache_request,
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
+                placement_info=RankPlacementInfo(
+                    local_rank=self.worker_id,
+                    local_world_size=self.world_size,
+                ),
             )
         except TimeoutError:
             raise ConnectionError(

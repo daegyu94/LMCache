@@ -33,6 +33,7 @@ from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    RankPlacementInfo,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
@@ -630,6 +631,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         engine_type: EngineType,
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
+        placement_info: RankPlacementInfo,
     ) -> None:
         """Register the KV cache tensors for a given GPU instance ID.
 
@@ -645,6 +647,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+            placement_info: Rank-local placement metadata for L2 adapters.
         """
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering

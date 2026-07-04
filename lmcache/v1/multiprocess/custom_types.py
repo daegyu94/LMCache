@@ -144,6 +144,26 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     use_mla: bool
 
 
+class RankPlacementInfo(msgspec.Struct):
+    """Rank metadata used for placement-handle selection.
+
+    The rank domain is chosen by each integration. For example, vLLM uses
+    its KV-shard rank/world size, which is TP-aware and is not necessarily
+    the physical node-local process rank.
+
+    Attributes:
+        local_rank: Rank within the placement cohort.
+        local_world_size: Number of ranks sharing the placement cohort.
+        placement_group_id: Optional explicit cohort key. When omitted,
+            placement-aware adapters may infer cohorts from engine/model/rank
+            metadata.
+    """
+
+    local_rank: int
+    local_world_size: int
+    placement_group_id: str | None = None
+
+
 @dataclass
 class CustomizedSerdeConfig:
     serializer: Callable[[Any], bytes]

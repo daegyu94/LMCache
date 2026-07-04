@@ -57,6 +57,7 @@ try:
     from lmcache.v1.multiprocess.custom_types import (
         IPCCacheServerKey,
         KVCache,
+        RankPlacementInfo,
         RegisterEngineDrivenContextPayload,
     )
     from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -365,6 +366,7 @@ def _send_register_kv_cache(
             EngineType.VLLM,
             hints,
             list(engine_group_infos or ()),
+            RankPlacementInfo(local_rank=0, local_world_size=world_size),
         ]
         result = _call(client, RequestType.REGISTER_KV_CACHE, payloads)
         return result is not _TIMEOUT
