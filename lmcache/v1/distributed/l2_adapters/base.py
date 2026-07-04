@@ -218,6 +218,48 @@ class L2AdapterInterface(ABC):
         """
         pass
 
+    def submit_store_task_with_lifetime_hints(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        lifetime_hints: list[str | None],
+    ) -> L2TaskId:
+        """Submit a store task carrying optional per-key lifetime hints.
+
+        Args:
+            keys: Object keys to store.
+            objects: Memory objects aligned with ``keys``.
+            lifetime_hints: Optional admin-defined L2 placement hints aligned
+                with ``keys``. Adapters that do not implement placement-hint
+                routing fall back to normal store submission only when every
+                hint is ``None``.
+
+        Returns:
+            L2TaskId: The task id of the submitted store task.
+
+        Raises:
+            ValueError: If non-``None`` lifetime hints are supplied to an
+                adapter that does not support them.
+        """
+        if any(hint is not None for hint in lifetime_hints):
+            raise ValueError(
+                f"{type(self).__name__} does not support L2 lifetime hints"
+            )
+        return self.submit_store_task(keys, objects)
+
+    def supports_lifetime_hint(self, lifetime_hint: str) -> bool:
+        """Return whether this adapter can honor ``lifetime_hint``.
+
+        Args:
+            lifetime_hint: Admin-defined L2 placement hint name supplied by an
+                LLM integration during ``REGISTER_KV_CACHE``.
+
+        Returns:
+            ``True`` when this adapter can apply the hint to future stores.
+        """
+        del lifetime_hint
+        return False
+
     @abstractmethod
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         """Pop all completed store tasks.

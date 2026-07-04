@@ -73,6 +73,7 @@ class _StoreTaskState:
     temp_keys: list[ObjectKey]
     temp_objs: list[MemoryObj]
     phase: _StorePhase
+    lifetime_hints: list[str | None] | None = None
     """SERIALIZE while temps are write-locked; INNER_STORE after the
     serialize→store transition. Only read on shutdown to pick the right
     lock-release path; assignment is done under ``self._lock``."""
@@ -166,12 +167,45 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
-        """Submit a wrapped store (serialize → inner.store).
+        """Submit a wrapped store (serialize -> inner.store).
 
         All-or-nothing: if temp alloc fails for any key or serialize
         submission raises, the whole task is marked failed and the
         caller's next ``pop_completed_store_tasks`` call sees it.
         """
+        return self._submit_store_task(keys, objects, lifetime_hints=None)
+
+    def supports_lifetime_hint(self, lifetime_hint: str) -> bool:
+        """Return whether the wrapped adapter can honor ``lifetime_hint``.
+
+        Args:
+            lifetime_hint: Admin-defined L2 placement hint name supplied during
+                ``REGISTER_KV_CACHE``.
+
+        Returns:
+            ``True`` when the inner adapter can apply the hint after serde.
+        """
+        return self._inner.supports_lifetime_hint(lifetime_hint)
+
+    def submit_store_task_with_lifetime_hints(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        lifetime_hints: list[str | None],
+    ) -> L2TaskId:
+        """Submit a wrapped store while preserving per-key lifetime hints."""
+        if len(lifetime_hints) != len(keys):
+            raise ValueError("lifetime_hints must have the same length as keys")
+        return self._submit_store_task(
+            keys, objects, lifetime_hints=list(lifetime_hints)
+        )
+
+    def _submit_store_task(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        lifetime_hints: list[str | None] | None,
+    ) -> L2TaskId:
         with self._lock:
             wrapped_id = self._next_task_id
             self._next_task_id += 1
@@ -188,13 +222,14 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         # Hold the wrapper lock across submit + reverse-map registration
         # so the internal drain thread cannot observe a half-state where
         # the serde already signaled completion but ``_serde_to_store``
-        # has no entry — which would leave the wrapped task hanging.
+        # has no entry -- which would leave the wrapped task hanging.
         state = _StoreTaskState(
             wrapped_id=wrapped_id,
             keys=list(keys),
             temp_keys=temp_keys,
             temp_objs=temp_objs,
             phase=_StorePhase.SERIALIZE,
+            lifetime_hints=lifetime_hints,
         )
         try:
             with self._lock:
@@ -453,7 +488,14 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             # can safely read them during the store.
             self._l1_manager.finish_write_and_reserve_read(state.temp_keys)
             try:
-                inner_id = self._inner.submit_store_task(state.keys, state.temp_objs)
+                if state.lifetime_hints is not None:
+                    inner_id = self._inner.submit_store_task_with_lifetime_hints(
+                        state.keys, state.temp_objs, state.lifetime_hints
+                    )
+                else:
+                    inner_id = self._inner.submit_store_task(
+                        state.keys, state.temp_objs
+                    )
             except Exception:
                 logger.exception(
                     "Serde wrapper: inner.submit_store_task raised for task %d",

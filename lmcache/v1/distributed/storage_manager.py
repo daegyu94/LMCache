@@ -165,6 +165,42 @@ class StorageManager:
             self.get_l2_usages,
         )
 
+    def validate_lifetime_hint(self, lifetime_hint: str | None) -> None:
+        """Validate that all configured L2 adapters can honor a hint.
+
+        Args:
+            lifetime_hint: Admin-defined L2 placement hint supplied by an LLM
+                integration during ``REGISTER_KV_CACHE``. ``None`` preserves
+                the existing placement behavior and is always valid.
+
+        Raises:
+            ValueError: If a non-``None`` hint cannot be honored by every
+                configured L2 adapter.
+        """
+        if lifetime_hint is None:
+            return
+
+        with self._adapters_lock:
+            adapters = dict(self._l2_adapters)
+            descriptors = dict(self._adapter_descriptors)
+
+        if not adapters:
+            raise ValueError(
+                f"lifetime hint {lifetime_hint!r} requires at least one L2 adapter"
+            )
+
+        unsupported: list[str] = []
+        for adapter_id, adapter in adapters.items():
+            if not adapter.supports_lifetime_hint(lifetime_hint):
+                descriptor = descriptors.get(adapter_id)
+                l2_name = descriptor.type_name if descriptor is not None else "unknown"
+                unsupported.append(f"{adapter_id}:{l2_name}")
+        if unsupported:
+            raise ValueError(
+                f"lifetime hint {lifetime_hint!r} is not supported by L2 adapters: "
+                + ", ".join(unsupported)
+            )
+
     # External APIs for serving engine integration code to call
     @enable_tracing()
     def reserve_write(
@@ -227,16 +263,22 @@ class StorageManager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        lifetime_hint: str | None = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
 
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
+            lifetime_hint: Optional admin-defined L2 placement lifetime hint for
+                these keys. ``None`` preserves the existing placement behavior.
         """
+        self._store_controller.record_lifetime_hint(keys, lifetime_hint)
         finish_result = self._l1_manager.finish_write(keys)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        if failed_keys:
+            self._store_controller.record_lifetime_hint(failed_keys, None)
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_FINISHED,

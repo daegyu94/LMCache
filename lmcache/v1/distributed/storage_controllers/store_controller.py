@@ -240,6 +240,9 @@ class StoreController(StorageControllerInterface):
         }
         self._policy = policy
 
+        self._lifetime_hints_lock = threading.Lock()
+        self._lifetime_hints_by_key: dict[ObjectKey, str] = {}
+
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
         self._draining: dict[int, threading.Event] = {}
@@ -366,6 +369,28 @@ class StoreController(StorageControllerInterface):
             raise RuntimeError(
                 f"StoreController did not attach adapter {adapter_id} in time"
             )
+
+    def record_lifetime_hint(
+        self,
+        keys: list[ObjectKey],
+        lifetime_hint: str | None,
+    ) -> None:
+        """Record an L2 placement lifetime hint for upcoming stores.
+
+        Args:
+            keys: Object keys whose next write completion should carry the hint.
+            lifetime_hint: Admin-defined placement hint. ``None`` clears any
+                pending hint for these keys.
+        """
+        if not keys:
+            return
+        with self._lifetime_hints_lock:
+            if lifetime_hint is None:
+                for key in keys:
+                    self._lifetime_hints_by_key.pop(key, None)
+                return
+            for key in keys:
+                self._lifetime_hints_by_key[key] = lifetime_hint
 
     def request_remove_adapter(self, adapter_id: int) -> threading.Event:
         """Non-blocking function to request the removal of a L2 adapter
@@ -581,6 +606,7 @@ class StoreController(StorageControllerInterface):
             if adapter_id not in self._draining
         ]
         plan = self._policy.select_store_targets(keys, routing_descriptors)
+        lifetime_hints_by_key = self._consume_lifetime_hint_map(keys)
 
         l1_mgr = self._l1_manager
 
@@ -653,7 +679,35 @@ class StoreController(StorageControllerInterface):
                 continue
 
             adapter = self._l2_adapters[adapter_index]
-            task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            lifetime_hints = [lifetime_hints_by_key.get(key) for key in successful_keys]
+            try:
+                task_id = adapter.submit_store_task_with_lifetime_hints(
+                    successful_keys, successful_objs, lifetime_hints
+                )
+            except Exception:
+                l1_mgr.finish_read(successful_keys)
+                logger.exception(
+                    "Failed to submit L2 store task to adapter %d; "
+                    "released %d L1 read locks.",
+                    adapter_index,
+                    len(successful_keys),
+                )
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L2_STORE_COMPLETED,
+                        metadata={
+                            "adapter_index": adapter_index,
+                            "task_id": -1,
+                            "l2_name": self._adapter_descriptors[
+                                adapter_index
+                            ].type_name,
+                            "bytes_transferred": 0,
+                            "succeeded_count": 0,
+                            "failed_count": len(successful_keys),
+                        },
+                    )
+                )
+                continue
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
@@ -688,6 +742,27 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(successful_keys),
             )
+
+    def _consume_lifetime_hints(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[str | None]:
+        """Return and remove pending lifetime hints aligned with ``keys``."""
+        hint_map = self._consume_lifetime_hint_map(keys)
+        return [hint_map.get(key) for key in keys]
+
+    def _consume_lifetime_hint_map(
+        self,
+        keys: list[ObjectKey],
+    ) -> dict[ObjectKey, str]:
+        """Return and remove pending lifetime hints for ``keys``."""
+        with self._lifetime_hints_lock:
+            result: dict[ObjectKey, str] = {}
+            for key in keys:
+                hint = self._lifetime_hints_by_key.pop(key, None)
+                if hint is not None:
+                    result[key] = hint
+            return result
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
