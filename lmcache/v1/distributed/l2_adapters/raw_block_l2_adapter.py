@@ -14,7 +14,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
+from urllib.parse import unquote, urlparse
+import json
 import threading
 
 if TYPE_CHECKING:
@@ -56,6 +59,23 @@ RawBlockStoreTaskResult = tuple[
     list[ObjectKey],
     list[int],
 ]
+
+_FDP_POLICY_CLASS = "class"
+_SUPPORTED_FDP_POLICIES = frozenset({_FDP_POLICY_CLASS})
+
+
+def _normalize_fdp_policy(fdp_policy: Any) -> str:
+    """Validate and normalize the user-facing FDP placement policy."""
+    if fdp_policy is None:
+        return _FDP_POLICY_CLASS
+    if not isinstance(fdp_policy, str):
+        raise ValueError("fdp_policy must be a string")
+
+    normalized = fdp_policy.strip().lower()
+    if normalized not in _SUPPORTED_FDP_POLICIES:
+        supported = ", ".join(sorted(_SUPPORTED_FDP_POLICIES))
+        raise ValueError(f"fdp_policy must be one of: {supported}")
+    return normalized
 
 
 def _normalize_fdp_placement_ids(
@@ -107,12 +127,51 @@ def _resolve_fdp_lifetime_hints_from_dict(
     d: dict, *, fdp_enabled: bool
 ) -> list[str] | None:
     """Resolve optional FDP lifetime hint config."""
-    raw_fdp_lifetime_hints = d.get("fdp_lifetime_hints")
-    if raw_fdp_lifetime_hints is not None and not isinstance(
-        raw_fdp_lifetime_hints, list
-    ):
-        raise ValueError("fdp_lifetime_hints must be a list")
-    return raw_fdp_lifetime_hints if fdp_enabled else None
+    if not fdp_enabled:
+        return None
+    return _resolve_fdp_lifetime_hints(d.get("fdp_lifetime_hints"))
+
+
+def _resolve_fdp_lifetime_hints(
+    lifetime_hints: Optional[list[str] | str],
+) -> list[str] | None:
+    """Resolve inline or file-backed FDP lifetime hints."""
+    if lifetime_hints is None:
+        return None
+    if isinstance(lifetime_hints, list):
+        return lifetime_hints
+    if isinstance(lifetime_hints, str):
+        return _load_fdp_lifetime_hints_file(lifetime_hints)
+    raise ValueError("fdp_lifetime_hints must be a list or file:// URI string")
+
+
+def _load_fdp_lifetime_hints_file(path_or_uri: str) -> list[str]:
+    """Load FDP lifetime hints from a local JSON file URI."""
+    location = path_or_uri.strip()
+    if not location:
+        raise ValueError("fdp_lifetime_hints file path must not be empty")
+
+    parsed = urlparse(location)
+    if not location.startswith("file://") or parsed.scheme != "file":
+        raise ValueError("fdp_lifetime_hints file input must use file:// URI")
+    if parsed.netloc not in ("", "localhost"):
+        raise ValueError("fdp_lifetime_hints file URI must be local")
+    path = Path(unquote(parsed.path))
+    if not path.is_absolute():
+        raise ValueError("fdp_lifetime_hints file URI path must be absolute")
+
+    try:
+        raw_lifetime_hints = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise ValueError(f"failed to read fdp_lifetime_hints file: {location}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"fdp_lifetime_hints file must contain a JSON list: {location}"
+        ) from e
+
+    if not isinstance(raw_lifetime_hints, list):
+        raise ValueError("fdp_lifetime_hints file must contain a JSON list")
+    return cast(list[str], raw_lifetime_hints)
 
 
 def _normalize_fdp_lifetime_hints(
@@ -169,8 +228,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd: bool = False,
         max_data_transfer_size: int = 0,
         fdp_enabled: bool = False,
+        fdp_policy: str = _FDP_POLICY_CLASS,
         fdp_placement_ids: Optional[list[int]] = None,
-        fdp_lifetime_hints: Optional[list[str]] = None,
+        fdp_lifetime_hints: Optional[list[str] | str] = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
@@ -199,12 +259,17 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             max_data_transfer_size: Max data transfer size for a single request.
             fdp_enabled: Enable NVMe Flexible Data Placement discovery and
                 non-zero placement-identifier registration for raw-block writes.
+            fdp_policy: FDP placement policy. This branch supports only
+                ``"class"``, which maps admin-defined lifetime hints to FDP
+                placement identifiers.
             fdp_placement_ids: Optional exact non-zero FDP placement identifier
                 list used for FDP status registration and lifetime-hint mapping.
                 If omitted, all device-reported placement identifiers except 0
                 are used.
             fdp_lifetime_hints: Optional admin-defined hint names mapped
                 positionally to FDP placement identifiers after startup discovery.
+                A list provides inline hints; a string must be a ``file://``
+                URI containing a JSON hint-name list.
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
@@ -233,6 +298,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.use_uring_cmd = bool(use_uring_cmd)
         self.max_data_transfer_size = int(max_data_transfer_size)
         self.fdp_enabled = bool(fdp_enabled)
+        self.fdp_policy = _normalize_fdp_policy(fdp_policy)
         if self.fdp_enabled and (
             self.io_engine != "io_uring" or not self.use_uring_cmd
         ):
@@ -244,10 +310,13 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             if self.fdp_enabled
             else None
         )
-        self.fdp_lifetime_hints = (
-            _normalize_fdp_lifetime_hints(fdp_lifetime_hints)
+        resolved_fdp_lifetime_hints = (
+            _resolve_fdp_lifetime_hints(fdp_lifetime_hints)
             if self.fdp_enabled
             else None
+        )
+        self.fdp_lifetime_hints = _normalize_fdp_lifetime_hints(
+            resolved_fdp_lifetime_hints
         )
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
@@ -285,6 +354,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         max_data_transfer_size = int(d.get("max_data_transfer_size", 0))
         fdp_enabled = bool(d.get("fdp_enabled", False))
+        fdp_policy = _normalize_fdp_policy(d.get("fdp_policy"))
         fdp_placement_ids = _resolve_fdp_placement_ids_from_dict(
             d, fdp_enabled=fdp_enabled
         )
@@ -346,6 +416,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_uring_cmd=use_uring_cmd,
             max_data_transfer_size=max_data_transfer_size,
             fdp_enabled=fdp_enabled,
+            fdp_policy=fdp_policy,
             fdp_placement_ids=fdp_placement_ids,
             fdp_lifetime_hints=fdp_lifetime_hints,
             num_store_workers=worker_counts["num_store_workers"],
@@ -390,11 +461,14 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "(0: (default) auto detect limit splitting, > 0: explicit split, "
             "< 0: auto detect limit splitting)\n"
             "- fdp_enabled (bool): enable FDP discovery (default false)\n"
+            "- fdp_policy (str): FDP placement policy; currently only class "
+            "(default class)\n"
             "- fdp_placement_ids (list[int]): exact non-zero FDP placement "
             "identifiers to register; omitted uses all device-reported non-zero "
             "identifiers\n"
-            "- fdp_lifetime_hints (list[str]): optional admin-defined hint "
-            "names mapped by list order to FDP placement identifiers\n"
+            "- fdp_lifetime_hints (list[str] | str): optional admin-defined "
+            "hint names mapped by list order to FDP placement identifiers; "
+            "a string must be a file:// JSON list URI\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
             "- num_load_workers (int): load worker threads (default 4)"
@@ -472,6 +546,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
             self._fdp_enabled = bool(config.fdp_enabled)
+            self._fdp_policy = config.fdp_policy
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_ids: list[int] = []
             self._fdp_lifetime_hints: list[str] = []
@@ -755,6 +830,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "lookup_inflight_task_count": self._lookup_inflight_tasks,
                 "load_inflight_task_count": self._load_inflight_tasks,
                 "fdp_enabled": self._fdp_enabled,
+                "fdp_policy": self._fdp_policy,
                 "fdp_discovered_status": list(self._fdp_discovered_status),
                 "fdp_placement_ids": list(self._fdp_placement_ids),
                 "fdp_lifetime_hints": list(self._fdp_lifetime_hints),

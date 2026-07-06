@@ -40,9 +40,14 @@ caller-provided load buffers during prefetch.
 - ``fdp_enabled``: Enables NVMe Flexible Data Placement (FDP) discovery
   and non-zero placement-identifier registration. Requires
   ``io_engine="io_uring"`` and ``use_uring_cmd=true``.
+- ``fdp_policy``: FDP placement policy. This branch supports only
+  ``"class"``, which maps admin-defined lifetime hints to placement
+  identifiers.
 - ``fdp_placement_ids``: Optional exact non-zero placement identifier list.
-- ``fdp_lifetime_hints``: Optional admin-defined hint names. The names map
-  positionally to ``fdp_placement_ids`` after device discovery. For example,
+- ``fdp_lifetime_hints``: Optional admin-defined hint names. Inline values
+  use a JSON string list. File-backed values must use a local ``file://`` URI
+  whose file contains a JSON string list. The names map positionally to
+  ``fdp_placement_ids`` after device discovery. For example,
   ``fdp_lifetime_hints=["transient", "session"]`` maps ``"transient"`` to
   the first usable placement identifier and ``"session"`` to the second.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
@@ -67,11 +72,13 @@ caller-provided load buffers during prefetch.
 - When ``use_uring_cmd=true``, ``use_odirect`` is ignored for NVMe namespace
   character devices. FDP examples set ``use_odirect=false`` because
   ``io_uring_cmd`` uses NVMe passthrough rather than the POSIX write path.
-- FDP registers only non-zero placement identifiers. If ``fdp_placement_ids`` is
-  omitted, all discovered non-zero placement identifiers are used; if provided,
-  the list must exactly match the device's non-zero placement-identifier set and
-  must not contain 0. If ``fdp_lifetime_hints`` is provided, there must be at
-  least as many usable placement identifiers as hint names.
+- FDP registers only non-zero placement identifiers. ``fdp_policy="class"`` is
+  the default and currently only policy in this branch. If
+  ``fdp_placement_ids`` is omitted, all discovered non-zero placement
+  identifiers are used; if provided, the list must exactly match the device's
+  non-zero placement-identifier set and must not contain 0. If
+  ``fdp_lifetime_hints`` is provided inline or through a ``file://`` JSON list,
+  there must be at least as many usable placement identifiers as hint names.
 - Lifetime hints are supported for MP ``REGISTER_KV_CACHE`` GPU
   LMCache-driven workers. Unsupported hint names fail registration before the
   worker starts using the cache. The engine-driven non-GPU path does not support
@@ -96,8 +103,11 @@ caller-provided load buffers during prefetch.
     # With io_uring_cmd (NVMe passthrough)
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "iouring_queue_depth": 256, "max_data_transfer_size": 131072, "use_odirect": false}'
 
-    # With FDP discovery enabled, registering all non-zero placement identifiers
-    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "use_odirect": false}'
+    # With FDP class policy enabled, registering all non-zero placement identifiers
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "class", "fdp_lifetime_hints": ["vllm1", "vllm2"], "use_odirect": false}'
+
+    # With FDP class policy hints loaded from a local JSON file URI
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_policy": "class", "fdp_lifetime_hints": "file:///etc/lmcache/fdp-hints.json", "use_odirect": false}'
 
     # With eviction
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "load_checkpoint_on_init": false, "eviction": {"eviction_policy": "LRU", "trigger_watermark": 0.9, "eviction_ratio": 0.1}}'

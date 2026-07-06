@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+import json
 
 # Third Party
 import pytest
@@ -162,7 +163,8 @@ class _FakeFdpCore:
 def _make_fdp_config(
     *,
     placement_ids: list[int] | None = None,
-    lifetime_hints: list[str] | None = None,
+    lifetime_hints: list[str] | str | None = None,
+    fdp_policy: str = "class",
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path="/dev/ng0n1",
@@ -179,6 +181,7 @@ def _make_fdp_config(
         use_uring_cmd=True,
         iouring_queue_depth=8,
         fdp_enabled=True,
+        fdp_policy=fdp_policy,
         fdp_placement_ids=placement_ids,
         fdp_lifetime_hints=lifetime_hints,
         num_store_workers=1,
@@ -235,6 +238,40 @@ def test_raw_block_fdp_from_dict_validates_enabled_placement_id_elements() -> No
         )
 
 
+def test_raw_block_fdp_policy_defaults_to_class() -> None:
+    config = RawBlockL2AdapterConfig.from_dict(
+        {
+            "device_path": "/dev/ng0n1",
+            "slot_bytes": RAW_BLOCK_CI_SLOT_BYTES,
+            "io_engine": "io_uring",
+            "use_uring_cmd": True,
+            "fdp_enabled": True,
+        }
+    )
+
+    assert config.fdp_policy == "class"
+
+
+def test_raw_block_fdp_accepts_explicit_class_policy() -> None:
+    config = RawBlockL2AdapterConfig.from_dict(
+        {
+            "device_path": "/dev/ng0n1",
+            "slot_bytes": RAW_BLOCK_CI_SLOT_BYTES,
+            "io_engine": "io_uring",
+            "use_uring_cmd": True,
+            "fdp_enabled": True,
+            "fdp_policy": "class",
+        }
+    )
+
+    assert config.fdp_policy == "class"
+
+
+def test_raw_block_fdp_rejects_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="fdp_policy must be one of: class"):
+        _make_fdp_config(fdp_policy="rank")
+
+
 def test_raw_block_fdp_empty_status_fails_startup():
     fake_core = _FakeFdpCore(status=[])
     config = _make_fdp_config()
@@ -249,6 +286,7 @@ def test_raw_block_fdp_status_reports_registered_nonzero_placement_ids() -> None
     try:
         status = adapter.report_status()
         assert status["fdp_enabled"] is True
+        assert status["fdp_policy"] == "class"
         assert status["fdp_discovered_status"] == [(0, 10), (1, 11), (7, 17)]
         assert status["fdp_placement_ids"] == [1, 7]
     finally:
@@ -278,6 +316,40 @@ def test_raw_block_fdp_rejects_invalid_lifetime_hints() -> None:
 
     with pytest.raises(ValueError, match="must not contain duplicates"):
         _make_fdp_config(lifetime_hints=["transient", "transient"])
+
+
+def test_raw_block_fdp_lifetime_hints_load_from_file_uri(tmp_path: Path) -> None:
+    hints_file = tmp_path / "fdp-hints.json"
+    hints_file.write_text(json.dumps(["transient", "session_local"]), encoding="utf-8")
+
+    config = _make_fdp_config(lifetime_hints=hints_file.as_uri())
+
+    assert config.fdp_lifetime_hints == ["transient", "session_local"]
+
+
+def test_raw_block_fdp_lifetime_hints_reject_plain_string_path(
+    tmp_path: Path,
+) -> None:
+    hints_file = tmp_path / "fdp-hints.json"
+    hints_file.write_text(json.dumps(["transient"]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must use file:// URI"):
+        _make_fdp_config(lifetime_hints=str(hints_file))
+
+
+def test_raw_block_fdp_lifetime_hints_reject_opaque_file_uri() -> None:
+    with pytest.raises(ValueError, match="must use file:// URI"):
+        _make_fdp_config(lifetime_hints="file:fdp-hints.json")
+
+
+def test_raw_block_fdp_lifetime_hints_file_must_contain_json_list(
+    tmp_path: Path,
+) -> None:
+    hints_file = tmp_path / "fdp-hints.json"
+    hints_file.write_text(json.dumps({"hint": "transient"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain a JSON list"):
+        _make_fdp_config(lifetime_hints=hints_file.as_uri())
 
 
 def test_raw_block_fdp_requires_enough_ids_for_lifetime_hints() -> None:

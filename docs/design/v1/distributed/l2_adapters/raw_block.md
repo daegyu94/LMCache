@@ -48,12 +48,14 @@ placement identifiers.
 
 FDP plumbing is split by layer: `RawBlockL2Adapter` discovers and registers
 non-zero placement identifiers, while `RawBlockCore` enforces that explicit
-placement identifier 0 is never used. Admin-defined `fdp_lifetime_hints` map
-positionally to those non-zero placement identifiers, and MP
-`REGISTER_KV_CACHE` can attach one configured hint to a GPU LMCache-driven
-worker. When that worker stores KV data, the store controller passes the hint to
-`RawBlockL2Adapter`, which writes the matching FDP placement identifier.
-Checkpoint metadata writes still use default NVMe placement with no directive.
+placement identifier 0 is never used. Under the current `fdp_policy="class"`
+policy, admin-defined `fdp_lifetime_hints` map positionally to those non-zero
+placement identifiers. Hints can be configured inline as a string list or loaded
+from a local `file://` URI containing a JSON string list. MP `REGISTER_KV_CACHE`
+can attach one configured hint to a GPU LMCache-driven worker. When that worker
+stores KV data, the store controller passes the hint to `RawBlockL2Adapter`,
+which writes the matching FDP placement identifier. Checkpoint metadata writes
+still use default NVMe placement with no directive.
 User-facing FDP configuration rules live in
 `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command encoding
 details live in `rust/raw_block/README.md`.
