@@ -32,6 +32,7 @@ if os.fspath(REPO_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(REPO_ROOT))
 
 DEFAULT_META_TOTAL_BYTES = 64 * 1024 * 1024
+DEFAULT_SLOT_HEADER_BYTES = 4096
 DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
@@ -127,6 +128,23 @@ def _prod(values: list[int]) -> int:
     for value in values:
         result *= int(value)
     return result
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _required_slot_bytes_for_payload(
+    payload_bytes: int,
+    *,
+    block_align: int,
+    header_bytes: int = DEFAULT_SLOT_HEADER_BYTES,
+) -> int:
+    return _align_up(payload_bytes, block_align) + header_bytes
+
+
+def _slot_header_bytes(config: dict[str, Any]) -> int:
+    return int(config.get("global", {}).get("header_bytes", DEFAULT_SLOT_HEADER_BYTES))
 
 
 def _dtype_size(dtype: Any) -> int | None:
@@ -627,6 +645,20 @@ def attach_trace_footprints(
             )
             by_trace_and_slot[cache_key] = footprint
         worker.trace_footprint = footprint
+        if footprint.estimated_max_object_bytes > 0:
+            required_slot_bytes = _required_slot_bytes_for_payload(
+                footprint.estimated_max_object_bytes,
+                block_align=int(config.get("block_align", 4096)),
+                header_bytes=_slot_header_bytes(config),
+            )
+            if worker.slot_bytes < required_slot_bytes:
+                warnings.append(
+                    f"{worker.name}[{worker.worker_index}]: slot_bytes "
+                    f"{worker.slot_bytes} is smaller than max payload "
+                    f"{footprint.estimated_max_object_bytes} + raw-block header; "
+                    f"using {required_slot_bytes}"
+                )
+                worker.slot_bytes = required_slot_bytes
         for warning in footprint.warnings:
             message = f"{worker.name}: {warning}"
             if "does not exist" in warning and not dry_run:
@@ -643,10 +675,7 @@ def attach_trace_footprints(
                 f"{worker.capacity_bytes} is more than 4x estimated unique "
                 f"store bytes {unique_bytes}; churn may be weak"
             )
-        min_capacity = (
-            footprint.estimated_max_object_bytes
-            + _reserved_metadata_bytes(worker, config)
-        )
+        min_capacity = worker.slot_bytes + _reserved_metadata_bytes(worker, config)
         if (
             footprint.estimated_max_object_bytes
             and worker.capacity_bytes < min_capacity
@@ -654,7 +683,8 @@ def attach_trace_footprints(
             warnings.append(
                 f"{worker.name}[{worker.worker_index}]: capacity_bytes "
                 f"{worker.capacity_bytes} is smaller than estimated max object "
-                f"+ metadata reservation {min_capacity}; replay may fail"
+                f"+ raw-block header + metadata reservation {min_capacity}; "
+                "replay may fail"
             )
     return warnings
 

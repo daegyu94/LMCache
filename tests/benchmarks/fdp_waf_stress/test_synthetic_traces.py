@@ -7,6 +7,7 @@ import os
 # First Party
 from benchmarks.fdp_waf_stress.generate_synthetic_traces import main as generate_main
 from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
+    DEFAULT_SLOT_HEADER_BYTES,
     analyze_trace_footprint,
     expand_workers,
     load_yaml_config,
@@ -74,3 +75,11 @@ def test_generate_synthetic_traces_roundtrip_and_dry_run(tmp_path):
     assert dry_run_exit == 0
     assert (dry_run_dir / "commands.txt").exists()
     assert (dry_run_dir / "workers.json").exists()
+    workers_payload = json.loads((dry_run_dir / "workers.json").read_text())
+    assert workers_payload
+    assert all(
+        worker["slot_bytes"]
+        >= worker["trace_footprint"]["estimated_max_object_bytes"]
+        + DEFAULT_SLOT_HEADER_BYTES
+        for worker in workers_payload
+    )
