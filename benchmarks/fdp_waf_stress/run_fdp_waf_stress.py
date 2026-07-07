@@ -26,7 +26,6 @@ import time
 # Third Party
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if os.fspath(REPO_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(REPO_ROOT))
@@ -36,6 +35,7 @@ DEFAULT_SLOT_HEADER_BYTES = 4096
 DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
+DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
     "timestamp",
@@ -724,6 +724,9 @@ def print_dry_run(
     iterations: int,
     warmup_iterations: int,
     duration_seconds: int | None,
+    target_write_multiplier: float | None,
+    target_write_bytes: int | None,
+    target_device_capacity_bytes: int | None,
 ) -> list[str]:
     lines = [
         f"mode={mode}",
@@ -733,7 +736,15 @@ def print_dry_run(
         "",
     ]
     total_preview_iterations = warmup_iterations + (iterations or 1)
-    if duration_seconds is not None:
+    if target_write_bytes is not None:
+        lines.append(
+            "target_write_multiplier="
+            f"{target_write_multiplier}"
+        )
+        lines.append(f"target_device_capacity_bytes={target_device_capacity_bytes}")
+        lines.append(f"target_write_bytes={target_write_bytes}")
+        total_preview_iterations = warmup_iterations + 1
+    elif duration_seconds is not None:
         lines.append(f"duration_seconds={duration_seconds}")
         total_preview_iterations = warmup_iterations + 1
     commands: list[str] = []
@@ -823,6 +834,27 @@ def run_capture(
         }
 
 
+def detect_block_device_capacity_bytes(block_device_path: str | None) -> int | None:
+    if not block_device_path:
+        return None
+    device_name = os.path.basename(os.path.realpath(str(block_device_path)))
+    sysfs_size = os.path.join("/sys/class/block", device_name, "size")
+    try:
+        with open(sysfs_size) as file_obj:
+            sectors = _safe_int(file_obj.read())
+        if sectors is not None and sectors > 0:
+            return sectors * 512
+    except OSError:
+        pass
+
+    if shutil.which("blockdev"):
+        result = run_capture(["blockdev", "--getsize64", str(block_device_path)])
+        parsed = _safe_int(result.get("stdout"))
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
 def extract_host_write_bytes(smart_payload: Any) -> int | None:
     if not isinstance(smart_payload, dict):
         return None
@@ -831,6 +863,14 @@ def extract_host_write_bytes(smart_payload: Any) -> int | None:
     if parsed is None:
         return None
     return parsed * 512_000
+
+
+def capture_host_write_bytes(config: dict[str, Any]) -> int | None:
+    block_device = config.get("block_device_path")
+    if not shutil.which("nvme") or not block_device:
+        return None
+    smart = run_capture(["nvme", "smart-log", str(block_device), "--json"])
+    return extract_host_write_bytes(smart.get("json"))
 
 
 def extract_media_write_bytes(payload: Any) -> int | None:
@@ -1197,6 +1237,73 @@ def run_workers_until_deadline(
     return all_results, max_worker_iterations
 
 
+def run_workers_until_host_write_target(
+    workers: list[WorkerSpec],
+    config: dict[str, Any],
+    *,
+    mode: str,
+    run_id: str,
+    output_dir: str,
+    start_iteration: int,
+    baseline_host_write_bytes: int,
+    target_write_bytes: int,
+    poll_interval_seconds: int,
+) -> tuple[list[ReplayRunResult], int]:
+    stop_event = threading.Event()
+    poll_interval = max(1, int(poll_interval_seconds))
+
+    def _monitor_loop() -> None:
+        while not stop_event.wait(poll_interval):
+            current = capture_host_write_bytes(config)
+            if current is None:
+                continue
+            if current - baseline_host_write_bytes >= target_write_bytes:
+                stop_event.set()
+                return
+
+    def _worker_loop(worker: WorkerSpec) -> list[ReplayRunResult]:
+        worker_results: list[ReplayRunResult] = []
+        iteration = start_iteration
+        while not stop_event.is_set():
+            worker_results.append(
+                run_single_worker_replay(
+                    worker,
+                    config,
+                    mode=mode,
+                    run_id=run_id,
+                    output_dir=output_dir,
+                    iteration=iteration,
+                    phase="measurement",
+                )
+            )
+            iteration += 1
+        return worker_results
+
+    monitor = threading.Thread(
+        target=_monitor_loop,
+        name="fdp-waf-target-monitor",
+        daemon=True,
+    )
+    monitor.start()
+
+    all_results: list[ReplayRunResult] = []
+    max_worker_iterations = 0
+    try:
+        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            futures = [executor.submit(_worker_loop, worker) for worker in workers]
+            for future in as_completed(futures):
+                worker_results = future.result()
+                all_results.extend(worker_results)
+                max_worker_iterations = max(
+                    max_worker_iterations,
+                    len(worker_results),
+                )
+    finally:
+        stop_event.set()
+        monitor.join(timeout=1)
+    return all_results, max_worker_iterations
+
+
 def run_iterations(
     workers: list[WorkerSpec],
     config: dict[str, Any],
@@ -1207,6 +1314,9 @@ def run_iterations(
     warmup_iterations: int,
     measurement_iterations: int | None,
     duration_seconds: int | None,
+    target_write_bytes: int | None = None,
+    target_write_baseline_bytes: int | None = None,
+    target_write_poll_seconds: int = DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
     start_iteration: int = 0,
 ) -> tuple[list[ReplayRunResult], int]:
     all_results: list[ReplayRunResult] = []
@@ -1225,7 +1335,24 @@ def run_iterations(
 
     measurement_start_iter = start_iteration + warmup_iterations
     completed_measurement_iterations = 0
-    if duration_seconds is not None:
+    if target_write_bytes is not None:
+        if target_write_baseline_bytes is None:
+            raise ValueError("target host-write mode requires a baseline counter")
+        target_results, completed_measurement_iterations = (
+            run_workers_until_host_write_target(
+                workers,
+                config,
+                mode=mode,
+                run_id=run_id,
+                output_dir=output_dir,
+                start_iteration=measurement_start_iter,
+                baseline_host_write_bytes=target_write_baseline_bytes,
+                target_write_bytes=target_write_bytes,
+                poll_interval_seconds=target_write_poll_seconds,
+            )
+        )
+        all_results.extend(target_results)
+    elif duration_seconds is not None:
         duration_results, completed_measurement_iterations = (
             run_workers_until_deadline(
                 workers,
@@ -1277,6 +1404,9 @@ def build_summary(
     measurement_after: dict[str, Any],
     run_results: list[ReplayRunResult],
     warnings: list[str],
+    target_write_multiplier: float | None = None,
+    target_device_capacity_bytes: int | None = None,
+    target_write_bytes: int | None = None,
 ) -> dict[str, Any]:
     host_delta = _delta(
         measurement_after,
@@ -1344,6 +1474,9 @@ def build_summary(
         "media_write_bytes_delta": media_delta,
         "waf": waf,
         "waf_status": waf_status,
+        "target_write_multiplier": target_write_multiplier,
+        "target_device_capacity_bytes": target_device_capacity_bytes,
+        "target_write_bytes": target_write_bytes,
         "workers": worker_summaries,
         "warnings": warnings,
     }
@@ -1361,6 +1494,10 @@ def build_summary_md(summary: dict[str, Any]) -> str:
         f"- measurement_iterations: {summary['measurement_iterations']}",
         f"- host_write_bytes_delta: {summary['host_write_bytes_delta']}",
         f"- media_write_bytes_delta: {summary['media_write_bytes_delta']}",
+        f"- target_write_bytes: {summary.get('target_write_bytes')}",
+        f"- target_device_capacity_bytes: {summary.get('target_device_capacity_bytes')}",
+        f"- target_write_multiplier: "
+        f"{summary.get('target_write_multiplier')}",
         f"- waf: {summary['waf']}",
         f"- waf_status: {summary['waf_status']}",
         "",
@@ -1422,9 +1559,10 @@ def _all_planned_commands(
     warmup_iterations: int,
     measurement_iterations: int | None,
     duration_seconds: int | None,
+    target_write_bytes: int | None,
 ) -> list[str]:
     count = warmup_iterations + (measurement_iterations or 1)
-    if duration_seconds is not None:
+    if target_write_bytes is not None or duration_seconds is not None:
         count = warmup_iterations + 1
     commands = []
     for iteration in range(count):
@@ -1465,6 +1603,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "to waf_samples.tsv every N seconds during measurement; use 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--target-write-multiplier",
+        default=None,
+        type=float,
+        help=(
+            "Run measurement until host-write delta reaches device capacity "
+            "multiplied by this value. When enabled, duration/iteration "
+            "measurement limits are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--target-write-poll-seconds",
+        type=int,
+        default=DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
+        help="Host-write target polling interval in seconds.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
     parser.add_argument("--dry-run", action="store_true")
@@ -1476,12 +1630,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.duration_seconds is not None:
         if args.duration_seconds <= 0:
             raise ValueError("--duration-seconds must be > 0")
-        if args.iterations != parser.get_default("iterations"):
+        if (
+            args.target_write_multiplier is None
+            and args.iterations != parser.get_default("iterations")
+        ):
             raise ValueError(
                 "--iterations and --duration-seconds are mutually exclusive"
             )
     if args.sample_interval_seconds < 0:
         raise ValueError("--sample-interval-seconds must be >= 0")
+    if (
+        args.target_write_multiplier is not None
+        and args.target_write_multiplier <= 0
+    ):
+        raise ValueError("--target-write-multiplier must be > 0")
+    if args.target_write_poll_seconds <= 0:
+        raise ValueError("--target-write-poll-seconds must be > 0")
     return args
 
 
@@ -1499,6 +1663,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     workers = expand_workers(config, args.mode)
     warnings = attach_trace_footprints(workers, config, dry_run=args.dry_run)
+    target_multiplier = args.target_write_multiplier
+    target_device_capacity_bytes = None
+    target_write_bytes = None
+    if target_multiplier is not None:
+        target_device_capacity_bytes = detect_block_device_capacity_bytes(
+            config.get("block_device_path")
+        )
+        if target_device_capacity_bytes is None:
+            raise ValueError(
+                "could not detect block device capacity for "
+                f"{config.get('block_device_path')!r}"
+            )
+        target_write_bytes = int(target_device_capacity_bytes * target_multiplier)
+        if target_write_bytes <= 0:
+            raise ValueError("target host-write byte count must be > 0")
 
     if args.dry_run:
         commands = print_dry_run(
@@ -1510,6 +1689,9 @@ def main(argv: list[str] | None = None) -> int:
             iterations=args.iterations,
             warmup_iterations=args.warmup_iterations,
             duration_seconds=args.duration_seconds,
+            target_write_multiplier=target_multiplier,
+            target_write_bytes=target_write_bytes,
+            target_device_capacity_bytes=target_device_capacity_bytes,
         )
         _write_initial_outputs(
             output_dir=output_dir,
@@ -1531,6 +1713,7 @@ def main(argv: list[str] | None = None) -> int:
         warmup_iterations=args.warmup_iterations,
         measurement_iterations=args.iterations,
         duration_seconds=args.duration_seconds,
+        target_write_bytes=target_write_bytes,
     )
     _write_initial_outputs(
         output_dir=output_dir,
@@ -1560,6 +1743,15 @@ def main(argv: list[str] | None = None) -> int:
         os.path.join(output_dir, "measurement_after_warmup.json"),
         measurement_after_warmup,
     )
+    target_write_baseline = None
+    if target_write_bytes is not None:
+        target_write_baseline = _safe_int(
+            measurement_after_warmup.get("host_write_bytes")
+        )
+        if target_write_baseline is None:
+            raise ValueError(
+                "target host-write mode requires nvme smart-log host counter"
+            )
 
     sampler_stop, sampler_thread = start_waf_sampler(
         config=config,
@@ -1577,6 +1769,9 @@ def main(argv: list[str] | None = None) -> int:
             warmup_iterations=0,
             measurement_iterations=args.iterations,
             duration_seconds=args.duration_seconds,
+            target_write_bytes=target_write_bytes,
+            target_write_baseline_bytes=target_write_baseline,
+            target_write_poll_seconds=args.target_write_poll_seconds,
             start_iteration=args.warmup_iterations,
         )
     finally:
@@ -1604,6 +1799,9 @@ def main(argv: list[str] | None = None) -> int:
         measurement_after=measurement_after,
         run_results=all_results,
         warnings=warnings,
+        target_write_multiplier=target_multiplier,
+        target_device_capacity_bytes=target_device_capacity_bytes,
+        target_write_bytes=target_write_bytes,
     )
     write_json(os.path.join(output_dir, "summary.json"), summary)
     write_text(os.path.join(output_dir, "summary.md"), build_summary_md(summary))

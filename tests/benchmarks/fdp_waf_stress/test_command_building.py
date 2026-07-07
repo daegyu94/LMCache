@@ -20,6 +20,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     parse_args,
     waf_sample_to_tsv,
 )
+import benchmarks.fdp_waf_stress.run_fdp_waf_stress as runner
 
 
 def _config(tmp_path):
@@ -212,3 +213,65 @@ def test_sample_interval_defaults_to_five_minutes_and_can_be_disabled(tmp_path):
 
     assert default_args.sample_interval_seconds == DEFAULT_SAMPLE_INTERVAL_SECONDS
     assert disabled_args.sample_interval_seconds == 0
+
+
+def test_target_write_multiplier_is_opt_in(tmp_path):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    with open(config_path, "w") as file_obj:
+        yaml.safe_dump(config, file_obj)
+
+    default_args = parse_args(["--config", os.fspath(config_path), "--mode", "mixed"])
+    target_args = parse_args(
+        [
+            "--config",
+            os.fspath(config_path),
+            "--mode",
+            "mixed",
+            "--duration-seconds",
+            "30",
+            "--iterations",
+            "2",
+            "--target-write-multiplier",
+            "5",
+        ]
+    )
+
+    assert default_args.target_write_multiplier is None
+    assert target_args.target_write_multiplier == 5
+
+
+def test_target_write_multiplier_dry_run_uses_device_capacity(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    output_dir = tmp_path / "out"
+    with open(config_path, "w") as file_obj:
+        yaml.safe_dump(config, file_obj)
+    monkeypatch.setattr(runner, "detect_block_device_capacity_bytes", lambda _: 1024)
+
+    exit_code = main(
+        [
+            "--config",
+            os.fspath(config_path),
+            "--mode",
+            "mixed",
+            "--duration-seconds",
+            "30",
+            "--target-write-multiplier",
+            "5",
+            "--output-dir",
+            os.fspath(output_dir),
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "target_write_multiplier=5.0" in captured.out
+    assert "target_device_capacity_bytes=1024" in captured.out
+    assert "target_write_bytes=5120" in captured.out
+    assert "duration_seconds=30" not in captured.out
