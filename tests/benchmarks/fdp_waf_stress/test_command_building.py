@@ -9,12 +9,16 @@ import yaml
 
 # First Party
 from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
+    DEFAULT_SAMPLE_INTERVAL_SECONDS,
     build_l2_adapter,
     build_replay_command,
+    build_waf_sample,
+    expand_workers,
     extract_host_write_bytes,
     extract_media_write_bytes,
-    expand_workers,
     main,
+    parse_args,
+    waf_sample_to_tsv,
 )
 
 
@@ -155,3 +159,56 @@ def test_measurement_parser_fallback_without_vendor_media_counter():
     assert extract_host_write_bytes(smart) == 5_120_000
     assert extract_media_write_bytes(None) is None
     assert extract_media_write_bytes({"nested": {"nand_write_bytes": "1234"}}) == 1234
+
+
+def test_waf_sample_tsv_uses_interval_and_cumulative_deltas():
+    baseline = {
+        "captured_at": "2026-07-07T00:00:00+00:00",
+        "host_write_bytes": 1_000,
+        "media_write_bytes": 2_000,
+    }
+    previous = {
+        "captured_at": "2026-07-07T00:05:00+00:00",
+        "host_write_bytes": 1_500,
+        "media_write_bytes": 2_750,
+    }
+    sample = {
+        "captured_at": "2026-07-07T00:10:00+00:00",
+        "host_write_bytes": 2_000,
+        "media_write_bytes": 3_500,
+    }
+
+    result = build_waf_sample(sample=sample, baseline=baseline, previous=previous)
+
+    assert result["timestamp"] == "2026-07-07T00:10:00+00:00"
+    assert result["host_write_bytes"] == 500
+    assert result["media_write_bytes"] == 750
+    assert result["waf"] == 1.5
+    assert result["cumulative_host_write_bytes"] == 1_000
+    assert result["cumulative_media_write_bytes"] == 1_500
+    assert result["cumulative_waf"] == 1.5
+    assert waf_sample_to_tsv(result) == (
+        "2026-07-07T00:10:00+00:00\t500\t750\t1.5\t1000\t1500\t1.5"
+    )
+
+
+def test_sample_interval_defaults_to_five_minutes_and_can_be_disabled(tmp_path):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    with open(config_path, "w") as file_obj:
+        yaml.safe_dump(config, file_obj)
+
+    default_args = parse_args(["--config", os.fspath(config_path), "--mode", "mixed"])
+    disabled_args = parse_args(
+        [
+            "--config",
+            os.fspath(config_path),
+            "--mode",
+            "mixed",
+            "--sample-interval-seconds",
+            "0",
+        ]
+    )
+
+    assert default_args.sample_interval_seconds == DEFAULT_SAMPLE_INTERVAL_SECONDS
+    assert disabled_args.sample_interval_seconds == 0

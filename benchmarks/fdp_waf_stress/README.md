@@ -118,6 +118,7 @@ uv run --no-sync python benchmarks/fdp_waf_stress/run_fdp_waf_stress.py \
   --mode mixed \
   --duration-seconds 1800 \
   --warmup-iterations 2 \
+  --sample-interval-seconds 300 \
   --output-dir /mnt/hc-ssd/waf-fdp-mixed-30m
 ```
 
@@ -144,6 +145,12 @@ Each run writes:
 - `summary.json`
 - `summary.md`
 - `worker_logs/`
+- `waf_samples.tsv`, when `--sample-interval-seconds` is greater than 0
+
+`waf_samples.tsv` records one sample per interval during measurement with
+`timestamp`, interval `host_write_bytes`, interval `media_write_bytes`, interval
+`waf`, and cumulative deltas since warmup. The default interval is 300 seconds;
+pass `--sample-interval-seconds 0` to disable periodic sampling.
 
 If a vendor media/NAND write counter is configured, `summary.json` includes
 `media_write_bytes_delta` and `waf`. Without that counter, WAF is marked

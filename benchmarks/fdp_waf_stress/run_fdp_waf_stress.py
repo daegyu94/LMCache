@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 # Third Party
@@ -33,7 +34,17 @@ if os.fspath(REPO_ROOT) not in sys.path:
 DEFAULT_META_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
 VALID_MODES = ("mixed", "separated", "no_fdp")
+WAF_SAMPLE_TSV_COLUMNS = (
+    "timestamp",
+    "host_write_bytes",
+    "media_write_bytes",
+    "waf",
+    "cumulative_host_write_bytes",
+    "cumulative_media_write_bytes",
+    "cumulative_waf",
+)
 
 
 @dataclass
@@ -654,6 +665,11 @@ def write_json(path: str | Path, payload: Any) -> None:
         file_obj.write("\n")
 
 
+def append_text(path: str | Path, text: str) -> None:
+    with open(path, "a") as file_obj:
+        file_obj.write(text)
+
+
 def write_text(path: str | Path, text: str) -> None:
     with open(path, "w") as file_obj:
         file_obj.write(text)
@@ -877,6 +893,97 @@ def capture_measurement(config: dict[str, Any], label: str) -> dict[str, Any]:
             result["warnings"].append("xnvme unavailable; skipped FDP logs")
 
     return result
+
+
+def _waf_from_deltas(
+    host_delta: int | None,
+    media_delta: int | None,
+) -> float | None:
+    if host_delta is None or host_delta <= 0 or media_delta is None:
+        return None
+    return media_delta / host_delta
+
+
+def _format_tsv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def build_waf_sample(
+    *,
+    sample: dict[str, Any],
+    baseline: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, Any]:
+    interval_host_delta = _delta(sample, previous, "host_write_bytes")
+    interval_media_delta = _delta(sample, previous, "media_write_bytes")
+    cumulative_host_delta = _delta(sample, baseline, "host_write_bytes")
+    cumulative_media_delta = _delta(sample, baseline, "media_write_bytes")
+    return {
+        "timestamp": sample.get("captured_at"),
+        "host_write_bytes": interval_host_delta,
+        "media_write_bytes": interval_media_delta,
+        "waf": _waf_from_deltas(interval_host_delta, interval_media_delta),
+        "cumulative_host_write_bytes": cumulative_host_delta,
+        "cumulative_media_write_bytes": cumulative_media_delta,
+        "cumulative_waf": _waf_from_deltas(
+            cumulative_host_delta,
+            cumulative_media_delta,
+        ),
+    }
+
+
+def waf_sample_to_tsv(sample: dict[str, Any]) -> str:
+    return "\t".join(
+        _format_tsv_value(sample.get(column)) for column in WAF_SAMPLE_TSV_COLUMNS
+    )
+
+
+def initialize_waf_samples(path: str | Path) -> None:
+    write_text(path, "\t".join(WAF_SAMPLE_TSV_COLUMNS) + "\n")
+
+
+def start_waf_sampler(
+    *,
+    config: dict[str, Any],
+    output_dir: str,
+    baseline: dict[str, Any],
+    interval_seconds: int,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    if interval_seconds <= 0:
+        return None, None
+
+    samples_path = os.path.join(output_dir, "waf_samples.tsv")
+    initialize_waf_samples(samples_path)
+    stop_event = threading.Event()
+
+    def _sample_loop() -> None:
+        previous = baseline
+        sample_index = 0
+        while not stop_event.wait(interval_seconds):
+            sample_index += 1
+            sample = capture_measurement(config, f"sample_{sample_index:04d}")
+            append_text(
+                samples_path,
+                waf_sample_to_tsv(
+                    build_waf_sample(
+                        sample=sample,
+                        baseline=baseline,
+                        previous=previous,
+                    )
+                )
+                + "\n",
+            )
+            previous = sample
+
+    thread = threading.Thread(
+        target=_sample_loop,
+        name="fdp-waf-sampler",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def _count_failed_jsonl(path: str) -> int | None:
@@ -1319,6 +1426,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup-iterations", type=int, default=2)
     parser.add_argument("--duration-seconds", type=int, default=None)
+    parser.add_argument(
+        "--sample-interval-seconds",
+        type=int,
+        default=DEFAULT_SAMPLE_INTERVAL_SECONDS,
+        help=(
+            "Record timestamp, host-write delta, media-write delta, and WAF "
+            "to waf_samples.tsv every N seconds during measurement; use 0 to disable."
+        ),
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
     parser.add_argument("--dry-run", action="store_true")
@@ -1334,6 +1450,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError(
                 "--iterations and --duration-seconds are mutually exclusive"
             )
+    if args.sample_interval_seconds < 0:
+        raise ValueError("--sample-interval-seconds must be >= 0")
     return args
 
 
@@ -1413,17 +1531,29 @@ def main(argv: list[str] | None = None) -> int:
         measurement_after_warmup,
     )
 
-    measurement_results, completed_measurement_iterations = run_iterations(
-        workers,
-        config,
-        mode=args.mode,
-        run_id=args.run_id,
+    sampler_stop, sampler_thread = start_waf_sampler(
+        config=config,
         output_dir=output_dir,
-        warmup_iterations=0,
-        measurement_iterations=args.iterations,
-        duration_seconds=args.duration_seconds,
-        start_iteration=args.warmup_iterations,
+        baseline=measurement_after_warmup,
+        interval_seconds=args.sample_interval_seconds,
     )
+    try:
+        measurement_results, completed_measurement_iterations = run_iterations(
+            workers,
+            config,
+            mode=args.mode,
+            run_id=args.run_id,
+            output_dir=output_dir,
+            warmup_iterations=0,
+            measurement_iterations=args.iterations,
+            duration_seconds=args.duration_seconds,
+            start_iteration=args.warmup_iterations,
+        )
+    finally:
+        if sampler_stop is not None:
+            sampler_stop.set()
+        if sampler_thread is not None:
+            sampler_thread.join(timeout=10)
 
     measurement_after = capture_measurement(config, "after_measurement")
     write_json(os.path.join(output_dir, "measurement_after.json"), measurement_after)
