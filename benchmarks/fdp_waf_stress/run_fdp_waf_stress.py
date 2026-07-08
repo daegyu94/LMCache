@@ -47,6 +47,15 @@ WAF_SAMPLE_TSV_COLUMNS = (
     "cumulative_media_write_bytes",
     "cumulative_waf",
 )
+WAF_SAMPLE_COLUMN_WIDTHS = {
+    "timestamp": 20,
+    "host_write_bytes": 18,
+    "media_write_bytes": 18,
+    "waf": 10,
+    "cumulative_host_write_bytes": 28,
+    "cumulative_media_write_bytes": 28,
+    "cumulative_waf": 14,
+}
 
 
 @dataclass
@@ -1111,10 +1120,31 @@ def _waf_from_deltas(
     return media_delta / host_delta
 
 
-def _format_tsv_value(value: Any) -> str:
+def _format_sample_timestamp(value: Any) -> str:
     if value is None:
         return ""
+    text = str(value)
+    if len(text) >= 19 and "T" in text:
+        return text[:19].replace("T", " ")
+    return text
+
+
+def _format_sample_value(column: str, value: Any) -> str:
+    if value is None:
+        return ""
+    if column == "timestamp":
+        return _format_sample_timestamp(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
     return str(value)
+
+
+def _format_sample_row(values: dict[str, Any]) -> str:
+    cells = []
+    for column in WAF_SAMPLE_TSV_COLUMNS:
+        value = _format_sample_value(column, values.get(column))
+        cells.append(value.ljust(WAF_SAMPLE_COLUMN_WIDTHS[column]))
+    return "  ".join(cells).rstrip()
 
 
 def build_waf_sample(
@@ -1142,13 +1172,18 @@ def build_waf_sample(
 
 
 def waf_sample_to_tsv(sample: dict[str, Any]) -> str:
-    return "\t".join(
-        _format_tsv_value(sample.get(column)) for column in WAF_SAMPLE_TSV_COLUMNS
-    )
+    return _format_sample_row(sample)
 
 
 def initialize_waf_samples(path: str | Path) -> None:
-    write_text(path, "\t".join(WAF_SAMPLE_TSV_COLUMNS) + "\n")
+    header = _format_sample_row({column: column for column in WAF_SAMPLE_TSV_COLUMNS})
+    separator = _format_sample_row(
+        {
+            column: "-" * WAF_SAMPLE_COLUMN_WIDTHS[column]
+            for column in WAF_SAMPLE_TSV_COLUMNS
+        }
+    )
+    write_text(path, header + "\n" + separator + "\n")
 
 
 def start_waf_sampler(
