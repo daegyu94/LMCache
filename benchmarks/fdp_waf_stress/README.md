@@ -148,10 +148,11 @@ Each run writes:
 - `waf_samples.tsv`, when `--sample-interval-seconds` is greater than 0
 
 `waf_samples.tsv` records one sample per interval during measurement with
-`timestamp`, absolute `fdp_host_write_bytes`, absolute
-`fdp_media_write_bytes`, `fdp_waf`, and `device_write_multiplier`. The default
-interval is 300 seconds; pass `--sample-interval-seconds 0` to disable periodic
-sampling.
+`timestamp`, interval-delta `fdp_host_write_bytes`, interval-delta
+`fdp_media_write_bytes`, interval `fdp_waf`, and cumulative
+`device_write_multiplier`. If an interval has no host-write delta,
+`fdp_waf` is left blank. The default interval is 300 seconds; pass
+`--sample-interval-seconds 0` to disable periodic sampling.
 
 If a vendor media/NAND write counter is configured, `summary.json` includes
 `media_write_bytes_delta` and `waf`. Without that counter, WAF is marked

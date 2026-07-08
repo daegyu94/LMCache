@@ -1137,7 +1137,8 @@ def build_waf_sample(
     previous: dict[str, Any],
     target_device_capacity_bytes: int | None = None,
 ) -> dict[str, Any]:
-    del previous
+    interval_host_delta = _delta(sample, previous, "host_write_bytes")
+    interval_media_delta = _delta(sample, previous, "media_write_bytes")
     cumulative_host_delta = _delta(sample, baseline, "host_write_bytes")
     device_write_multiplier = None
     if (
@@ -1146,16 +1147,11 @@ def build_waf_sample(
         and target_device_capacity_bytes > 0
     ):
         device_write_multiplier = cumulative_host_delta / target_device_capacity_bytes
-    fdp_host_write_bytes = _safe_int(sample.get("host_write_bytes"))
-    fdp_media_write_bytes = _safe_int(sample.get("media_write_bytes"))
     return {
         "timestamp": sample.get("captured_at"),
-        "fdp_host_write_bytes": fdp_host_write_bytes,
-        "fdp_media_write_bytes": fdp_media_write_bytes,
-        "fdp_waf": _waf_from_deltas(
-            fdp_host_write_bytes,
-            fdp_media_write_bytes,
-        ),
+        "fdp_host_write_bytes": interval_host_delta,
+        "fdp_media_write_bytes": interval_media_delta,
+        "fdp_waf": _waf_from_deltas(interval_host_delta, interval_media_delta),
         "device_write_multiplier": device_write_multiplier,
     }
 

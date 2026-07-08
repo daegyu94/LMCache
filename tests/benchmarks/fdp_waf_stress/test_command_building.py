@@ -162,7 +162,7 @@ def test_measurement_parser_fallback_without_vendor_media_counter():
     assert extract_media_write_bytes({"nested": {"nand_write_bytes": "1234"}}) == 1234
 
 
-def test_waf_sample_tsv_uses_interval_and_cumulative_deltas():
+def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
     baseline = {
         "captured_at": "2026-07-07T00:00:00+00:00",
         "host_write_bytes": 1_000,
@@ -179,18 +179,51 @@ def test_waf_sample_tsv_uses_interval_and_cumulative_deltas():
         "media_write_bytes": 3_500,
     }
 
-    result = build_waf_sample(sample=sample, baseline=baseline, previous=previous)
+    result = build_waf_sample(
+        sample=sample,
+        baseline=baseline,
+        previous=previous,
+        target_device_capacity_bytes=2_000,
+    )
 
     assert result["timestamp"] == "2026-07-07T00:10:00+00:00"
-    assert result["host_write_bytes"] == 500
-    assert result["media_write_bytes"] == 750
-    assert result["waf"] == 1.5
-    assert result["cumulative_host_write_bytes"] == 1_000
-    assert result["cumulative_media_write_bytes"] == 1_500
-    assert result["cumulative_waf"] == 1.5
-    assert waf_sample_to_tsv(result) == (
-        "2026-07-07T00:10:00+00:00\t500\t750\t1.5\t1000\t1500\t1.5"
-    )
+    assert result["fdp_host_write_bytes"] == 500
+    assert result["fdp_media_write_bytes"] == 750
+    assert result["fdp_waf"] == 1.5
+    assert result["device_write_multiplier"] == 0.5
+    assert waf_sample_to_tsv(result).split() == [
+        "2026-07-07",
+        "00:10:00",
+        "500",
+        "750",
+        "1.5",
+        "0.5",
+    ]
+
+
+def test_waf_sample_omits_interval_waf_when_host_delta_is_zero():
+    baseline = {
+        "captured_at": "2026-07-07T00:00:00+00:00",
+        "host_write_bytes": 1_000,
+        "media_write_bytes": 2_000,
+    }
+    previous = {
+        "captured_at": "2026-07-07T00:05:00+00:00",
+        "host_write_bytes": 1_500,
+        "media_write_bytes": 2_750,
+    }
+    sample = {
+        "captured_at": "2026-07-07T00:10:00+00:00",
+        "host_write_bytes": 1_500,
+        "media_write_bytes": 2_750,
+    }
+
+    result = build_waf_sample(sample=sample, baseline=baseline, previous=previous)
+
+    assert result["fdp_host_write_bytes"] == 0
+    assert result["fdp_media_write_bytes"] == 0
+    assert result["fdp_waf"] is None
+    assert "  0                       0" in waf_sample_to_tsv(result)
 
 
 def test_sample_interval_defaults_to_five_minutes_and_can_be_disabled(tmp_path):
