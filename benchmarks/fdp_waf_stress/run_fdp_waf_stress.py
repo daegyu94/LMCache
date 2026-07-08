@@ -13,6 +13,7 @@ from typing import Any
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -438,10 +439,11 @@ def _resolve_worker_ruhs(
     )
 
 
-def make_meta_magic(worker_global_index: int) -> str:
-    if worker_global_index < 0 or worker_global_index > 99_999_999:
+def make_meta_magic(run_id: str, worker_global_index: int) -> str:
+    if worker_global_index < 0 or worker_global_index > 0xFFFF:
         raise ValueError("worker index cannot fit into an 8-byte meta_magic")
-    return f"WF{worker_global_index:06d}"
+    run_hash = hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:4].upper()
+    return f"{run_hash}{worker_global_index:04X}"
 
 
 def make_salt_suffix(
@@ -461,7 +463,12 @@ def _validate_alignment(name: str, value: int, block_align: int) -> None:
         raise ValueError(f"{name}={value} is not aligned to {block_align}")
 
 
-def expand_workers(config: dict[str, Any], mode: str) -> list[WorkerSpec]:
+def expand_workers(
+    config: dict[str, Any],
+    mode: str,
+    *,
+    run_id: str,
+) -> list[WorkerSpec]:
     block_align = int(config.get("block_align", 4096))
     windows = config.get("windows", {})
     start_offset = int(windows.get("start_offset_bytes", 0))
@@ -509,7 +516,7 @@ def expand_workers(config: dict[str, Any], mode: str) -> list[WorkerSpec]:
                     capacity_bytes=capacity,
                     slot_bytes=slot_bytes,
                     l1_size_gb=float(workload["l1_size_gb"]),
-                    meta_magic=make_meta_magic(global_index + 1),
+                    meta_magic=make_meta_magic(run_id, global_index + 1),
                     use_fdp=use_fdp,
                     fdp_data_ruh_ids=list(data_ruhs),
                     fdp_metadata_ruh_ids=list(metadata_ruhs),
@@ -1585,6 +1592,7 @@ def build_summary(
                 "base_offset_bytes": worker.base_offset_bytes,
                 "capacity_bytes": worker.capacity_bytes,
                 "slot_bytes": worker.slot_bytes,
+                "meta_magic": worker.meta_magic,
                 "fdp_data_ruh_ids": worker.fdp_data_ruh_ids,
                 "fdp_metadata_ruh_ids": worker.fdp_metadata_ruh_ids,
                 "records_failed": sum(failed_counts) if failed_counts else None,
@@ -1791,7 +1799,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         output_dir=args.output_dir,
     )
-    workers = expand_workers(config, args.mode)
+    workers = expand_workers(config, args.mode, run_id=args.run_id)
     warnings = attach_trace_footprints(workers, config, dry_run=args.dry_run)
     target_multiplier = args.target_write_multiplier
     target_device_capacity_bytes = None
