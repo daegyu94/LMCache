@@ -148,10 +148,10 @@ Each run writes:
 - `waf_samples.tsv`, when `--sample-interval-seconds` is greater than 0
 
 `waf_samples.tsv` records one sample per interval during measurement with
-`timestamp`, interval-delta `fdp_host_write_bytes`, interval-delta
-`fdp_media_write_bytes`, interval `fdp_waf`, cumulative
+`timestamp`, interval-delta `fdp_host_write_mb`, interval-delta
+`fdp_media_write_mb`, interval `fdp_waf`, cumulative
 `device_write_multiplier`, and `sample_status`. Some NVMe controllers do not
-refresh FDP stats on every sample interval; when both observed deltas are zero,
+refresh FDP stats on every sample interval; when both observed MB deltas are zero,
 the delta and WAF fields are left blank and `sample_status` is `stale`. The
 default interval is 300 seconds; pass `--sample-interval-seconds 0` to disable
 periodic sampling.

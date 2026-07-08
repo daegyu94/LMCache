@@ -40,16 +40,16 @@ DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
     "timestamp",
-    "fdp_host_write_bytes",
-    "fdp_media_write_bytes",
+    "fdp_host_write_mb",
+    "fdp_media_write_mb",
     "fdp_waf",
     "device_write_multiplier",
     "sample_status",
 )
 WAF_SAMPLE_COLUMN_WIDTHS = {
     "timestamp": 20,
-    "fdp_host_write_bytes": 22,
-    "fdp_media_write_bytes": 22,
+    "fdp_host_write_mb": 18,
+    "fdp_media_write_mb": 18,
     "fdp_waf": 10,
     "device_write_multiplier": 24,
     "sample_status": 14,
@@ -1119,8 +1119,12 @@ def _format_sample_value(column: str, value: Any) -> str:
         return ""
     if column == "timestamp":
         return _format_sample_timestamp(value)
+    if column in {"fdp_host_write_mb", "fdp_media_write_mb"} and isinstance(
+        value, (int, float)
+    ):
+        return f"{value:.2f}"
     if isinstance(value, float):
-        return f"{value:.6g}"
+        return f"{value:.3f}"
     return str(value)
 
 
@@ -1162,8 +1166,12 @@ def build_waf_sample(
 
     return {
         "timestamp": sample.get("captured_at"),
-        "fdp_host_write_bytes": output_host_delta,
-        "fdp_media_write_bytes": output_media_delta,
+        "fdp_host_write_mb": (output_host_delta / 1_000_000)
+        if output_host_delta is not None
+        else None,
+        "fdp_media_write_mb": (output_media_delta / 1_000_000)
+        if output_media_delta is not None
+        else None,
         "fdp_waf": _waf_from_deltas(output_host_delta, output_media_delta),
         "device_write_multiplier": device_write_multiplier,
         "sample_status": sample_status,

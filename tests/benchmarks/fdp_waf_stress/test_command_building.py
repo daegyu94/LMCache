@@ -165,40 +165,40 @@ def test_measurement_parser_fallback_without_vendor_media_counter():
 def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
     baseline = {
         "captured_at": "2026-07-07T00:00:00+00:00",
-        "host_write_bytes": 1_000,
-        "media_write_bytes": 2_000,
+        "host_write_bytes": 1_000_000_000,
+        "media_write_bytes": 2_000_000_000,
     }
     previous = {
         "captured_at": "2026-07-07T00:05:00+00:00",
-        "host_write_bytes": 1_500,
-        "media_write_bytes": 2_750,
+        "host_write_bytes": 1_500_000_000,
+        "media_write_bytes": 2_750_000_000,
     }
     sample = {
         "captured_at": "2026-07-07T00:10:00+00:00",
-        "host_write_bytes": 2_000,
-        "media_write_bytes": 3_500,
+        "host_write_bytes": 2_000_000_000,
+        "media_write_bytes": 3_500_000_000,
     }
 
     result = build_waf_sample(
         sample=sample,
         baseline=baseline,
         previous=previous,
-        target_device_capacity_bytes=2_000,
+        target_device_capacity_bytes=2_000_000_000,
     )
 
     assert result["timestamp"] == "2026-07-07T00:10:00+00:00"
-    assert result["fdp_host_write_bytes"] == 500
-    assert result["fdp_media_write_bytes"] == 750
+    assert result["fdp_host_write_mb"] == 500.0
+    assert result["fdp_media_write_mb"] == 750.0
     assert result["fdp_waf"] == 1.5
     assert result["device_write_multiplier"] == 0.5
     assert result["sample_status"] == "updated"
     assert waf_sample_to_tsv(result).split() == [
         "2026-07-07",
         "00:10:00",
-        "500",
-        "750",
-        "1.5",
-        "0.5",
+        "500.00",
+        "750.00",
+        "1.500",
+        "0.500",
         "updated",
     ]
 
@@ -222,8 +222,8 @@ def test_waf_sample_marks_stale_interval_when_deltas_are_zero():
 
     result = build_waf_sample(sample=sample, baseline=baseline, previous=previous)
 
-    assert result["fdp_host_write_bytes"] is None
-    assert result["fdp_media_write_bytes"] is None
+    assert result["fdp_host_write_mb"] is None
+    assert result["fdp_media_write_mb"] is None
     assert result["fdp_waf"] is None
     assert result["sample_status"] == "stale"
     assert waf_sample_to_tsv(result).split() == [
