@@ -44,6 +44,7 @@ WAF_SAMPLE_TSV_COLUMNS = (
     "fdp_media_write_bytes",
     "fdp_waf",
     "device_write_multiplier",
+    "sample_status",
 )
 WAF_SAMPLE_COLUMN_WIDTHS = {
     "timestamp": 20,
@@ -51,6 +52,7 @@ WAF_SAMPLE_COLUMN_WIDTHS = {
     "fdp_media_write_bytes": 22,
     "fdp_waf": 10,
     "device_write_multiplier": 24,
+    "sample_status": 14,
 }
 
 
@@ -1147,12 +1149,24 @@ def build_waf_sample(
         and target_device_capacity_bytes > 0
     ):
         device_write_multiplier = cumulative_host_delta / target_device_capacity_bytes
+
+    sample_status = "updated"
+    output_host_delta = interval_host_delta
+    output_media_delta = interval_media_delta
+    if interval_host_delta is None or interval_media_delta is None:
+        sample_status = "unavailable"
+    elif interval_host_delta == 0 and interval_media_delta == 0:
+        sample_status = "stale"
+        output_host_delta = None
+        output_media_delta = None
+
     return {
         "timestamp": sample.get("captured_at"),
-        "fdp_host_write_bytes": interval_host_delta,
-        "fdp_media_write_bytes": interval_media_delta,
-        "fdp_waf": _waf_from_deltas(interval_host_delta, interval_media_delta),
+        "fdp_host_write_bytes": output_host_delta,
+        "fdp_media_write_bytes": output_media_delta,
+        "fdp_waf": _waf_from_deltas(output_host_delta, output_media_delta),
         "device_write_multiplier": device_write_multiplier,
+        "sample_status": sample_status,
     }
 
 

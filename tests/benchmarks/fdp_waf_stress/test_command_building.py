@@ -191,6 +191,7 @@ def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
     assert result["fdp_media_write_bytes"] == 750
     assert result["fdp_waf"] == 1.5
     assert result["device_write_multiplier"] == 0.5
+    assert result["sample_status"] == "updated"
     assert waf_sample_to_tsv(result).split() == [
         "2026-07-07",
         "00:10:00",
@@ -198,10 +199,11 @@ def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
         "750",
         "1.5",
         "0.5",
+        "updated",
     ]
 
 
-def test_waf_sample_omits_interval_waf_when_host_delta_is_zero():
+def test_waf_sample_marks_stale_interval_when_deltas_are_zero():
     baseline = {
         "captured_at": "2026-07-07T00:00:00+00:00",
         "host_write_bytes": 1_000,
@@ -220,10 +222,15 @@ def test_waf_sample_omits_interval_waf_when_host_delta_is_zero():
 
     result = build_waf_sample(sample=sample, baseline=baseline, previous=previous)
 
-    assert result["fdp_host_write_bytes"] == 0
-    assert result["fdp_media_write_bytes"] == 0
+    assert result["fdp_host_write_bytes"] is None
+    assert result["fdp_media_write_bytes"] is None
     assert result["fdp_waf"] is None
-    assert "  0                       0" in waf_sample_to_tsv(result)
+    assert result["sample_status"] == "stale"
+    assert waf_sample_to_tsv(result).split() == [
+        "2026-07-07",
+        "00:10:00",
+        "stale",
+    ]
 
 
 def test_sample_interval_defaults_to_five_minutes_and_can_be_disabled(tmp_path):

@@ -149,10 +149,12 @@ Each run writes:
 
 `waf_samples.tsv` records one sample per interval during measurement with
 `timestamp`, interval-delta `fdp_host_write_bytes`, interval-delta
-`fdp_media_write_bytes`, interval `fdp_waf`, and cumulative
-`device_write_multiplier`. If an interval has no host-write delta,
-`fdp_waf` is left blank. The default interval is 300 seconds; pass
-`--sample-interval-seconds 0` to disable periodic sampling.
+`fdp_media_write_bytes`, interval `fdp_waf`, cumulative
+`device_write_multiplier`, and `sample_status`. Some NVMe controllers do not
+refresh FDP stats on every sample interval; when both observed deltas are zero,
+the delta and WAF fields are left blank and `sample_status` is `stale`. The
+default interval is 300 seconds; pass `--sample-interval-seconds 0` to disable
+periodic sampling.
 
 If a vendor media/NAND write counter is configured, `summary.json` includes
 `media_write_bytes_delta` and `waf`. Without that counter, WAF is marked
