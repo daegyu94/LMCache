@@ -37,6 +37,7 @@ DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
 DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
+DEFAULT_NOISY_NEIGHBOR_RUNTIME_SECONDS = 315360000
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
     "timestamp",
@@ -103,6 +104,15 @@ class ReplayRunResult:
     records_failed: int | None
     started_at: str
     ended_at: str
+
+
+@dataclass
+class NoisyNeighborPlan:
+    command: list[str]
+    log_path: str
+    offset_bytes: int
+    size_bytes: int
+    device_capacity_bytes: int
 
 
 def _utc_now() -> str:
@@ -735,6 +745,7 @@ def print_dry_run(
     target_write_multiplier: float | None,
     target_write_bytes: int | None,
     target_device_capacity_bytes: int | None,
+    noisy_neighbor_plan: NoisyNeighborPlan | None,
 ) -> list[str]:
     lines = [
         f"mode={mode}",
@@ -744,6 +755,11 @@ def print_dry_run(
         "",
     ]
     total_preview_iterations = warmup_iterations + (iterations or 1)
+    if noisy_neighbor_plan is not None:
+        lines.append("noisy_neighbor=true")
+        lines.append(f"noisy_neighbor_offset_bytes={noisy_neighbor_plan.offset_bytes}")
+        lines.append(f"noisy_neighbor_size_bytes={noisy_neighbor_plan.size_bytes}")
+        lines.append(command_to_text(noisy_neighbor_plan.command))
     if target_write_bytes is not None:
         lines.append(f"target_write_multiplier={target_write_multiplier}")
         lines.append(f"target_device_capacity_bytes={target_device_capacity_bytes}")
@@ -753,6 +769,8 @@ def print_dry_run(
         lines.append(f"duration_seconds={duration_seconds}")
         total_preview_iterations = warmup_iterations + 1
     commands: list[str] = []
+    if noisy_neighbor_plan is not None:
+        commands.append(command_to_text(noisy_neighbor_plan.command))
     for worker in workers:
         lines.append(
             "window "
@@ -858,6 +876,100 @@ def detect_block_device_capacity_bytes(block_device_path: str | None) -> int | N
         if parsed is not None and parsed > 0:
             return parsed
     return None
+
+
+def _resolve_fio_binary() -> str:
+    candidates = [os.path.expanduser("~/.local/bin/fio"), shutil.which("fio")]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ValueError("fio binary not found for noisy-neighbor writes")
+
+
+def build_noisy_neighbor_plan(
+    config: dict[str, Any],
+    workers: list[WorkerSpec],
+    *,
+    output_dir: str,
+) -> NoisyNeighborPlan:
+    block_device_path = config.get("block_device_path")
+    if not block_device_path:
+        raise ValueError("noisy-neighbor mode requires config.block_device_path")
+
+    device_capacity_bytes = detect_block_device_capacity_bytes(str(block_device_path))
+    if device_capacity_bytes is None or device_capacity_bytes <= 0:
+        raise ValueError(
+            f"could not detect block device capacity for {block_device_path!r}"
+        )
+
+    replay_end = max(
+        (worker.base_offset_bytes + worker.capacity_bytes for worker in workers),
+        default=0,
+    )
+    block_align = int(config.get("block_align", 4096))
+    offset_bytes = _align_up(replay_end, block_align)
+    if offset_bytes >= device_capacity_bytes:
+        raise ValueError(
+            "noisy-neighbor mode requires free device space after the replay windows"
+        )
+
+    size_bytes = device_capacity_bytes - offset_bytes
+    size_bytes -= size_bytes % block_align
+    if size_bytes < block_align:
+        raise ValueError(
+            "noisy-neighbor region is smaller than one aligned write block"
+        )
+
+    command = [
+        _resolve_fio_binary(),
+        "--name=noisy_neighbor",
+        f"--filename={block_device_path}",
+        "--rw=randwrite",
+        f"--bs={block_align}",
+        f"--blockalign={block_align}",
+        "--direct=1",
+        "--ioengine=io_uring",
+        "--iodepth=64",
+        "--numjobs=1",
+        "--norandommap=1",
+        "--randrepeat=0",
+        f"--offset={offset_bytes}",
+        f"--size={size_bytes}",
+        "--time_based=1",
+        f"--runtime={DEFAULT_NOISY_NEIGHBOR_RUNTIME_SECONDS}",
+    ]
+    return NoisyNeighborPlan(
+        command=command,
+        log_path=os.path.join(output_dir, "noisy_neighbor.log"),
+        offset_bytes=offset_bytes,
+        size_bytes=size_bytes,
+        device_capacity_bytes=device_capacity_bytes,
+    )
+
+
+def start_noisy_neighbor(plan: NoisyNeighborPlan) -> subprocess.Popen[str]:
+    os.makedirs(os.path.dirname(plan.log_path), exist_ok=True)
+    with open(plan.log_path, "w") as log_fh:
+        log_fh.write(f"command: {command_to_text(plan.command)}\n")
+        log_fh.flush()
+        return subprocess.Popen(
+            plan.command,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+
+def stop_noisy_neighbor(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def extract_host_write_bytes(smart_payload: Any) -> int | None:
@@ -1586,6 +1698,7 @@ def build_summary(
     target_write_multiplier: float | None = None,
     target_device_capacity_bytes: int | None = None,
     target_write_bytes: int | None = None,
+    noisy_neighbor_plan: NoisyNeighborPlan | None = None,
 ) -> dict[str, Any]:
     host_delta = _delta(
         measurement_after,
@@ -1675,6 +1788,15 @@ def build_summary(
         "target_write_multiplier": target_write_multiplier,
         "target_device_capacity_bytes": target_device_capacity_bytes,
         "target_write_bytes": target_write_bytes,
+        "with_noisy_neighbor": noisy_neighbor_plan is not None,
+        "noisy_neighbor_offset_bytes": (
+            noisy_neighbor_plan.offset_bytes
+            if noisy_neighbor_plan is not None
+            else None
+        ),
+        "noisy_neighbor_size_bytes": (
+            noisy_neighbor_plan.size_bytes if noisy_neighbor_plan is not None else None
+        ),
         "workers": worker_summaries,
         "warnings": warnings,
     }
@@ -1696,6 +1818,9 @@ def build_summary_md(summary: dict[str, Any]) -> str:
         f"- target_device_capacity_bytes: "
         f"{summary.get('target_device_capacity_bytes')}",
         f"- target_write_multiplier: {summary.get('target_write_multiplier')}",
+        f"- with_noisy_neighbor: {summary.get('with_noisy_neighbor')}",
+        f"- noisy_neighbor_offset_bytes: {summary.get('noisy_neighbor_offset_bytes')}",
+        f"- noisy_neighbor_size_bytes: {summary.get('noisy_neighbor_size_bytes')}",
         f"- waf: {summary['waf']}",
         f"- waf_status: {summary['waf_status']}",
         f"- fdp_stats_host_write_bytes: {summary.get('fdp_stats_host_write_bytes')}",
@@ -1761,11 +1886,14 @@ def _all_planned_commands(
     measurement_iterations: int | None,
     duration_seconds: int | None,
     target_write_bytes: int | None,
+    noisy_neighbor_plan: NoisyNeighborPlan | None,
 ) -> list[str]:
     count = warmup_iterations + (measurement_iterations or 1)
     if target_write_bytes is not None or duration_seconds is not None:
         count = warmup_iterations + 1
     commands = []
+    if noisy_neighbor_plan is not None:
+        commands.append(command_to_text(noisy_neighbor_plan.command))
     for iteration in range(count):
         phase = "warmup" if iteration < warmup_iterations else "measurement"
         for worker in workers:
@@ -1820,6 +1948,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
         help="Host-write target polling interval in seconds.",
     )
+    parser.add_argument("--with-noisy-neighbor", action="store_true")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
     parser.add_argument("--dry-run", action="store_true")
@@ -1842,6 +1971,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--sample-interval-seconds must be >= 0")
     if args.target_write_multiplier is not None and args.target_write_multiplier <= 0:
         raise ValueError("--target-write-multiplier must be > 0")
+    if args.with_noisy_neighbor and args.target_write_multiplier is not None:
+        raise ValueError(
+            "--with-noisy-neighbor cannot be combined with --target-write-multiplier"
+        )
     if args.target_write_poll_seconds <= 0:
         raise ValueError("--target-write-poll-seconds must be > 0")
     return args
@@ -1861,6 +1994,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     workers = expand_workers(config, args.mode, run_id=args.run_id)
     warnings = attach_trace_footprints(workers, config, dry_run=args.dry_run)
+    noisy_neighbor_plan = None
+    if args.with_noisy_neighbor:
+        noisy_neighbor_plan = build_noisy_neighbor_plan(
+            config,
+            workers,
+            output_dir=output_dir,
+        )
+        warnings.append(
+            "with_noisy_neighbor enabled: WAF and host/media write deltas "
+            "include background randwrite traffic"
+        )
     target_multiplier = args.target_write_multiplier
     target_device_capacity_bytes = None
     target_write_bytes = None
@@ -1890,6 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
             target_write_multiplier=target_multiplier,
             target_write_bytes=target_write_bytes,
             target_device_capacity_bytes=target_device_capacity_bytes,
+            noisy_neighbor_plan=noisy_neighbor_plan,
         )
         _write_initial_outputs(
             output_dir=output_dir,
@@ -1912,6 +2057,7 @@ def main(argv: list[str] | None = None) -> int:
         measurement_iterations=args.iterations,
         duration_seconds=args.duration_seconds,
         target_write_bytes=target_write_bytes,
+        noisy_neighbor_plan=noisy_neighbor_plan,
     )
     _write_initial_outputs(
         output_dir=output_dir,
@@ -1951,6 +2097,10 @@ def main(argv: list[str] | None = None) -> int:
                 "target host-write mode requires nvme smart-log host counter"
             )
 
+    noisy_neighbor_proc = None
+    if noisy_neighbor_plan is not None:
+        noisy_neighbor_proc = start_noisy_neighbor(noisy_neighbor_plan)
+
     sampler_stop, sampler_thread = start_waf_sampler(
         config=config,
         output_dir=output_dir,
@@ -1978,6 +2128,7 @@ def main(argv: list[str] | None = None) -> int:
             sampler_stop.set()
         if sampler_thread is not None:
             sampler_thread.join(timeout=10)
+        stop_noisy_neighbor(noisy_neighbor_proc)
 
     measurement_after = capture_measurement(config, "after_measurement")
     write_json(os.path.join(output_dir, "measurement_after.json"), measurement_after)
@@ -2001,6 +2152,7 @@ def main(argv: list[str] | None = None) -> int:
         target_write_multiplier=target_multiplier,
         target_device_capacity_bytes=target_device_capacity_bytes,
         target_write_bytes=target_write_bytes,
+        noisy_neighbor_plan=noisy_neighbor_plan,
     )
     write_json(os.path.join(output_dir, "summary.json"), summary)
     write_text(os.path.join(output_dir, "summary.md"), build_summary_md(summary))
