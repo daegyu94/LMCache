@@ -23,6 +23,7 @@ measurement:
   enabled: true
   collect_nvme_smart: true
   collect_fdp_logs: true
+  fdp_stats_backend: auto  # auto, xnvme, or nvme
   vendor_media_write_command: null
   # Optional user-provided shell command returning media/NAND bytes written.
   # Example:

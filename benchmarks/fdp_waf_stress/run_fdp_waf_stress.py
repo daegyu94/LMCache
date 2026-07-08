@@ -873,6 +873,118 @@ def capture_host_write_bytes(config: dict[str, Any]) -> int | None:
     return extract_host_write_bytes(smart.get("json"))
 
 
+def extract_fdp_stats_bytes(payload: Any) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    if payload is None:
+        return stats
+    if isinstance(payload, dict):
+        field_names = {
+            "host_write_bytes": (
+                "host_write_bytes",
+                "host_bytes_with_metadata_written",
+                "hbmw",
+            ),
+            "media_write_bytes": (
+                "media_write_bytes",
+                "media_bytes_with_metadata_written",
+                "mbmw",
+            ),
+            "media_bytes_erased": (
+                "media_bytes_erased",
+                "mbe",
+            ),
+        }
+        for output_key, input_keys in field_names.items():
+            for input_key in input_keys:
+                parsed = _safe_int(payload.get(input_key))
+                if parsed is not None:
+                    stats[output_key] = parsed
+                    break
+        for value in payload.values():
+            nested = extract_fdp_stats_bytes(value)
+            stats = {**nested, **stats}
+        return stats
+    if isinstance(payload, list):
+        for item in payload:
+            stats.update(extract_fdp_stats_bytes(item))
+        return stats
+    if not isinstance(payload, str):
+        return stats
+
+    patterns = {
+        "host_write_bytes": (
+            r"Host Bytes with Metadata Written \(HBMW\):\s*(\d[\d,_]*)",
+            r"^\s*hbmw:\s*\[\s*(\d[\d,_]*)",
+        ),
+        "media_write_bytes": (
+            r"Media Bytes with Metadata Written \(MBMW\):\s*(\d[\d,_]*)",
+            r"^\s*mbmw:\s*\[\s*(\d[\d,_]*)",
+        ),
+        "media_bytes_erased": (
+            r"Media Bytes Erased \(MBE\):\s*(\d[\d,_]*)",
+            r"^\s*mbe:\s*\[\s*(\d[\d,_]*)",
+        ),
+    }
+    for output_key, regexes in patterns.items():
+        for regex in regexes:
+            match = re.search(regex, payload, re.MULTILINE)
+            if match:
+                parsed = _safe_int(match.group(1))
+                if parsed is not None:
+                    stats[output_key] = parsed
+                    break
+    return stats
+
+
+def _capture_xnvme_fdp_stats(block_device: str) -> dict[str, Any] | None:
+    if not shutil.which("xnvme"):
+        return None
+    result = run_capture(
+        ["xnvme", "log-fdp-stats", str(block_device), "--lsi", "0x1"]
+    )
+    if result.get("returncode") == 0 and extract_fdp_stats_bytes(
+        result.get("stdout")
+    ):
+        result["source"] = "xnvme log-fdp-stats"
+        return result
+    return None
+
+
+def _capture_nvme_cli_fdp_stats(block_device: str) -> dict[str, Any] | None:
+    if not shutil.which("nvme"):
+        return None
+    result = run_capture(
+        ["sudo", "-n", "nvme", "fdp", "stats", str(block_device), "-e", "1"]
+    )
+    result["source"] = "nvme fdp stats"
+    return result
+
+
+def capture_fdp_stats(config: dict[str, Any]) -> dict[str, Any] | None:
+    block_device = config.get("block_device_path")
+    if not block_device:
+        return None
+    measurement_cfg = config.get("measurement", {})
+    command = measurement_cfg.get("fdp_stats_command")
+    if command:
+        return run_capture(str(command), shell=True)
+
+    backend = str(measurement_cfg.get("fdp_stats_backend", "auto")).lower()
+    if backend not in {"auto", "xnvme", "nvme"}:
+        raise ValueError(
+            "measurement.fdp_stats_backend must be one of: auto, xnvme, nvme"
+        )
+
+    if backend == "xnvme":
+        return _capture_xnvme_fdp_stats(str(block_device))
+    if backend == "nvme":
+        return _capture_nvme_cli_fdp_stats(str(block_device))
+
+    return _capture_xnvme_fdp_stats(str(block_device)) or _capture_nvme_cli_fdp_stats(
+        str(block_device)
+    )
+
+
 def extract_media_write_bytes(payload: Any) -> int | None:
     if payload is None:
         return None
@@ -925,42 +1037,60 @@ def capture_measurement(config: dict[str, Any], label: str) -> dict[str, Any]:
         else:
             result["warnings"].append("nvme CLI or block_device_path unavailable")
 
+    fdp_stats = capture_fdp_stats(config)
+    if fdp_stats is not None:
+        result.setdefault("fdp_logs", {})["stats"] = fdp_stats
+        parsed_fdp_stats = extract_fdp_stats_bytes(fdp_stats.get("json"))
+        if not parsed_fdp_stats:
+            parsed_fdp_stats = extract_fdp_stats_bytes(fdp_stats.get("stdout"))
+        if "host_write_bytes" in parsed_fdp_stats:
+            result["host_write_bytes"] = parsed_fdp_stats["host_write_bytes"]
+        if "media_write_bytes" in parsed_fdp_stats:
+            result["media_write_bytes"] = parsed_fdp_stats["media_write_bytes"]
+        if "media_bytes_erased" in parsed_fdp_stats:
+            result["media_bytes_erased"] = parsed_fdp_stats["media_bytes_erased"]
+    else:
+        result["warnings"].append("FDP stats unavailable; skipped FDP stats")
+
     vendor_command = measurement_cfg.get("vendor_media_write_command")
     if vendor_command:
         vendor = run_capture(str(vendor_command), shell=True)
         result["vendor_media_write"] = vendor
         parsed_json = vendor.get("json")
-        media_bytes = extract_media_write_bytes(parsed_json)
+        parsed_fdp_stats = extract_fdp_stats_bytes(parsed_json)
+        if "host_write_bytes" in parsed_fdp_stats:
+            result["host_write_bytes"] = parsed_fdp_stats["host_write_bytes"]
+        media_bytes = parsed_fdp_stats.get("media_write_bytes")
+        if media_bytes is None:
+            media_bytes = extract_media_write_bytes(parsed_json)
         if media_bytes is None:
             media_bytes = extract_media_write_bytes(vendor.get("stdout"))
-        result["media_write_bytes"] = media_bytes
-    else:
+        if media_bytes is not None:
+            result["media_write_bytes"] = media_bytes
+    elif "media_write_bytes" not in result:
         result["media_write_bytes"] = None
         result["warnings"].append("vendor media-write command not configured")
 
     if bool(measurement_cfg.get("collect_fdp_logs", True)):
         if shutil.which("xnvme") and block_device:
-            result["fdp_logs"] = {
-                "stats": run_capture(
-                    ["xnvme", "log-fdp-stats", str(block_device), "--lsi", "0x1"]
-                ),
-                "ruhu": run_capture(
-                    [
-                        "xnvme",
-                        "log-ruhu",
-                        str(block_device),
-                        "--lsi",
-                        "0x1",
-                        "--limit",
-                        "16",
-                    ]
-                ),
-                "ruhs": run_capture(
-                    ["xnvme", "fdp-ruhs", str(block_device), "--limit", "16"]
-                ),
-            }
-        else:
-            result["warnings"].append("xnvme unavailable; skipped FDP logs")
+            fdp_logs = result.setdefault("fdp_logs", {})
+            fdp_logs.setdefault("stats", fdp_stats)
+            fdp_logs["ruhu"] = run_capture(
+                [
+                    "xnvme",
+                    "log-ruhu",
+                    str(block_device),
+                    "--lsi",
+                    "0x1",
+                    "--limit",
+                    "16",
+                ]
+            )
+            fdp_logs["ruhs"] = run_capture(
+                ["xnvme", "fdp-ruhs", str(block_device), "--limit", "16"]
+            )
+        elif not shutil.which("nvme") or not block_device:
+            result["warnings"].append("FDP log tools unavailable; skipped FDP logs")
 
     return result
 
