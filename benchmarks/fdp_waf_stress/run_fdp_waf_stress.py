@@ -1602,6 +1602,21 @@ def build_summary(
     elif media_delta is None:
         waf_status = "unavailable: media/NAND write counter missing"
 
+    fdp_stats_host_write_bytes = _safe_int(measurement_after.get("host_write_bytes"))
+    fdp_stats_media_write_bytes = _safe_int(measurement_after.get("media_write_bytes"))
+    fdp_stats_cumulative_waf = None
+    if (
+        fdp_stats_host_write_bytes is not None
+        and fdp_stats_host_write_bytes > 0
+        and fdp_stats_media_write_bytes is not None
+    ):
+        fdp_stats_cumulative_waf = (
+            fdp_stats_media_write_bytes / fdp_stats_host_write_bytes
+        )
+    if waf is None and fdp_stats_cumulative_waf is not None:
+        waf = fdp_stats_cumulative_waf
+        waf_status = "available: cumulative FDP stats"
+
     measurement_results = [
         result for result in run_results if result.phase == "measurement"
     ]
@@ -1647,6 +1662,9 @@ def build_summary(
         "media_write_bytes_delta": media_delta,
         "waf": waf,
         "waf_status": waf_status,
+        "fdp_stats_host_write_bytes": fdp_stats_host_write_bytes,
+        "fdp_stats_media_write_bytes": fdp_stats_media_write_bytes,
+        "fdp_stats_cumulative_waf": fdp_stats_cumulative_waf,
         "target_write_multiplier": target_write_multiplier,
         "target_device_capacity_bytes": target_device_capacity_bytes,
         "target_write_bytes": target_write_bytes,
@@ -1668,11 +1686,14 @@ def build_summary_md(summary: dict[str, Any]) -> str:
         f"- host_write_bytes_delta: {summary['host_write_bytes_delta']}",
         f"- media_write_bytes_delta: {summary['media_write_bytes_delta']}",
         f"- target_write_bytes: {summary.get('target_write_bytes')}",
-        f"- target_device_capacity_bytes: {summary.get('target_device_capacity_bytes')}",
-        f"- target_write_multiplier: "
-        f"{summary.get('target_write_multiplier')}",
+        f"- target_device_capacity_bytes: "
+        f"{summary.get('target_device_capacity_bytes')}",
+        f"- target_write_multiplier: {summary.get('target_write_multiplier')}",
         f"- waf: {summary['waf']}",
         f"- waf_status: {summary['waf_status']}",
+        f"- fdp_stats_host_write_bytes: {summary.get('fdp_stats_host_write_bytes')}",
+        f"- fdp_stats_media_write_bytes: {summary.get('fdp_stats_media_write_bytes')}",
+        f"- fdp_stats_cumulative_waf: {summary.get('fdp_stats_cumulative_waf')}",
         "",
         "## Workers",
         "",
