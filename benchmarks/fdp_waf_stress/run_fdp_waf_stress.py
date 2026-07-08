@@ -40,21 +40,17 @@ DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
     "timestamp",
-    "host_write_bytes",
-    "media_write_bytes",
-    "waf",
-    "cumulative_host_write_bytes",
-    "cumulative_media_write_bytes",
-    "cumulative_waf",
+    "fdp_host_write_bytes",
+    "fdp_media_write_bytes",
+    "fdp_waf",
+    "device_write_multiplier",
 )
 WAF_SAMPLE_COLUMN_WIDTHS = {
     "timestamp": 20,
-    "host_write_bytes": 18,
-    "media_write_bytes": 18,
-    "waf": 10,
-    "cumulative_host_write_bytes": 28,
-    "cumulative_media_write_bytes": 28,
-    "cumulative_waf": 14,
+    "fdp_host_write_bytes": 22,
+    "fdp_media_write_bytes": 22,
+    "fdp_waf": 10,
+    "device_write_multiplier": 24,
 }
 
 
@@ -1152,22 +1148,28 @@ def build_waf_sample(
     sample: dict[str, Any],
     baseline: dict[str, Any],
     previous: dict[str, Any],
+    target_device_capacity_bytes: int | None = None,
 ) -> dict[str, Any]:
-    interval_host_delta = _delta(sample, previous, "host_write_bytes")
-    interval_media_delta = _delta(sample, previous, "media_write_bytes")
+    del previous
     cumulative_host_delta = _delta(sample, baseline, "host_write_bytes")
-    cumulative_media_delta = _delta(sample, baseline, "media_write_bytes")
+    device_write_multiplier = None
+    if (
+        cumulative_host_delta is not None
+        and target_device_capacity_bytes is not None
+        and target_device_capacity_bytes > 0
+    ):
+        device_write_multiplier = cumulative_host_delta / target_device_capacity_bytes
+    fdp_host_write_bytes = _safe_int(sample.get("host_write_bytes"))
+    fdp_media_write_bytes = _safe_int(sample.get("media_write_bytes"))
     return {
         "timestamp": sample.get("captured_at"),
-        "host_write_bytes": interval_host_delta,
-        "media_write_bytes": interval_media_delta,
-        "waf": _waf_from_deltas(interval_host_delta, interval_media_delta),
-        "cumulative_host_write_bytes": cumulative_host_delta,
-        "cumulative_media_write_bytes": cumulative_media_delta,
-        "cumulative_waf": _waf_from_deltas(
-            cumulative_host_delta,
-            cumulative_media_delta,
+        "fdp_host_write_bytes": fdp_host_write_bytes,
+        "fdp_media_write_bytes": fdp_media_write_bytes,
+        "fdp_waf": _waf_from_deltas(
+            fdp_host_write_bytes,
+            fdp_media_write_bytes,
         ),
+        "device_write_multiplier": device_write_multiplier,
     }
 
 
@@ -1192,6 +1194,7 @@ def start_waf_sampler(
     output_dir: str,
     baseline: dict[str, Any],
     interval_seconds: int,
+    target_device_capacity_bytes: int | None = None,
 ) -> tuple[threading.Event | None, threading.Thread | None]:
     if interval_seconds <= 0:
         return None, None
@@ -1213,6 +1216,7 @@ def start_waf_sampler(
                         sample=sample,
                         baseline=baseline,
                         previous=previous,
+                        target_device_capacity_bytes=target_device_capacity_bytes,
                     )
                 )
                 + "\n",
@@ -1952,6 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=output_dir,
         baseline=measurement_after_warmup,
         interval_seconds=args.sample_interval_seconds,
+        target_device_capacity_bytes=target_device_capacity_bytes,
     )
     try:
         measurement_results, completed_measurement_iterations = run_iterations(
