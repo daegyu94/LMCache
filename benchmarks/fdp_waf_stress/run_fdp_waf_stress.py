@@ -322,10 +322,7 @@ def resolve_output_dir(
 ) -> str:
     if output_dir:
         return output_dir
-    root = (
-        config.get("global", {}).get("output_root")
-        or DEFAULT_OUTPUT_ROOT
-    )
+    root = config.get("global", {}).get("output_root") or DEFAULT_OUTPUT_ROOT
     return os.path.join(str(root), f"{run_id}-{mode}")
 
 
@@ -457,10 +454,7 @@ def make_salt_suffix(
     worker: WorkerSpec,
     iteration: int,
 ) -> str:
-    return (
-        f"{run_id}.{mode}.{worker.name}.w{worker.worker_index}."
-        f"iter_{iteration:04d}"
-    )
+    return f"{run_id}.{mode}.{worker.name}.w{worker.worker_index}.iter_{iteration:04d}"
 
 
 def _validate_alignment(name: str, value: int, block_align: int) -> None:
@@ -749,10 +743,7 @@ def print_dry_run(
     ]
     total_preview_iterations = warmup_iterations + (iterations or 1)
     if target_write_bytes is not None:
-        lines.append(
-            "target_write_multiplier="
-            f"{target_write_multiplier}"
-        )
+        lines.append(f"target_write_multiplier={target_write_multiplier}")
         lines.append(f"target_device_capacity_bytes={target_device_capacity_bytes}")
         lines.append(f"target_write_bytes={target_write_bytes}")
         total_preview_iterations = warmup_iterations + 1
@@ -951,12 +942,8 @@ def extract_fdp_stats_bytes(payload: Any) -> dict[str, int]:
 def _capture_xnvme_fdp_stats(block_device: str) -> dict[str, Any] | None:
     if not shutil.which("xnvme"):
         return None
-    result = run_capture(
-        ["xnvme", "log-fdp-stats", str(block_device), "--lsi", "0x1"]
-    )
-    if result.get("returncode") == 0 and extract_fdp_stats_bytes(
-        result.get("stdout")
-    ):
+    result = run_capture(["xnvme", "log-fdp-stats", str(block_device), "--lsi", "0x1"])
+    if result.get("returncode") == 0 and extract_fdp_stats_bytes(result.get("stdout")):
         result["source"] = "xnvme log-fdp-stats"
         return result
     return None
@@ -1529,16 +1516,14 @@ def run_iterations(
         )
         all_results.extend(target_results)
     elif duration_seconds is not None:
-        duration_results, completed_measurement_iterations = (
-            run_workers_until_deadline(
-                workers,
-                config,
-                mode=mode,
-                run_id=run_id,
-                output_dir=output_dir,
-                start_iteration=measurement_start_iter,
-                duration_seconds=duration_seconds,
-            )
+        duration_results, completed_measurement_iterations = run_workers_until_deadline(
+            workers,
+            config,
+            mode=mode,
+            run_id=run_id,
+            output_dir=output_dir,
+            start_iteration=measurement_start_iter,
+            duration_seconds=duration_seconds,
         )
         all_results.extend(duration_results)
     else:
@@ -1837,10 +1822,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
     if args.sample_interval_seconds < 0:
         raise ValueError("--sample-interval-seconds must be >= 0")
-    if (
-        args.target_write_multiplier is not None
-        and args.target_write_multiplier <= 0
-    ):
+    if args.target_write_multiplier is not None and args.target_write_multiplier <= 0:
         raise ValueError("--target-write-multiplier must be > 0")
     if args.target_write_poll_seconds <= 0:
         raise ValueError("--target-write-poll-seconds must be > 0")
