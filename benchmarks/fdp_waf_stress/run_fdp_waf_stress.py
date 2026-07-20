@@ -46,7 +46,6 @@ WAF_SAMPLE_TSV_COLUMNS = (
     "fdp_host_write_mb",
     "fdp_media_write_mb",
     "fdp_waf",
-    "device_write_multiplier",
     "sample_status",
 )
 WAF_SAMPLE_COLUMN_WIDTHS = {
@@ -54,7 +53,6 @@ WAF_SAMPLE_COLUMN_WIDTHS = {
     "fdp_host_write_mb": 18,
     "fdp_media_write_mb": 18,
     "fdp_waf": 10,
-    "device_write_multiplier": 24,
     "sample_status": 14,
 }
 
@@ -1093,6 +1091,36 @@ def capture_host_write_bytes(config: dict[str, Any]) -> int | None:
     return extract_host_write_bytes(smart.get("json"))
 
 
+def _format_binary_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units[:-1]:
+        if amount < 1024:
+            return f"{amount:.2f} {unit}"
+        amount /= 1024
+    return f"{amount:.2f} {units[-1]}"
+
+
+def format_target_write_progress(
+    written_bytes: int,
+    target_write_bytes: int,
+    device_capacity_bytes: int,
+    *,
+    width: int = 30,
+) -> str:
+    written = max(0, int(written_bytes))
+    target = max(1, int(target_write_bytes))
+    capacity = max(1, int(device_capacity_bytes))
+    fraction = min(1.0, written / target)
+    filled = min(width, int(fraction * width))
+    bar = "#" * filled + "-" * (width - filled)
+    return (
+        f"Host write [{bar}] {fraction * 100:6.2f}%  "
+        f"{_format_binary_bytes(written)} / {_format_binary_bytes(target)}  "
+        f"({written / capacity:.3f}x / {target / capacity:.3f}x)"
+    )
+
+
 def extract_fdp_stats_bytes(payload: Any) -> dict[str, int]:
     stats: dict[str, int] = {}
     if payload is None:
@@ -1658,6 +1686,7 @@ def run_workers_until_host_write_target(
     start_iteration: int,
     baseline_host_write_bytes: int,
     target_write_bytes: int,
+    device_capacity_bytes: int,
     poll_interval_seconds: int,
 ) -> tuple[list[ReplayRunResult], int]:
     stop_event = threading.Event()
@@ -1665,14 +1694,30 @@ def run_workers_until_host_write_target(
     poll_interval = max(1, int(poll_interval_seconds))
 
     def _monitor_loop() -> None:
-        while not stop_event.wait(poll_interval):
-            current = capture_host_write_bytes(config)
-            if current is None:
-                continue
-            if current - baseline_host_write_bytes >= target_write_bytes:
-                stop_event.set()
-                active_processes.terminate_all()
-                return
+        progress_printed = False
+        try:
+            while not stop_event.is_set():
+                current = capture_host_write_bytes(config)
+                if current is not None:
+                    written_bytes = max(0, current - baseline_host_write_bytes)
+                    progress = format_target_write_progress(
+                        written_bytes,
+                        target_write_bytes,
+                        device_capacity_bytes,
+                    )
+                    sys.stdout.write(f"\r{progress}")
+                    sys.stdout.flush()
+                    progress_printed = True
+                    if written_bytes >= target_write_bytes:
+                        stop_event.set()
+                        active_processes.terminate_all()
+                        return
+                if stop_event.wait(poll_interval):
+                    return
+        finally:
+            if progress_printed:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
     def _worker_loop(worker: WorkerSpec) -> list[ReplayRunResult]:
         worker_results: list[ReplayRunResult] = []
@@ -1730,6 +1775,7 @@ def run_iterations(
     duration_seconds: int | None,
     target_write_bytes: int | None = None,
     target_write_baseline_bytes: int | None = None,
+    target_device_capacity_bytes: int | None = None,
     target_write_poll_seconds: int = DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
     start_iteration: int = 0,
 ) -> tuple[list[ReplayRunResult], int]:
@@ -1762,6 +1808,9 @@ def run_iterations(
                 start_iteration=measurement_start_iter,
                 baseline_host_write_bytes=target_write_baseline_bytes,
                 target_write_bytes=target_write_bytes,
+                device_capacity_bytes=(
+                    target_device_capacity_bytes or target_write_bytes
+                ),
                 poll_interval_seconds=target_write_poll_seconds,
             )
         )
@@ -2274,6 +2323,7 @@ def main(argv: list[str] | None = None) -> int:
             duration_seconds=args.duration_seconds,
             target_write_bytes=target_write_bytes,
             target_write_baseline_bytes=target_write_baseline,
+            target_device_capacity_bytes=target_device_capacity_bytes,
             target_write_poll_seconds=args.target_write_poll_seconds,
             start_iteration=args.warmup_iterations,
         )

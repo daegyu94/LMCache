@@ -20,6 +20,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     expand_workers,
     extract_host_write_bytes,
     extract_media_write_bytes,
+    format_target_write_progress,
     main,
     parse_args,
     run_single_worker_replay,
@@ -167,7 +168,7 @@ def test_measurement_parser_fallback_without_vendor_media_counter():
     assert extract_media_write_bytes({"nested": {"nand_write_bytes": "1234"}}) == 1234
 
 
-def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
+def test_waf_sample_tsv_uses_interval_deltas_without_multiplier_column():
     baseline = {
         "captured_at": "2026-07-07T00:00:00+00:00",
         "host_write_bytes": 1_000_000_000,
@@ -203,9 +204,39 @@ def test_waf_sample_tsv_uses_interval_deltas_and_cumulative_multiplier():
         "500.00",
         "750.00",
         "1.500",
-        "0.500",
         "updated",
     ]
+
+
+def test_target_write_progress_shows_percent_amount_and_multiplier():
+    gib = 1024**3
+
+    progress = format_target_write_progress(
+        written_bytes=3 * gib,
+        target_write_bytes=6 * gib,
+        device_capacity_bytes=2 * gib,
+        width=10,
+    )
+
+    assert "[#####-----]" in progress
+    assert "50.00%" in progress
+    assert "3.00 GiB / 6.00 GiB" in progress
+    assert "(1.500x / 3.000x)" in progress
+
+
+def test_target_write_progress_caps_bar_at_100_percent_after_overshoot():
+    gib = 1024**3
+
+    progress = format_target_write_progress(
+        written_bytes=7 * gib,
+        target_write_bytes=6 * gib,
+        device_capacity_bytes=2 * gib,
+        width=10,
+    )
+
+    assert "[##########]" in progress
+    assert "100.00%" in progress
+    assert "7.00 GiB / 6.00 GiB" in progress
 
 
 def test_waf_sample_marks_stale_interval_when_deltas_are_zero():
