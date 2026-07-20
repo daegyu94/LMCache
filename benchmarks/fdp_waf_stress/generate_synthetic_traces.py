@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 # Standard
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 import argparse
@@ -48,7 +48,6 @@ from lmcache.v1.mp_observability.trace.format import (  # noqa: E402
     encode_header,
     encode_record,
 )
-
 
 DEFAULT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_DEVICE_PATH = "/dev/ng1n1"
@@ -209,7 +208,7 @@ def _recipes(scale: str, ruh_count: int) -> list[TraceRecipe]:
     if ruh_count < 128:
         raise ValueError("--ruh-count must be at least 128 for the 128-RUH config")
 
-    stress = scale == "stress"
+    stress = scale != "smoke"
     return [
         TraceRecipe(
             name="llama8b_chat_chunk256",
@@ -297,6 +296,66 @@ def _recipes(scale: str, ruh_count: int) -> list[TraceRecipe]:
             notes="many small objects to pressure checkpoint metadata",
         ),
     ]
+
+
+def _scale_recipes(recipes: list[TraceRecipe], scale: int) -> list[TraceRecipe]:
+    """Scale stress recipes without changing individual operation sizes."""
+    return [
+        replace(
+            recipe,
+            store_batches=recipe.store_batches * scale,
+            prefetch_batches=recipe.prefetch_batches * scale,
+            capacity_bytes=recipe.capacity_bytes * scale,
+        )
+        for recipe in recipes
+    ]
+
+
+def _parse_scale(value: str) -> tuple[str, int, bool]:
+    """Parse a legacy preset or a positive stress scaling factor."""
+    normalized = value.lower()
+    if normalized == "smoke":
+        return normalized, 1, True
+    if normalized == "stress":
+        return normalized, 1, False
+    try:
+        scale = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--scale must be smoke, stress, or a positive integer"
+        ) from exc
+    if scale < 1:
+        raise argparse.ArgumentTypeError("--scale must be >= 1")
+    return f"{scale}x", scale, False
+
+
+def _packed_layout(recipes: list[TraceRecipe]) -> dict[str, Any]:
+    """Return the contiguous packed LBA windows for generated workloads."""
+    base_offset = DEFAULT_START_OFFSET_BYTES
+    workers: list[dict[str, Any]] = []
+    for recipe in recipes:
+        for worker_index in range(recipe.concurrency):
+            end_offset = base_offset + recipe.capacity_bytes
+            workers.append(
+                {
+                    "name": recipe.name,
+                    "worker_index": worker_index,
+                    "base_offset_bytes": base_offset,
+                    "end_offset_bytes": end_offset,
+                    "capacity_bytes": recipe.capacity_bytes,
+                }
+            )
+            base_offset = end_offset
+    return {
+        "allocation": "packed",
+        "worker_count": len(workers),
+        "capacity_sum_bytes": sum(worker["capacity_bytes"] for worker in workers),
+        "start_offset_bytes": DEFAULT_START_OFFSET_BYTES,
+        "end_offset_bytes": base_offset,
+        "span_bytes": base_offset - DEFAULT_START_OFFSET_BYTES,
+        "alignment_padding_bytes": 0,
+        "workers": workers,
+    }
 
 
 def generate_trace(
@@ -399,12 +458,15 @@ def build_config(
     trace_dir: str,
     output_root: str,
     ruh_count: int,
+    device_path: str,
+    block_device_path: str,
+    meta_total_bytes: int,
 ) -> dict[str, Any]:
     if ruh_count < 128:
         raise ValueError("generated 128-RUH config requires ruh_count >= 128")
     return {
-        "device_path": DEFAULT_DEVICE_PATH,
-        "block_device_path": DEFAULT_BLOCK_DEVICE_PATH,
+        "device_path": device_path,
+        "block_device_path": block_device_path,
         "block_align": 4096,
         "global": {
             "l2_store_policy": "skip_l1",
@@ -412,7 +474,7 @@ def build_config(
             "disable_metrics": True,
             "quiet": True,
             "l1_align_bytes": 4096,
-            "meta_total_bytes": DEFAULT_META_TOTAL_BYTES,
+            "meta_total_bytes": meta_total_bytes,
             "use_odirect": False,
             "use_uring": True,
             "use_uring_cmd": True,
@@ -427,7 +489,8 @@ def build_config(
         },
         "windows": {
             "start_offset_bytes": DEFAULT_START_OFFSET_BYTES,
-            "window_stride_bytes": DEFAULT_WINDOW_STRIDE_BYTES,
+            "allocation": "packed",
+            "alignment_bytes": 4096,
             "default_capacity_bytes": 1 * 1024 * 1024 * 1024,
             "auto_assign": True,
         },
@@ -510,62 +573,84 @@ def write_json(path: str, payload: Any) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_root = Path(DEFAULT_ROOT)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--output-dir",
-        default=os.fspath(default_root / "traces"),
-        help="Directory for generated .lct files.",
-    )
-    parser.add_argument(
-        "--config-out",
-        default=os.fspath(default_root / "config.128ruh.yaml"),
-    )
-    parser.add_argument(
-        "--manifest-out",
-        default=os.fspath(default_root / "trace_manifest.generated.yaml"),
-    )
-    parser.add_argument(
-        "--summary-out",
-        default=os.fspath(default_root / "trace_generation_summary.json"),
-    )
+    parser.add_argument("--root", default=DEFAULT_ROOT)
+    parser.add_argument("--output-dir", default=None, help="Directory for .lct files.")
+    parser.add_argument("--config-out", default=None)
+    parser.add_argument("--manifest-out", default=None)
+    parser.add_argument("--summary-out", default=None)
+    parser.add_argument("--device-path", default=DEFAULT_DEVICE_PATH)
+    parser.add_argument("--block-device-path", default=DEFAULT_BLOCK_DEVICE_PATH)
     parser.add_argument("--ruh-count", type=int, default=128)
     parser.add_argument("--seed", type=int, default=20260507)
-    parser.add_argument("--scale", choices=["smoke", "stress"], default="stress")
+    parser.add_argument("--scale", type=_parse_scale, default=_parse_scale("stress"))
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    trace_dir = os.path.abspath(args.output_dir)
-    output_root = os.path.abspath(os.path.dirname(args.config_out))
+    scale_name, scale_factor, use_smoke_recipe = args.scale
+    root = Path(args.root)
+    output_dir = Path(args.output_dir) if args.output_dir else root / "traces"
+    config_out = (
+        Path(args.config_out) if args.config_out else root / "config.128ruh.yaml"
+    )
+    manifest_out = (
+        Path(args.manifest_out)
+        if args.manifest_out
+        else root / "trace_manifest.generated.yaml"
+    )
+    summary_out = (
+        Path(args.summary_out)
+        if args.summary_out
+        else root / "trace_generation_summary.json"
+    )
+    trace_dir = os.path.abspath(output_dir)
+    output_root = os.path.abspath(config_out.parent)
     os.makedirs(trace_dir, exist_ok=True)
     os.makedirs(output_root, exist_ok=True)
 
-    recipes = _recipes(args.scale, args.ruh_count)
-    traces = [
-        generate_trace(recipe, trace_dir, seed=args.seed)
-        for recipe in recipes
-    ]
+    recipes = _recipes("smoke" if use_smoke_recipe else "stress", args.ruh_count)
+    if not use_smoke_recipe:
+        recipes = _scale_recipes(recipes, scale_factor)
+    meta_total_bytes = DEFAULT_META_TOTAL_BYTES * scale_factor
+    traces = [generate_trace(recipe, trace_dir, seed=args.seed) for recipe in recipes]
+    layout = _packed_layout(recipes)
     config = build_config(
         recipes,
         trace_dir=trace_dir,
         output_root=output_root,
         ruh_count=args.ruh_count,
+        device_path=args.device_path,
+        block_device_path=args.block_device_path,
+        meta_total_bytes=meta_total_bytes,
     )
     manifest = build_manifest(recipes, trace_dir)
+    estimated_store_bytes = sum(item["estimated_store_bytes"] for item in traces)
+    estimated_concurrent_store_bytes = sum(
+        item["estimated_store_bytes"] * recipe.concurrency
+        for item, recipe in zip(traces, recipes, strict=True)
+    )
     summary = {
-        "scale": args.scale,
+        "scale": {"input": scale_name, "factor": scale_factor},
         "ruh_count": args.ruh_count,
+        "paths": {
+            "root": os.path.abspath(root),
+            "device_path": args.device_path,
+            "block_device_path": args.block_device_path,
+        },
         "trace_dir": trace_dir,
-        "config_path": os.path.abspath(args.config_out),
-        "manifest_path": os.path.abspath(args.manifest_out),
+        "config_path": os.path.abspath(config_out),
+        "manifest_path": os.path.abspath(manifest_out),
+        "estimated_store_bytes": estimated_store_bytes,
+        "estimated_store_bytes_with_concurrency": estimated_concurrent_store_bytes,
+        "worker_lba_layout": layout,
         "traces": traces,
     }
 
-    write_yaml(args.config_out, config)
-    write_yaml(args.manifest_out, manifest)
-    write_json(args.summary_out, summary)
+    write_yaml(os.fspath(config_out), config)
+    write_yaml(os.fspath(manifest_out), manifest)
+    write_json(os.fspath(summary_out), summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

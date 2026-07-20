@@ -11,8 +11,8 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     analyze_trace_footprint,
     expand_workers,
     load_yaml_config,
-    main as harness_main,
 )
+from benchmarks.fdp_waf_stress.run_fdp_waf_stress import main as harness_main
 
 
 def test_generate_synthetic_traces_roundtrip_and_dry_run(tmp_path):
@@ -83,3 +83,26 @@ def test_generate_synthetic_traces_roundtrip_and_dry_run(tmp_path):
         + DEFAULT_SLOT_HEADER_BYTES
         for worker in workers_payload
     )
+
+
+def test_numeric_scale_uses_packed_lba_windows(tmp_path):
+    root = tmp_path / "generated"
+
+    assert generate_main(["--root", os.fspath(root), "--scale", "2"]) == 0
+
+    summary = json.loads((root / "trace_generation_summary.json").read_text())
+    layout = summary["worker_lba_layout"]
+    assert summary["scale"] == {"input": "2x", "factor": 2}
+    assert layout["allocation"] == "packed"
+    assert layout["capacity_sum_bytes"] == 19 * 1024 * 1024 * 1024
+    assert layout["span_bytes"] == layout["capacity_sum_bytes"]
+    assert all(
+        current["base_offset_bytes"] == previous["end_offset_bytes"]
+        for previous, current in zip(
+            layout["workers"], layout["workers"][1:], strict=False
+        )
+    )
+
+    config = load_yaml_config(os.fspath(root / "config.128ruh.yaml"))
+    assert config["windows"]["allocation"] == "packed"
+    assert config["global"]["meta_total_bytes"] == 128 * 1024 * 1024
