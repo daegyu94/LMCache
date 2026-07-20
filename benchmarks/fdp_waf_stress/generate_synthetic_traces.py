@@ -620,8 +620,11 @@ def main(argv: list[str] | None = None) -> int:
     scale_name, scale_factor, use_smoke_recipe = args.scale
     root = Path(args.root)
     output_dir = Path(args.output_dir) if args.output_dir else root / "traces"
+    scale_label = "smoke" if use_smoke_recipe else str(scale_factor)
     config_out = (
-        Path(args.config_out) if args.config_out else root / "config.128ruh.yaml"
+        Path(args.config_out)
+        if args.config_out
+        else root / f"config.{args.ruh_count}ruh.{scale_label}scale.yaml"
     )
     manifest_out = (
         Path(args.manifest_out)

@@ -65,9 +65,11 @@ together. `--device-path` and `--block-device-path` override the corresponding
 replay device paths. The summary prints the expected packed worker LBA ranges,
 capacity sum, and span.
 
-The generated `config.128ruh.yaml` uses compact RUH ranges and expands them to
-explicit RUH arrays when building replay commands. In `separated` mode, data
-RUHs are split by workload family and metadata RUHs use IDs above 100.
+When `--config-out` is omitted, the generated config name includes the RUH
+count and scale, for example `config.8ruh.50scale.yaml`. It uses compact RUH
+ranges and expands them to explicit RUH arrays when building replay commands.
+In 128-RUH `separated` mode, data RUHs are split by workload family and
+metadata RUHs use IDs above 100.
 
 Dry-run the generated config:
 
