@@ -49,8 +49,17 @@ run a model, allocate CUDA tensors, or touch NVMe. Replay later allocates CPU L1
 objects from the recorded `MemoryLayoutDesc` and writes synthetic payloads to
 the configured raw-block L2 adapter.
 
-For a quick validation run, use `--scale smoke`. For WAF testing, use
-`--scale stress`.
+`--scale smoke` retains the compact validation recipe. `--scale stress` and
+`--scale 1` select the stress baseline; a positive integer scales its store/prefetch
+batch counts and worker capacities together. The generated config uses packed,
+non-overlapping worker windows, so the LBA span equals the sum of worker
+capacities. For example, `--scale 108` creates about 1,026 GiB of worker
+capacity.
+
+Use `--root` to relocate the generated traces, config, manifest, and summary
+together. `--device-path` and `--block-device-path` override the corresponding
+replay device paths. The summary prints the expected packed worker LBA ranges,
+capacity sum, and span.
 
 The generated `config.128ruh.yaml` uses compact RUH ranges and expands them to
 explicit RUH arrays when building replay commands. In `separated` mode, data
