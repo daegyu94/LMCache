@@ -9,8 +9,8 @@ import yaml
 
 # First Party
 from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
-    expand_workers,
     expand_ruh_ids,
+    expand_workers,
     load_yaml_config,
     make_meta_magic,
     make_salt_suffix,
@@ -18,7 +18,13 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
 )
 
 
-def _config(tmp_path, *, stride=1024 * 1024, capacity=1024 * 1024):
+def _config(
+    tmp_path,
+    *,
+    stride=1024 * 1024,
+    capacity=1024 * 1024,
+    allocation="fixed_stride",
+):
     trace = tmp_path / "missing.lct"
     return {
         "device_path": "/dev/ng1n1",
@@ -34,6 +40,7 @@ def _config(tmp_path, *, stride=1024 * 1024, capacity=1024 * 1024):
             "start_offset_bytes": 4096 * 1024,
             "window_stride_bytes": stride,
             "default_capacity_bytes": capacity,
+            "allocation": allocation,
             "auto_assign": True,
         },
         "modes": {
@@ -131,6 +138,31 @@ def test_auto_window_allocation(tmp_path):
     validate_windows(workers)
 
 
+def test_packed_window_allocation(tmp_path):
+    config = _config(tmp_path, allocation="packed")
+    config["workloads"][0]["capacity_bytes"] = 2 * 1024 * 1024
+    config["workloads"][1]["capacity_bytes"] = 3 * 1024 * 1024
+
+    workers = expand_workers(config, "mixed")
+
+    assert [worker.base_offset_bytes for worker in workers] == [
+        4096 * 1024,
+        4096 * 1024 + 2 * 1024 * 1024,
+        4096 * 1024 + 4 * 1024 * 1024,
+    ]
+    assert workers[-1].base_offset_bytes + workers[-1].capacity_bytes == (
+        4096 * 1024 + 7 * 1024 * 1024
+    )
+    validate_windows(workers)
+
+
+def test_invalid_window_allocation(tmp_path):
+    config = _config(tmp_path, allocation="unknown")
+
+    with pytest.raises(ValueError, match="windows.allocation"):
+        expand_workers(config, "mixed")
+
+
 def test_overlap_detection(tmp_path):
     config = _config(tmp_path, stride=512 * 1024, capacity=1024 * 1024)
 
@@ -141,7 +173,7 @@ def test_overlap_detection(tmp_path):
 def test_unique_meta_magic_generation(tmp_path):
     workers = expand_workers(_config(tmp_path), "mixed")
 
-    assert make_meta_magic(1) == "WF000001"
+    assert make_meta_magic("waf001", 1) == "83E40001"
     assert len({worker.meta_magic for worker in workers}) == len(workers)
     assert all(len(worker.meta_magic) == 8 for worker in workers)
 

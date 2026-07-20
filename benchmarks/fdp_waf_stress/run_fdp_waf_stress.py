@@ -478,7 +478,7 @@ def expand_workers(
     config: dict[str, Any],
     mode: str,
     *,
-    run_id: str,
+    run_id: str = DEFAULT_RUN_ID,
 ) -> list[WorkerSpec]:
     block_align = int(config.get("block_align", 4096))
     windows = config.get("windows", {})
@@ -486,12 +486,20 @@ def expand_workers(
     stride = int(windows.get("window_stride_bytes", 0))
     default_capacity = int(windows.get("default_capacity_bytes", 0))
     auto_assign = bool(windows.get("auto_assign", True))
-    if auto_assign and stride <= 0:
+    allocation = str(windows.get("allocation", "fixed_stride"))
+    alignment = int(windows.get("alignment_bytes", block_align))
+    if allocation not in {"fixed_stride", "packed"}:
+        raise ValueError("windows.allocation must be 'fixed_stride' or 'packed'")
+    if alignment <= 0:
+        raise ValueError("windows.alignment_bytes must be > 0")
+    _validate_alignment("windows.alignment_bytes", alignment, block_align)
+    if auto_assign and allocation == "fixed_stride" and stride <= 0:
         raise ValueError("windows.window_stride_bytes must be > 0")
     if default_capacity <= 0:
         raise ValueError("windows.default_capacity_bytes must be > 0")
 
     workers: list[WorkerSpec] = []
+    next_base_offset = start_offset
     for workload in config.get("workloads", []):
         if not isinstance(workload, dict):
             raise ValueError("each workload must be a mapping")
@@ -511,7 +519,10 @@ def expand_workers(
 
         for local_index in range(concurrency):
             global_index = len(workers)
-            if auto_assign:
+            if auto_assign and allocation == "packed":
+                base_offset = _align_up(next_base_offset, alignment)
+                next_base_offset = base_offset + capacity
+            elif auto_assign:
                 base_offset = start_offset + global_index * stride
             else:
                 base_offset = int(workload["base_offset_bytes"]) + local_index * stride
