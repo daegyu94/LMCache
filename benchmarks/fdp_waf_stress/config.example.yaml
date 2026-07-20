@@ -30,7 +30,7 @@ measurement:
   # vendor_media_write_command: "nvme solidigm smart-log-add /dev/nvme1n1 --json"
 
 windows:
-  start_offset_bytes: 2199023255552
+  start_offset_bytes: 2147483648
   window_stride_bytes: 2147483648
   default_capacity_bytes: 1073741824
   auto_assign: true

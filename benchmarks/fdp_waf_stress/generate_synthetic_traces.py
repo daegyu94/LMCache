@@ -52,7 +52,7 @@ from lmcache.v1.mp_observability.trace.format import (  # noqa: E402
 DEFAULT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_DEVICE_PATH = "/dev/ng1n1"
 DEFAULT_BLOCK_DEVICE_PATH = "/dev/nvme1n1"
-DEFAULT_START_OFFSET_BYTES = 2_199_023_255_552
+DEFAULT_START_OFFSET_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_WINDOW_STRIDE_BYTES = 2_147_483_648
 DEFAULT_META_TOTAL_BYTES = 67_108_864
 _LEN_STRUCT = struct.Struct(">I")
