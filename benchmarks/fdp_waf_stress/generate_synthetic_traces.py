@@ -205,8 +205,8 @@ def _record_prefetch(
 
 
 def _recipes(scale: str, ruh_count: int) -> list[TraceRecipe]:
-    if ruh_count < 128:
-        raise ValueError("--ruh-count must be at least 128 for the 128-RUH config")
+    if ruh_count != 8 and ruh_count < 128:
+        raise ValueError("--ruh-count must be 8 or at least 128")
 
     stress = scale != "smoke"
     return [
@@ -452,49 +452,12 @@ def _uv_replay_binary() -> list[str]:
     ]
 
 
-def build_config(
-    recipes: list[TraceRecipe],
-    *,
-    trace_dir: str,
-    output_root: str,
-    ruh_count: int,
-    device_path: str,
-    block_device_path: str,
-    meta_total_bytes: int,
-) -> dict[str, Any]:
-    if ruh_count < 128:
-        raise ValueError("generated 128-RUH config requires ruh_count >= 128")
-    return {
-        "device_path": device_path,
-        "block_device_path": block_device_path,
-        "block_align": 4096,
-        "global": {
-            "l2_store_policy": "skip_l1",
-            "eviction_policy": "noop",
-            "disable_metrics": True,
-            "quiet": True,
-            "l1_align_bytes": 4096,
-            "meta_total_bytes": meta_total_bytes,
-            "use_odirect": False,
-            "use_uring": True,
-            "use_uring_cmd": True,
-            "output_root": output_root,
-            "replay_binary": _uv_replay_binary(),
-        },
-        "measurement": {
-            "enabled": True,
-            "collect_nvme_smart": True,
-            "collect_fdp_logs": True,
-            "vendor_media_write_command": None,
-        },
-        "windows": {
-            "start_offset_bytes": DEFAULT_START_OFFSET_BYTES,
-            "allocation": "packed",
-            "alignment_bytes": 4096,
-            "default_capacity_bytes": 1 * 1024 * 1024 * 1024,
-            "auto_assign": True,
-        },
-        "modes": {
+def _build_modes(ruh_count: int) -> dict[str, Any]:
+    """Build RUH mappings for either the 128-RUH or compact profile."""
+    if ruh_count < 8:
+        raise ValueError("generated config requires ruh_count >= 8")
+    if ruh_count >= 128:
+        return {
             "mixed": {
                 "use_fdp": True,
                 "default_data_ruhs": {"start": 0, "count": ruh_count},
@@ -526,7 +489,72 @@ def build_config(
                 },
             },
             "no_fdp": {"use_fdp": False},
+        }
+
+    if ruh_count != 8:
+        raise ValueError("generated config requires ruh_count to be 8 or >= 128")
+    return {
+        "mixed": {
+            "use_fdp": True,
+            "default_data_ruhs": [0, 1, 2, 3, 4, 5, 6],
+            "default_metadata_ruhs": [7],
         },
+        "separated": {
+            "use_fdp": True,
+            "classes": {
+                "hot_churn": {"data_ruhs": [0, 1], "metadata_ruhs": [7]},
+                "cold_rag": {"data_ruhs": [2, 3], "metadata_ruhs": [7]},
+                "metadata_heavy": {"data_ruhs": [4], "metadata_ruhs": [7]},
+                "large_model": {"data_ruhs": [5, 6], "metadata_ruhs": [7]},
+                "small_model": {"data_ruhs": [0, 1], "metadata_ruhs": [7]},
+            },
+        },
+        "no_fdp": {"use_fdp": False},
+    }
+
+
+def build_config(
+    recipes: list[TraceRecipe],
+    *,
+    trace_dir: str,
+    output_root: str,
+    ruh_count: int,
+    device_path: str,
+    block_device_path: str,
+    meta_total_bytes: int,
+) -> dict[str, Any]:
+    modes = _build_modes(ruh_count)
+    return {
+        "device_path": device_path,
+        "block_device_path": block_device_path,
+        "block_align": 4096,
+        "global": {
+            "l2_store_policy": "skip_l1",
+            "eviction_policy": "noop",
+            "disable_metrics": True,
+            "quiet": True,
+            "l1_align_bytes": 4096,
+            "meta_total_bytes": meta_total_bytes,
+            "use_odirect": False,
+            "use_uring": True,
+            "use_uring_cmd": True,
+            "output_root": output_root,
+            "replay_binary": _uv_replay_binary(),
+        },
+        "measurement": {
+            "enabled": True,
+            "collect_nvme_smart": True,
+            "collect_fdp_logs": True,
+            "vendor_media_write_command": None,
+        },
+        "windows": {
+            "start_offset_bytes": DEFAULT_START_OFFSET_BYTES,
+            "allocation": "packed",
+            "alignment_bytes": 4096,
+            "default_capacity_bytes": 1 * 1024 * 1024 * 1024,
+            "auto_assign": True,
+        },
+        "modes": modes,
         "workloads": [
             {
                 "name": recipe.name,

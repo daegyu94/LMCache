@@ -106,3 +106,24 @@ def test_numeric_scale_uses_packed_lba_windows(tmp_path):
     config = load_yaml_config(os.fspath(root / "config.128ruh.yaml"))
     assert config["windows"]["allocation"] == "packed"
     assert config["global"]["meta_total_bytes"] == 128 * 1024 * 1024
+
+
+def test_generate_compact_eight_ruh_profile(tmp_path):
+    root = tmp_path / "eight-ruh"
+
+    assert (
+        generate_main(
+            ["--root", os.fspath(root), "--ruh-count", "8", "--scale", "smoke"]
+        )
+        == 0
+    )
+
+    config = load_yaml_config(os.fspath(root / "config.128ruh.yaml"))
+    workers = expand_workers(config, "separated")
+    assert config["modes"]["mixed"]["default_data_ruhs"] == [0, 1, 2, 3, 4, 5, 6]
+    assert config["modes"]["mixed"]["default_metadata_ruhs"] == [7]
+    assert all(
+        ruh_id < 8
+        for worker in workers
+        for ruh_id in worker.fdp_data_ruh_ids + worker.fdp_metadata_ruh_ids
+    )

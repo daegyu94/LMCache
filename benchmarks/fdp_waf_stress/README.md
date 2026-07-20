@@ -56,6 +56,10 @@ non-overlapping worker windows, so the LBA span equals the sum of worker
 capacities. For example, `--scale 108` creates about 1,026 GiB of worker
 capacity.
 
+For an 8-RUH device, pass `--ruh-count 8`; this uses data RUHs 0-6 and
+metadata RUH 7, with the separated-class mapping from the 8-RUH evaluation
+configuration. Other RUH counts must be at least 128.
+
 Use `--root` to relocate the generated traces, config, manifest, and summary
 together. `--device-path` and `--block-device-path` override the corresponding
 replay device paths. The summary prints the expected packed worker LBA ranges,
