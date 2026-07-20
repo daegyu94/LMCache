@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # Standard
 from typing import Callable
+import threading
 import time
 
 # Third Party
@@ -218,6 +219,32 @@ class TestRecordReplayRoundtrip:
 
         assert len(seen) == result.records_replayed
         assert all(not failed for _, failed in seen)
+
+    def test_stop_event_keeps_completed_record_in_metrics(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        keys = [_make_key(0)]
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write(keys, layout, mode="new")
+            sm.finish_write(keys)
+
+        _record_sequence(trace_path, sm_config, script)
+
+        stop_event = threading.Event()
+        seen: list[str] = []
+
+        def on_record(qualname: str, _latency_s: float, _failed: bool) -> None:
+            seen.append(qualname)
+            stop_event.set()
+
+        with StorageReplayDriver(_make_sm_config(), trace_path) as driver:
+            result = driver.run(on_record=on_record, stop_event=stop_event)
+
+        assert result.records_replayed == 1
+        assert result.records_failed == 0
+        assert len(seen) == 1
+        assert seen[0] in result.stats.summary()
 
     def test_replay_cache_salt_suffix_rewrites_object_keys(self, trace_path):
         sm_config = _make_sm_config()

@@ -31,7 +31,9 @@ from typing import Callable
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 
 # First Party
 from lmcache.cli.commands.base import BaseCommand
@@ -403,6 +405,18 @@ class TraceCommand(BaseCommand):
                     + "\n"
                 )
 
+        stop_event = threading.Event()
+        previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+        def _handle_sigterm(_signum: int, _frame: object) -> None:
+            logger.info(
+                "trace replay: SIGTERM received; finishing the current "
+                "record and writing partial metrics"
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+
         driver = None
         try:
             driver = StorageReplayDriver(
@@ -411,12 +425,15 @@ class TraceCommand(BaseCommand):
                 obs_config=obs_config,
                 replay_cache_salt_suffix=args.replay_cache_salt_suffix,
             )
-            result = driver.run(on_record=_on_record)
+            result = driver.run(on_record=_on_record, stop_event=stop_event)
         finally:
-            if driver is not None:
-                driver.close()
-            if jsonl_fh is not None:
-                jsonl_fh.close()
+            try:
+                if driver is not None:
+                    driver.close()
+                if jsonl_fh is not None:
+                    jsonl_fh.close()
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
         if driver is not None and driver.final_storage_status is not None:
             result.storage_status = driver.final_storage_status
 

@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 import hashlib
 import json
+import threading
 import time
 
 # First Party
@@ -318,6 +319,7 @@ class StorageReplayDriver:
     def run(
         self,
         on_record: RecordCallback | None = None,
+        stop_event: threading.Event | None = None,
     ) -> ReplayResult:
         """Replay every record in the trace.
 
@@ -333,6 +335,9 @@ class StorageReplayDriver:
             on_record: Optional per-record callback invoked after
                 dispatch with ``(qualname, latency_s, failed)``.
                 Used by the CLI's ``--jsonl-out`` feature.
+            stop_event: Optional cooperative cancellation event. When set,
+                replay stops before dispatching the next record and returns
+                the metrics collected from all completed records.
 
         Returns:
             A :class:`ReplayResult` summarizing the run.
@@ -347,6 +352,9 @@ class StorageReplayDriver:
         t_wall_origin = time.monotonic()
 
         for record in self._reader.records():
+            if stop_event is not None and stop_event.is_set():
+                break
+
             # Sleep just long enough to align to the recorded
             # offset from the start of replay.  No speedup — if
             # the replay machine is slower than recording, the
@@ -354,7 +362,10 @@ class StorageReplayDriver:
             target = t_wall_origin + record.t_mono
             now = time.monotonic()
             if now < target:
-                time.sleep(target - now)
+                if stop_event is None:
+                    time.sleep(target - now)
+                elif stop_event.wait(target - now):
+                    break
 
             try:
                 decoded_args = codecs.decode_args(record.args)

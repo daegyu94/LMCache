@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
 DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
+DEFAULT_TARGET_CANCEL_GRACE_SECONDS = 30
 DEFAULT_NOISY_NEIGHBOR_RUNTIME_SECONDS = 315360000
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
@@ -104,6 +106,8 @@ class ReplayRunResult:
     records_failed: int | None
     started_at: str
     ended_at: str
+    terminated_by_target: bool = False
+    process_exit_code: int | None = None
 
 
 @dataclass
@@ -113,6 +117,94 @@ class NoisyNeighborPlan:
     offset_bytes: int
     size_bytes: int
     device_capacity_bytes: int
+
+
+class ActiveReplayProcesses:
+    """Track and cooperatively terminate replay process groups."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: dict[int, subprocess.Popen[str]] = {}
+        self._terminated_pids: set[int] = set()
+        self._stopping = False
+
+    def register(self, proc: subprocess.Popen[str]) -> None:
+        terminate_now = False
+        with self._lock:
+            self._processes[proc.pid] = proc
+            if self._stopping:
+                self._terminated_pids.add(proc.pid)
+                terminate_now = True
+        if terminate_now:
+            self._signal_group(proc.pid, signal.SIGTERM)
+
+    def unregister(self, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes.pop(proc.pid, None)
+
+    def was_terminated(self, proc: subprocess.Popen[str]) -> bool:
+        with self._lock:
+            return proc.pid in self._terminated_pids
+
+    def _active_pgids(self) -> list[int]:
+        with self._lock:
+            return list(self._processes)
+
+    @staticmethod
+    def _signal_group(pgid: int, sig: int) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def _group_exists(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def terminate_all(
+        self,
+        grace_seconds: int = DEFAULT_TARGET_CANCEL_GRACE_SECONDS,
+    ) -> None:
+        with self._lock:
+            self._stopping = True
+            processes = list(self._processes.values())
+            self._terminated_pids.update(proc.pid for proc in processes)
+
+        pgids = [proc.pid for proc in processes]
+        for pgid in pgids:
+            self._signal_group(pgid, signal.SIGTERM)
+
+        deadline = time.monotonic() + max(0, grace_seconds)
+        while time.monotonic() < deadline:
+            active_pgids = self._active_pgids()
+            if not any(self._group_exists(pgid) for pgid in active_pgids):
+                return
+            time.sleep(0.1)
+
+        for pgid in self._active_pgids():
+            if self._group_exists(pgid):
+                self._signal_group(pgid, signal.SIGKILL)
+
+    def wait_for_group_exit(
+        self,
+        pgid: int,
+        grace_seconds: int = DEFAULT_TARGET_CANCEL_GRACE_SECONDS,
+    ) -> None:
+        """Wait for wrappers and children to finish flushing replay output."""
+        deadline = time.monotonic() + max(0, grace_seconds)
+        while self._group_exists(pgid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if self._group_exists(pgid):
+            self._signal_group(pgid, signal.SIGKILL)
+            kill_deadline = time.monotonic() + 5
+            while self._group_exists(pgid) and time.monotonic() < kill_deadline:
+                time.sleep(0.1)
 
 
 def _utc_now() -> str:
@@ -1455,6 +1547,7 @@ def run_single_worker_replay(
     output_dir: str,
     iteration: int,
     phase: str,
+    active_processes: ActiveReplayProcesses | None = None,
 ) -> ReplayRunResult:
     worker_dir = os.path.join(
         output_dir,
@@ -1481,8 +1574,20 @@ def run_single_worker_replay(
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=active_processes is not None,
         )
-        exit_code = proc.wait()
+        if active_processes is not None:
+            active_processes.register(proc)
+        try:
+            process_exit_code = proc.wait()
+        finally:
+            if active_processes is not None:
+                if active_processes.was_terminated(proc):
+                    active_processes.wait_for_group_exit(proc.pid)
+                active_processes.unregister(proc)
+    terminated_by_target = (
+        active_processes is not None and active_processes.was_terminated(proc)
+    )
     return ReplayRunResult(
         worker_global_index=worker.worker_global_index,
         worker_name=worker.name,
@@ -1493,10 +1598,12 @@ def run_single_worker_replay(
         log_path=log_path,
         output_dir=worker_dir,
         jsonl_path=jsonl_path,
-        exit_code=exit_code,
+        exit_code=0 if terminated_by_target else process_exit_code,
         records_failed=_count_failed_jsonl(jsonl_path),
         started_at=started_at,
         ended_at=_utc_now(),
+        terminated_by_target=terminated_by_target,
+        process_exit_code=process_exit_code,
     )
 
 
@@ -1554,6 +1661,7 @@ def run_workers_until_host_write_target(
     poll_interval_seconds: int,
 ) -> tuple[list[ReplayRunResult], int]:
     stop_event = threading.Event()
+    active_processes = ActiveReplayProcesses()
     poll_interval = max(1, int(poll_interval_seconds))
 
     def _monitor_loop() -> None:
@@ -1563,6 +1671,7 @@ def run_workers_until_host_write_target(
                 continue
             if current - baseline_host_write_bytes >= target_write_bytes:
                 stop_event.set()
+                active_processes.terminate_all()
                 return
 
     def _worker_loop(worker: WorkerSpec) -> list[ReplayRunResult]:
@@ -1578,6 +1687,7 @@ def run_workers_until_host_write_target(
                     output_dir=output_dir,
                     iteration=iteration,
                     phase="measurement",
+                    active_processes=active_processes,
                 )
             )
             iteration += 1
@@ -1759,6 +1869,14 @@ def build_summary(
     for worker in workers:
         worker_results = result_by_worker.get(worker.worker_global_index, [])
         exit_codes = [result.exit_code for result in worker_results]
+        process_exit_codes = [
+            result.process_exit_code
+            for result in worker_results
+            if result.process_exit_code is not None
+        ]
+        terminated_runs = sum(
+            1 for result in worker_results if result.terminated_by_target
+        )
         failed_counts = [
             result.records_failed
             for result in worker_results
@@ -1778,8 +1896,25 @@ def build_summary(
                 "fdp_metadata_ruh_ids": worker.fdp_metadata_ruh_ids,
                 "records_failed": sum(failed_counts) if failed_counts else None,
                 "exit_code": max(exit_codes) if exit_codes else None,
+                "process_exit_code": (
+                    max(process_exit_codes) if process_exit_codes else None
+                ),
+                "terminated_by_target": terminated_runs > 0,
+                "terminated_runs": terminated_runs,
             }
         )
+
+    target_write_reached = (
+        target_write_bytes is not None
+        and host_delta is not None
+        and host_delta >= target_write_bytes
+    )
+    target_write_overshoot_bytes = None
+    if target_write_bytes is not None and host_delta is not None:
+        target_write_overshoot_bytes = max(0, host_delta - target_write_bytes)
+    target_terminated_runs = sum(
+        1 for result in measurement_results if result.terminated_by_target
+    )
 
     return {
         "mode": mode,
@@ -1799,6 +1934,9 @@ def build_summary(
         "target_write_multiplier": target_write_multiplier,
         "target_device_capacity_bytes": target_device_capacity_bytes,
         "target_write_bytes": target_write_bytes,
+        "target_write_reached": target_write_reached,
+        "target_write_overshoot_bytes": target_write_overshoot_bytes,
+        "target_terminated_runs": target_terminated_runs,
         "with_noisy_neighbor": noisy_neighbor_plan is not None,
         "noisy_neighbor_offset_bytes": (
             noisy_neighbor_plan.offset_bytes
@@ -1829,6 +1967,10 @@ def build_summary_md(summary: dict[str, Any]) -> str:
         f"- target_device_capacity_bytes: "
         f"{summary.get('target_device_capacity_bytes')}",
         f"- target_write_multiplier: {summary.get('target_write_multiplier')}",
+        f"- target_write_reached: {summary.get('target_write_reached')}",
+        f"- target_write_overshoot_bytes: "
+        f"{summary.get('target_write_overshoot_bytes')}",
+        f"- target_terminated_runs: {summary.get('target_terminated_runs')}",
         f"- with_noisy_neighbor: {summary.get('with_noisy_neighbor')}",
         f"- noisy_neighbor_offset_bytes: {summary.get('noisy_neighbor_offset_bytes')}",
         f"- noisy_neighbor_size_bytes: {summary.get('noisy_neighbor_size_bytes')}",
@@ -1841,8 +1983,8 @@ def build_summary_md(summary: dict[str, Any]) -> str:
         "## Workers",
         "",
         "| worker | trace | base_offset_bytes | capacity_bytes | "
-        "FDP data | FDP metadata | exit | failed |",
-        "|---|---|---:|---:|---|---|---:|---:|",
+        "FDP data | FDP metadata | exit | target stop | failed |",
+        "|---|---|---:|---:|---|---|---:|---|---:|",
     ]
     for worker in summary["workers"]:
         lines.append(
@@ -1854,6 +1996,7 @@ def build_summary_md(summary: dict[str, Any]) -> str:
             f"{worker['fdp_data_ruh_ids']} | "
             f"{worker['fdp_metadata_ruh_ids']} | "
             f"{worker['exit_code']} | "
+            f"{worker['terminated_by_target']} | "
             f"{worker['records_failed']} |"
         )
     if summary.get("warnings"):
@@ -2168,7 +2311,10 @@ def main(argv: list[str] | None = None) -> int:
     write_json(os.path.join(output_dir, "summary.json"), summary)
     write_text(os.path.join(output_dir, "summary.md"), build_summary_md(summary))
 
-    failed = any(result.exit_code != 0 for result in all_results)
+    failed = any(
+        result.exit_code != 0 and not result.terminated_by_target
+        for result in all_results
+    )
     return 1 if failed else 0
 
 

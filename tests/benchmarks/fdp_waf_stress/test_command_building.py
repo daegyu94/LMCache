@@ -3,6 +3,9 @@
 # Standard
 import json
 import os
+import sys
+import threading
+import time
 
 # Third Party
 import yaml
@@ -10,6 +13,7 @@ import yaml
 # First Party
 from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     DEFAULT_SAMPLE_INTERVAL_SECONDS,
+    ActiveReplayProcesses,
     build_l2_adapter,
     build_replay_command,
     build_waf_sample,
@@ -18,6 +22,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     extract_media_write_bytes,
     main,
     parse_args,
+    run_single_worker_replay,
     waf_sample_to_tsv,
 )
 import benchmarks.fdp_waf_stress.run_fdp_waf_stress as runner
@@ -315,3 +320,54 @@ def test_target_write_multiplier_dry_run_uses_device_capacity(
     assert "target_device_capacity_bytes=1024" in captured.out
     assert "target_write_bytes=5120" in captured.out
     assert "duration_seconds=30" not in captured.out
+
+
+def test_target_sigterm_is_success_and_keeps_completed_jsonl(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    worker = expand_workers(config, "mixed")[0]
+    started_path = tmp_path / "started"
+
+    def fake_replay_command(*_args, jsonl_path, **_kwargs):
+        script = (
+            "import pathlib, time; "
+            f"pathlib.Path({json.dumps(os.fspath(started_path))}).touch(); "
+            f'f = open({json.dumps(jsonl_path)}, "w"); '
+            'f.write("{\\"failed\\": false}\\n"); f.flush(); '
+            "time.sleep(60)"
+        )
+        return [sys.executable, "-c", script]
+
+    monkeypatch.setattr(runner, "build_replay_command", fake_replay_command)
+    active_processes = ActiveReplayProcesses()
+    results = []
+
+    def run_worker():
+        results.append(
+            run_single_worker_replay(
+                worker,
+                config,
+                mode="mixed",
+                run_id="test",
+                output_dir=os.fspath(tmp_path / "out"),
+                iteration=0,
+                phase="measurement",
+                active_processes=active_processes,
+            )
+        )
+
+    thread = threading.Thread(target=run_worker)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not started_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started_path.exists()
+
+    active_processes.terminate_all(grace_seconds=2)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert results[0].terminated_by_target is True
+    assert results[0].process_exit_code != 0
+    assert results[0].exit_code == 0
+    assert results[0].records_failed == 0
