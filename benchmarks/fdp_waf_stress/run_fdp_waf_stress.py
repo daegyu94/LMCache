@@ -1121,6 +1121,52 @@ def format_target_write_progress(
     )
 
 
+def extract_application_write_bytes(status: dict[str, Any]) -> int:
+    total = 0
+    adapters = status.get("l2_adapters", [])
+    if not isinstance(adapters, list):
+        return total
+    for adapter in adapters:
+        if not isinstance(adapter, dict):
+            continue
+        core = adapter.get("core", {})
+        if not isinstance(core, dict):
+            continue
+        accounting = core.get("io_accounting", {})
+        if not isinstance(accounting, dict):
+            continue
+        value = _safe_int(accounting.get("total_write_physical_bytes"))
+        if value is None:
+            value = _safe_int(accounting.get("media_write_physical_bytes"))
+        if value is not None:
+            total += max(0, value)
+    return total
+
+
+def read_application_write_bytes(output_dir: str | Path) -> int | None:
+    for filename in (
+        "storage_manager_status.json",
+        "storage_manager_progress.json",
+    ):
+        try:
+            payload = json.loads((Path(output_dir) / filename).read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if isinstance(payload, dict):
+            return extract_application_write_bytes(payload)
+    return None
+
+
+def capture_application_write_bytes(output_dir: str) -> int:
+    total = 0
+    worker_root = Path(output_dir) / "worker_logs"
+    for iteration_dir in worker_root.glob("*/measurement_*"):
+        written_bytes = read_application_write_bytes(iteration_dir)
+        if written_bytes is not None:
+            total += written_bytes
+    return total
+
+
 def extract_fdp_stats_bytes(payload: Any) -> dict[str, int]:
     stats: dict[str, int] = {}
     if payload is None:
@@ -1676,7 +1722,7 @@ def run_workers_until_deadline(
     return all_results, max_worker_iterations
 
 
-def run_workers_until_host_write_target(
+def run_workers_until_application_write_target(
     workers: list[WorkerSpec],
     config: dict[str, Any],
     *,
@@ -1684,7 +1730,6 @@ def run_workers_until_host_write_target(
     run_id: str,
     output_dir: str,
     start_iteration: int,
-    baseline_host_write_bytes: int,
     target_write_bytes: int,
     device_capacity_bytes: int,
     poll_interval_seconds: int,
@@ -1697,21 +1742,19 @@ def run_workers_until_host_write_target(
         progress_printed = False
         try:
             while not stop_event.is_set():
-                current = capture_host_write_bytes(config)
-                if current is not None:
-                    written_bytes = max(0, current - baseline_host_write_bytes)
-                    progress = format_target_write_progress(
-                        written_bytes,
-                        target_write_bytes,
-                        device_capacity_bytes,
-                    )
-                    sys.stdout.write(f"\r{progress}")
-                    sys.stdout.flush()
-                    progress_printed = True
-                    if written_bytes >= target_write_bytes:
-                        stop_event.set()
-                        active_processes.terminate_all()
-                        return
+                written_bytes = capture_application_write_bytes(output_dir)
+                progress = format_target_write_progress(
+                    written_bytes,
+                    target_write_bytes,
+                    device_capacity_bytes,
+                )
+                sys.stdout.write(f"\r{progress}")
+                sys.stdout.flush()
+                progress_printed = True
+                if written_bytes >= target_write_bytes:
+                    stop_event.set()
+                    active_processes.terminate_all()
+                    return
                 if stop_event.wait(poll_interval):
                     return
         finally:
@@ -1774,7 +1817,6 @@ def run_iterations(
     measurement_iterations: int | None,
     duration_seconds: int | None,
     target_write_bytes: int | None = None,
-    target_write_baseline_bytes: int | None = None,
     target_device_capacity_bytes: int | None = None,
     target_write_poll_seconds: int = DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
     start_iteration: int = 0,
@@ -1796,17 +1838,14 @@ def run_iterations(
     measurement_start_iter = start_iteration + warmup_iterations
     completed_measurement_iterations = 0
     if target_write_bytes is not None:
-        if target_write_baseline_bytes is None:
-            raise ValueError("target host-write mode requires a baseline counter")
         target_results, completed_measurement_iterations = (
-            run_workers_until_host_write_target(
+            run_workers_until_application_write_target(
                 workers,
                 config,
                 mode=mode,
                 run_id=run_id,
                 output_dir=output_dir,
                 start_iteration=measurement_start_iter,
-                baseline_host_write_bytes=target_write_baseline_bytes,
                 target_write_bytes=target_write_bytes,
                 device_capacity_bytes=(
                     target_device_capacity_bytes or target_write_bytes
@@ -2290,16 +2329,6 @@ def main(argv: list[str] | None = None) -> int:
         os.path.join(output_dir, "measurement_after_warmup.json"),
         measurement_after_warmup,
     )
-    target_write_baseline = None
-    if target_write_bytes is not None:
-        target_write_baseline = _safe_int(
-            measurement_after_warmup.get("host_write_bytes")
-        )
-        if target_write_baseline is None:
-            raise ValueError(
-                "target host-write mode requires nvme smart-log host counter"
-            )
-
     noisy_neighbor_proc = None
     if noisy_neighbor_plan is not None:
         noisy_neighbor_proc = start_noisy_neighbor(noisy_neighbor_plan)
@@ -2322,7 +2351,6 @@ def main(argv: list[str] | None = None) -> int:
             measurement_iterations=args.iterations,
             duration_seconds=args.duration_seconds,
             target_write_bytes=target_write_bytes,
-            target_write_baseline_bytes=target_write_baseline,
             target_device_capacity_bytes=target_device_capacity_bytes,
             target_write_poll_seconds=args.target_write_poll_seconds,
             start_iteration=args.warmup_iterations,

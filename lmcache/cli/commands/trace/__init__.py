@@ -34,6 +34,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 # First Party
 from lmcache.cli.commands.base import BaseCommand
@@ -376,6 +377,34 @@ class TraceCommand(BaseCommand):
         jsonl_fh = open(args.jsonl_out, "w") if args.jsonl_out else None
         verbose = args.verbose
         counter = {"n": 0}
+        driver: StorageReplayDriver | None = None
+        progress_last_written_at = 0.0
+        progress_path = os.path.join(args.output_dir, "storage_manager_progress.json")
+
+        def _write_storage_progress() -> None:
+            nonlocal progress_last_written_at
+            if driver is None:
+                return
+            now = time.monotonic()
+            if progress_last_written_at > 0 and now - progress_last_written_at < 5:
+                return
+            try:
+                status = driver.storage_manager.report_status()
+                absolute_progress_path = os.path.abspath(progress_path)
+                progress_parent = os.path.dirname(absolute_progress_path)
+                if progress_parent:
+                    os.makedirs(progress_parent, exist_ok=True)
+                temporary_path = f"{absolute_progress_path}.tmp.{os.getpid()}"
+                with open(temporary_path, "w") as progress_fh:
+                    json.dump(status, progress_fh, sort_keys=True)
+                    progress_fh.write("\n")
+                os.replace(temporary_path, absolute_progress_path)
+                progress_last_written_at = now
+            except Exception:
+                logger.warning(
+                    "trace replay: failed to write live storage status",
+                    exc_info=True,
+                )
 
         def _on_record(qualname: str, latency_s: float, failed: bool) -> None:
             counter["n"] += 1
@@ -404,6 +433,7 @@ class TraceCommand(BaseCommand):
                     )
                     + "\n"
                 )
+            _write_storage_progress()
 
         stop_event = threading.Event()
         previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
@@ -417,7 +447,6 @@ class TraceCommand(BaseCommand):
 
         signal.signal(signal.SIGTERM, _handle_sigterm)
 
-        driver = None
         try:
             driver = StorageReplayDriver(
                 sm_config,
