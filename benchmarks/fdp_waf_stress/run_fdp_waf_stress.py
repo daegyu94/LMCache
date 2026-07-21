@@ -39,6 +39,7 @@ DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
 DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
 DEFAULT_TARGET_CANCEL_GRACE_SECONDS = 30
+COUNTER_SETTLE_SECONDS = 600
 DEFAULT_NOISY_NEIGHBOR_RUNTIME_SECONDS = 315360000
 VALID_MODES = ("mixed", "separated", "no_fdp")
 WAF_SAMPLE_TSV_COLUMNS = (
@@ -2343,6 +2344,10 @@ def main(argv: list[str] | None = None) -> int:
         duration_seconds=None,
     )
 
+    if args.warmup_iterations > 0:
+        print(f"Waiting {COUNTER_SETTLE_SECONDS}s for warmup counters to settle")
+        time.sleep(COUNTER_SETTLE_SECONDS)
+
     measurement_after_warmup = capture_measurement(config, "after_warmup")
     write_json(
         os.path.join(output_dir, "measurement_after_warmup.json"),
@@ -2381,7 +2386,14 @@ def main(argv: list[str] | None = None) -> int:
             sampler_thread.join(timeout=10)
         stop_noisy_neighbor(noisy_neighbor_proc)
 
-    measurement_after = capture_measurement(config, "after_measurement")
+    measurement_after_benchmark = capture_measurement(config, "after_benchmark")
+    write_json(
+        os.path.join(output_dir, "measurement_after_benchmark.json"),
+        measurement_after_benchmark,
+    )
+    print(f"Waiting {COUNTER_SETTLE_SECONDS}s for benchmark counters to settle")
+    time.sleep(COUNTER_SETTLE_SECONDS)
+    measurement_after = capture_measurement(config, "after_measurement_settled")
     write_json(os.path.join(output_dir, "measurement_after.json"), measurement_after)
 
     all_results = warmup_results + measurement_results

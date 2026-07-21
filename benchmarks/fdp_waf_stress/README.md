@@ -156,6 +156,7 @@ Each run writes:
 - `workers.json`
 - `measurement_before.json`
 - `measurement_after_warmup.json`
+- `measurement_after_benchmark.json`
 - `measurement_after.json`
 - `summary.json`
 - `summary.md`
@@ -174,6 +175,11 @@ periodic sampling.
 If a vendor media/NAND write counter is configured, `summary.json` includes
 `media_write_bytes_delta` and `waf`. Without that counter, WAF is marked
 unavailable rather than estimated.
+
+The runner waits 600 seconds after warmup, when warmup is enabled, before
+capturing the WAF baseline. It also saves an immediate post-benchmark counter
+snapshot, waits 600 seconds for delayed controller accounting, then captures the
+final counter used for WAF.
 
 ## Trace Guidance
 
