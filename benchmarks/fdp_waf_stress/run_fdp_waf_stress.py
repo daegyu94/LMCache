@@ -1101,12 +1101,20 @@ def _format_binary_bytes(value: int) -> str:
     return f"{amount:.2f} {units[-1]}"
 
 
+def _format_elapsed_seconds(value: float) -> str:
+    elapsed_seconds = max(0, int(value))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def format_target_write_progress(
     written_bytes: int,
     target_write_bytes: int,
     device_capacity_bytes: int,
     *,
     width: int = 30,
+    elapsed_seconds: float = 0,
 ) -> str:
     written = max(0, int(written_bytes))
     target = max(1, int(target_write_bytes))
@@ -1117,7 +1125,8 @@ def format_target_write_progress(
     return (
         f"Host write [{bar}] {fraction * 100:6.2f}%  "
         f"{_format_binary_bytes(written)} / {_format_binary_bytes(target)}  "
-        f"({written / capacity:.3f}x / {target / capacity:.3f}x)"
+        f"({written / capacity:.3f}x / {target / capacity:.3f}x)  "
+        f"elapsed={_format_elapsed_seconds(elapsed_seconds)}"
     )
 
 
@@ -1740,6 +1749,7 @@ def run_workers_until_application_write_target(
 
     def _monitor_loop() -> None:
         progress_printed = False
+        started_at = time.monotonic()
         try:
             while not stop_event.is_set():
                 written_bytes = capture_application_write_bytes(output_dir)
@@ -1747,8 +1757,10 @@ def run_workers_until_application_write_target(
                     written_bytes,
                     target_write_bytes,
                     device_capacity_bytes,
+                    elapsed_seconds=time.monotonic() - started_at,
                 )
-                sys.stdout.write(f"\r{progress}")
+                line_prefix = "\r\033[2K" if sys.stdout.isatty() else "\r"
+                sys.stdout.write(f"{line_prefix}{progress}")
                 sys.stdout.flush()
                 progress_printed = True
                 if written_bytes >= target_write_bytes:
@@ -1949,6 +1961,10 @@ def build_summary(
     measurement_results = [
         result for result in run_results if result.phase == "measurement"
     ]
+    lmcache_total_write_physical_bytes = sum(
+        read_application_write_bytes(result.output_dir) or 0
+        for result in measurement_results
+    )
     result_by_worker: dict[int, list[ReplayRunResult]] = {}
     for result in measurement_results:
         result_by_worker.setdefault(result.worker_global_index, []).append(result)
@@ -1994,12 +2010,14 @@ def build_summary(
 
     target_write_reached = (
         target_write_bytes is not None
-        and host_delta is not None
-        and host_delta >= target_write_bytes
+        and lmcache_total_write_physical_bytes >= target_write_bytes
     )
     target_write_overshoot_bytes = None
-    if target_write_bytes is not None and host_delta is not None:
-        target_write_overshoot_bytes = max(0, host_delta - target_write_bytes)
+    if target_write_bytes is not None:
+        target_write_overshoot_bytes = max(
+            0,
+            lmcache_total_write_physical_bytes - target_write_bytes,
+        )
     target_terminated_runs = sum(
         1 for result in measurement_results if result.terminated_by_target
     )
@@ -2014,6 +2032,7 @@ def build_summary(
         "measurement_iterations": measurement_iterations,
         "host_write_bytes_delta": host_delta,
         "media_write_bytes_delta": media_delta,
+        "lmcache_total_write_physical_bytes": lmcache_total_write_physical_bytes,
         "waf": waf,
         "waf_status": waf_status,
         "fdp_stats_host_write_bytes": fdp_stats_host_write_bytes,
@@ -2179,7 +2198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         type=float,
         help=(
-            "Run measurement until host-write delta reaches device capacity "
+            "Run measurement until LMCache physical writes reach device capacity "
             "multiplied by this value. When enabled, duration/iteration "
             "measurement limits are ignored."
         ),
@@ -2188,7 +2207,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--target-write-poll-seconds",
         type=int,
         default=DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS,
-        help="Host-write target polling interval in seconds.",
+        help="LMCache physical-write target polling interval in seconds.",
     )
     parser.add_argument("--with-noisy-neighbor", action="store_true")
     parser.add_argument("--output-dir", default=None)
@@ -2261,7 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         target_write_bytes = int(target_device_capacity_bytes * target_multiplier)
         if target_write_bytes <= 0:
-            raise ValueError("target host-write byte count must be > 0")
+            raise ValueError("target application write byte count must be > 0")
 
     if args.dry_run:
         commands = print_dry_run(

@@ -17,6 +17,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     build_l2_adapter,
     build_replay_command,
     build_waf_sample,
+    capture_application_write_bytes,
     expand_workers,
     extract_host_write_bytes,
     extract_media_write_bytes,
@@ -216,12 +217,14 @@ def test_target_write_progress_shows_percent_amount_and_multiplier():
         target_write_bytes=6 * gib,
         device_capacity_bytes=2 * gib,
         width=10,
+        elapsed_seconds=3661,
     )
 
     assert "[#####-----]" in progress
     assert "50.00%" in progress
     assert "3.00 GiB / 6.00 GiB" in progress
     assert "(1.500x / 3.000x)" in progress
+    assert "elapsed=01:01:01" in progress
 
 
 def test_target_write_progress_caps_bar_at_100_percent_after_overshoot():
@@ -237,6 +240,33 @@ def test_target_write_progress_caps_bar_at_100_percent_after_overshoot():
     assert "[##########]" in progress
     assert "100.00%" in progress
     assert "7.00 GiB / 6.00 GiB" in progress
+
+
+def test_application_write_bytes_uses_final_status_over_live_progress(tmp_path):
+    worker_root = tmp_path / "worker_logs"
+    finished = worker_root / "000" / "measurement_0000"
+    active = worker_root / "001" / "measurement_0000"
+    finished.mkdir(parents=True)
+    active.mkdir(parents=True)
+
+    def status(total_write_physical_bytes):
+        return {
+            "l2_adapters": [
+                {
+                    "core": {
+                        "io_accounting": {
+                            "total_write_physical_bytes": total_write_physical_bytes,
+                        }
+                    }
+                }
+            ]
+        }
+
+    (finished / "storage_manager_progress.json").write_text(json.dumps(status(100)))
+    (finished / "storage_manager_status.json").write_text(json.dumps(status(200)))
+    (active / "storage_manager_progress.json").write_text(json.dumps(status(300)))
+
+    assert capture_application_write_bytes(os.fspath(tmp_path)) == 500
 
 
 def test_waf_sample_marks_stale_interval_when_deltas_are_zero():
