@@ -313,6 +313,54 @@ def test_raw_block_l2_adapter_store_lookup_load_roundtrip():
 
 
 @requires_raw_block_ext
+def test_raw_block_l2_adapter_reports_successful_io_accounting():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as file_obj:
+            file_obj.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            key = _create_object_key(7)
+            miss = _create_object_key(8)
+            stored = _create_memory_obj(fill_value=7.0)
+            assert _run_store(adapter, [key], [stored]) is True
+
+            first = adapter.report_status()["core"]["io_accounting"]
+            assert first["store_attempted_count"] == 1
+            assert first["store_committed_count"] == 1
+            assert first["data_write_logical_bytes"] == len(stored.byte_array)
+            assert first["data_write_physical_bytes"] == (
+                first["data_write_payload_physical_bytes"]
+                + first["data_write_header_physical_bytes"]
+            )
+            assert (
+                first["total_write_physical_bytes"]
+                == first["data_write_physical_bytes"]
+            )
+
+            assert _run_store(adapter, [key], [stored]) is True
+            duplicate = adapter.report_status()["core"]["io_accounting"]
+            assert duplicate["store_attempted_count"] == 2
+            assert duplicate["store_existing_hit_count"] == 1
+            assert (
+                duplicate["total_write_physical_bytes"]
+                == first["total_write_physical_bytes"]
+            )
+
+            loaded = _create_memory_obj(fill_value=0.0)
+            _, bitmap = _run_load(adapter, [key, miss], [loaded, loaded])
+            assert bitmap is not None
+            accounting = adapter.report_status()["core"]["io_accounting"]
+            assert accounting["load_attempted_count"] == 2
+            assert accounting["load_index_hit_count"] == 1
+            assert accounting["data_read_logical_bytes"] == len(stored.byte_array)
+            assert accounting["data_read_physical_bytes"] >= len(stored.byte_array)
+        finally:
+            adapter.close()
+
+
+@requires_raw_block_ext
 def test_raw_block_l2_adapter_delete_respects_lock_until_unlock():
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dev.bin")

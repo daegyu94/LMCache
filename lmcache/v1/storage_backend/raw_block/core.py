@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import dataclasses
 import json
 import os
 import re
@@ -221,6 +222,31 @@ class RawBlockPutManyResult:
     stored_keys: list[str]
 
 
+@dataclass
+class RawBlockIoAccounting:
+    """Logical and physical byte counters for successful raw-block I/O."""
+
+    store_attempted_count: int = 0
+    store_attempted_logical_bytes: int = 0
+    store_existing_hit_count: int = 0
+    store_existing_hit_logical_bytes: int = 0
+    store_committed_count: int = 0
+    store_committed_logical_bytes: int = 0
+    data_write_logical_bytes: int = 0
+    data_write_payload_physical_bytes: int = 0
+    data_write_header_physical_bytes: int = 0
+    data_write_physical_bytes: int = 0
+    metadata_write_logical_bytes: int = 0
+    metadata_write_physical_bytes: int = 0
+    total_write_logical_bytes: int = 0
+    total_write_physical_bytes: int = 0
+    load_attempted_count: int = 0
+    load_index_hit_count: int = 0
+    load_index_hit_logical_bytes: int = 0
+    data_read_logical_bytes: int = 0
+    data_read_physical_bytes: int = 0
+
+
 class RawBlockCore:
     """
     Shared raw-block storage engine used by both legacy non-MP and MP L2 paths.
@@ -361,6 +387,7 @@ class RawBlockCore:
             )
 
         self._lock = threading.Lock()
+        self._io_accounting = RawBlockIoAccounting()
         self._index: dict[str, _Entry] = {}
         self._lock_refcnt: dict[str, int] = {}
         self._inflight: dict[str, _Inflight] = {}
@@ -728,9 +755,18 @@ class RawBlockCore:
             if self._closed:
                 break
 
+            attempted_size = int(len(obj.byte_array))
+
             with self._lock:
+                self._io_accounting.store_attempted_count += 1
+                self._io_accounting.store_attempted_logical_bytes += attempted_size
                 if key.encoded in self._index:
+                    entry = self._index[key.encoded]
                     results[i] = True
+                    self._io_accounting.store_existing_hit_count += 1
+                    self._io_accounting.store_existing_hit_logical_bytes += int(
+                        entry.size
+                    )
                     continue
                 if key.encoded in self._inflight:
                     continue
@@ -778,6 +814,10 @@ class RawBlockCore:
                 self._meta_dirty_total += 1
                 results[i] = True
                 stored_keys.append(key.encoded)
+                self._io_accounting.store_committed_count += 1
+                self._io_accounting.store_committed_logical_bytes += int(
+                    inflight.meta.size
+                )
 
         return RawBlockPutManyResult(
             results=results,
@@ -845,6 +885,11 @@ class RawBlockCore:
                 (encoded_key, self._index.get(encoded_key))
                 for encoded_key in encoded_keys
             ]
+            self._io_accounting.load_attempted_count += len(encoded_keys)
+            for _encoded_key, entry in items:
+                if entry is not None:
+                    self._io_accounting.load_index_hit_count += 1
+                    self._io_accounting.load_index_hit_logical_bytes += int(entry.size)
             self._inflight_io_count += 1
 
         results = [False] * len(encoded_keys)
@@ -890,6 +935,9 @@ class RawBlockCore:
                             [payload_len],
                             [total_len],
                         )
+                    with self._lock:
+                        self._io_accounting.data_read_logical_bytes += payload_len
+                        self._io_accounting.data_read_physical_bytes += total_len
                     objs[i].metadata.cached_positions = entry.meta.cached_positions
                     results[i] = True
                 except Exception as e:
@@ -1012,6 +1060,7 @@ class RawBlockCore:
                 "metadata_dirty_total": self._meta_dirty_total,
                 "metadata_persisted": self._meta_persisted,
                 "inflight_io_count": self._inflight_io_count,
+                "io_accounting": dataclasses.asdict(self._io_accounting),
                 "use_odirect": self.use_odirect,
                 "enable_zero_copy": self.enable_zero_copy,
                 "io_engine": self.io_engine,
@@ -1515,6 +1564,21 @@ class RawBlockCore:
                     [hdr_total, total_len],
                     [placement_id, placement_id],
                 )
+                with self._lock:
+                    data_logical = int(payload_len)
+                    data_payload_physical = int(total_len)
+                    data_header_physical = int(hdr_total)
+                    data_physical = data_payload_physical + data_header_physical
+                    self._io_accounting.data_write_logical_bytes += data_logical
+                    self._io_accounting.data_write_payload_physical_bytes += (
+                        data_payload_physical
+                    )
+                    self._io_accounting.data_write_header_physical_bytes += (
+                        data_header_physical
+                    )
+                    self._io_accounting.data_write_physical_bytes += data_physical
+                    self._io_accounting.total_write_logical_bytes += data_logical
+                    self._io_accounting.total_write_physical_bytes += data_physical
             finally:
                 with self._lock:
                     self._inflight_io_count -= 1
@@ -1793,6 +1857,12 @@ class RawBlockCore:
         )
 
         with self._lock:
+            metadata_logical = int(payload_len) + int(self.block_align)
+            metadata_physical = int(payload_total_len) + int(self.block_align)
+            self._io_accounting.metadata_write_logical_bytes += metadata_logical
+            self._io_accounting.metadata_write_physical_bytes += metadata_physical
+            self._io_accounting.total_write_logical_bytes += metadata_logical
+            self._io_accounting.total_write_physical_bytes += metadata_physical
             self._meta_seq = int(next_seq)
             self._meta_persisted = max(self._meta_persisted, int(dirty_total_snapshot))
         return True
