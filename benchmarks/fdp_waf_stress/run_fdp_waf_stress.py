@@ -725,6 +725,7 @@ def build_replay_command(
             make_salt_suffix(run_id, mode, worker, iteration),
             "--l1-size-gb",
             str(worker.l1_size_gb),
+            "--no-l1-use-lazy",
             "--eviction-policy",
             str(global_cfg.get("eviction_policy", "noop")),
             "--l2-store-policy",

@@ -131,6 +131,7 @@ def test_replay_command_contains_required_flags(tmp_path):
     assert adapter["latency_log_path"] == os.fspath(
         tmp_path / "worker/l2_latency.jsonl"
     )
+    assert "--no-l1-use-lazy" in cmd
 
 
 def test_dry_run_command_output(tmp_path, capsys):
