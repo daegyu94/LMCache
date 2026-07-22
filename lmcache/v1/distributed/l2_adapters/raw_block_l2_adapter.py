@@ -14,7 +14,10 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
+import json
+import os
 import threading
+import time
 
 if TYPE_CHECKING:
     from lmcache.native_storage_ops import Bitmap
@@ -56,6 +59,40 @@ RawBlockStoreTaskResult = tuple[
     list[ObjectKey],
     list[int],
 ]
+
+
+class _LatencyJsonlRecorder:
+    """Write raw-block L2 latency samples to a thread-safe JSONL stream."""
+
+    def __init__(self, path: str) -> None:
+        absolute_path = os.path.abspath(path)
+        parent = os.path.dirname(absolute_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self._file = open(absolute_path, "w", buffering=1, encoding="utf-8")
+        self._lock = threading.Lock()
+
+    def record(self, payload: dict[str, Any]) -> None:
+        """Append one JSON object without interrupting the I/O task."""
+        try:
+            with self._lock:
+                self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        except (OSError, ValueError):
+            logger.warning(
+                "RawBlockL2Adapter failed to record an L2 latency sample",
+                exc_info=True,
+            )
+
+    def close(self) -> None:
+        """Flush and close the JSONL output."""
+        with self._lock:
+            self._file.close()
+
+
+def _cache_salts(keys: list[ObjectKey]) -> list[str]:
+    """Return stable cache-salt labels for one submitted L2 task."""
+    return sorted({key.cache_salt for key in keys})
+
 
 _FDP_DATA_PLACEMENT_POLICY_NONE = "none"
 _FDP_DATA_PLACEMENT_POLICY_CACHE_SALT_PREFIX = "cache_salt_prefix"
@@ -214,6 +251,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
+        latency_log_path: str | None = None,
     ):
         """Initialize raw-block MP adapter configuration.
 
@@ -252,6 +290,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
+            latency_log_path: Optional JSONL output for cache-salt-attributed
+                lookup, read, and write latency samples.
         """
         super().__init__()
         self.device_path = device_path
@@ -311,6 +351,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
         self.num_load_workers = int(num_load_workers)
+        self.latency_log_path = latency_log_path
 
     @classmethod
     def from_dict(cls, d: dict) -> "RawBlockL2AdapterConfig":
@@ -420,6 +461,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
+            latency_log_path=(
+                str(d["latency_log_path"])
+                if d.get("latency_log_path") is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -472,7 +518,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "identifier for metadata checkpoints; requires io_uring_cmd\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
-            "- num_load_workers (int): load worker threads (default 4)"
+            "- num_load_workers (int): load worker threads (default 4)\n"
+            "- latency_log_path (str): optional JSONL output for cache-salt "
+            "L2 latency samples"
         )
 
     def to_core_config(self) -> RawBlockCoreConfig:
@@ -544,6 +592,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._store_pool: ThreadPoolExecutor
         self._lookup_pool: ThreadPoolExecutor
         self._load_pool: ThreadPoolExecutor
+        self._latency_recorder: _LatencyJsonlRecorder | None = None
         self._fdp_lock = threading.Lock()
         self._fdp_data_placement_policy = config.fdp_data_placement_policy
         self._fdp_cache_salt_bucket_placements: dict[str, int] = {}
@@ -556,6 +605,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+            if config.latency_log_path:
+                self._latency_recorder = _LatencyJsonlRecorder(config.latency_log_path)
             self._fdp_enabled = bool(config.fdp_enabled)
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_ids: list[int] = []
@@ -647,6 +698,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._store_inflight_tasks += 1
+        submitted_at = time.perf_counter()
+        cache_salts = _cache_salts(keys)
         try:
             future = self._store_pool.submit(
                 self._run_store_task, list(keys), list(objects)
@@ -655,7 +708,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._store_inflight_tasks -= 1
             raise
-        future.add_done_callback(partial(self._finish_store_task, task_id))
+        future.add_done_callback(
+            partial(
+                self._finish_store_task,
+                task_id,
+                submitted_at,
+                len(keys),
+                cache_salts,
+            )
+        )
         return task_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
@@ -686,13 +747,23 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._lookup_inflight_tasks += 1
+        submitted_at = time.perf_counter()
+        cache_salts = _cache_salts(keys)
         try:
             future = self._lookup_pool.submit(self._run_lookup_task, list(keys))
         except Exception:
             with self._lock:
                 self._lookup_inflight_tasks -= 1
             raise
-        future.add_done_callback(partial(self._finish_lookup_task, task_id, len(keys)))
+        future.add_done_callback(
+            partial(
+                self._finish_lookup_task,
+                task_id,
+                len(keys),
+                submitted_at,
+                cache_salts,
+            )
+        )
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -731,6 +802,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._load_inflight_tasks += 1
+        submitted_at = time.perf_counter()
+        cache_salts = _cache_salts(keys)
         try:
             future = self._load_pool.submit(
                 self._run_load_task, list(keys), list(objects)
@@ -739,7 +812,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._load_inflight_tasks -= 1
             raise
-        future.add_done_callback(partial(self._finish_load_task, task_id, len(keys)))
+        future.add_done_callback(
+            partial(
+                self._finish_load_task,
+                task_id,
+                len(keys),
+                submitted_at,
+                cache_salts,
+            )
+        )
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -790,6 +871,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._load_pool.shutdown(wait=True)
 
         self._core.close()
+        if self._latency_recorder is not None:
+            self._latency_recorder.close()
+            self._latency_recorder = None
 
         with self._lock:
             store_efd = self._store_efd
@@ -809,6 +893,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def report_status(self) -> dict:
         """Return adapter health, task counters, and core status."""
         core_status = self._core.report_status()
+        usage = self.get_usage()
         with self._fdp_lock:
             fdp_cache_salt_bucket_placements = dict(
                 self._fdp_cache_salt_bucket_placements
@@ -845,6 +930,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
+                "usage": {
+                    "total_bytes_used": usage.total_bytes_used,
+                    "total_capacity_bytes": usage.total_capacity_bytes,
+                    "bytes_by_cache_salt": dict(usage.bytes_by_cache_salt),
+                },
                 "core": core_status,
             }
 
@@ -1184,6 +1274,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def _finish_store_task(
         self,
         task_id: L2TaskId,
+        submitted_at: float,
+        key_count: int,
+        cache_salts: list[str],
         future: Future[RawBlockStoreTaskResult],
     ) -> None:
         success = False
@@ -1195,6 +1288,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bytes_transferred = sum(stored_sizes)
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
+        self._record_task_latency(
+            "l2_e2e_write",
+            submitted_at,
+            cache_salts=cache_salts,
+            failed=not success,
+            key_count=key_count,
+        )
         with self._lock:
             self._store_inflight_tasks -= 1
             self._completed_store_tasks[task_id] = L2StoreResult(
@@ -1218,13 +1318,28 @@ class RawBlockL2Adapter(L2AdapterInterface):
         return bitmap
 
     def _finish_lookup_task(
-        self, task_id: L2TaskId, bitmap_size: int, future: Future[Any]
+        self,
+        task_id: L2TaskId,
+        bitmap_size: int,
+        submitted_at: float,
+        cache_salts: list[str],
+        future: Future[Any],
     ) -> None:
         bitmap = _make_bitmap(bitmap_size)
+        failed = False
         try:
             bitmap = future.result()
         except Exception as e:
+            failed = True
             logger.error("RawBlockL2Adapter lookup task %d failed: %s", task_id, e)
+        self._record_task_latency(
+            "l2_lookup",
+            submitted_at,
+            cache_salts=cache_salts,
+            failed=failed,
+            key_count=bitmap_size,
+            hit_count=bitmap.popcount(),
+        )
         with self._lock:
             self._lookup_inflight_tasks -= 1
             self._completed_lookup_tasks[task_id] = bitmap
@@ -1247,7 +1362,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
         return bitmap, accessed_keys
 
     def _finish_load_task(
-        self, task_id: L2TaskId, bitmap_size: int, future: Future[Any]
+        self,
+        task_id: L2TaskId,
+        bitmap_size: int,
+        submitted_at: float,
+        cache_salts: list[str],
+        future: Future[Any],
     ) -> None:
         bitmap = _make_bitmap(bitmap_size)
         accessed_keys: list[ObjectKey] = []
@@ -1255,6 +1375,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bitmap, accessed_keys = future.result()
         except Exception as e:
             logger.error("RawBlockL2Adapter load task %d failed: %s", task_id, e)
+        self._record_task_latency(
+            "l2_e2e_read",
+            submitted_at,
+            cache_salts=cache_salts,
+            failed=bitmap.popcount() != bitmap_size,
+            key_count=bitmap_size,
+            hit_count=bitmap.popcount(),
+        )
         with self._lock:
             self._load_inflight_tasks -= 1
             self._completed_load_tasks[task_id] = bitmap
@@ -1265,6 +1393,33 @@ class RawBlockL2Adapter(L2AdapterInterface):
             except Exception as e:
                 logger.warning("RawBlockL2Adapter access notification failed: %s", e)
         self._signal_event_fd(event_fd)
+
+    def _record_task_latency(
+        self,
+        metric: str,
+        submitted_at: float,
+        *,
+        cache_salts: list[str],
+        failed: bool,
+        key_count: int,
+        hit_count: int | None = None,
+    ) -> None:
+        """Record one cache-salt-attributed L2 task latency sample."""
+        recorder = self._latency_recorder
+        if recorder is None:
+            return
+        payload: dict[str, Any] = {
+            "timestamp_unix_s": time.time(),
+            "metric": metric,
+            "latency_ms": (time.perf_counter() - submitted_at) * 1000.0,
+            "failed": failed,
+            "key_count": key_count,
+            "cache_salt": cache_salts[0] if len(cache_salts) == 1 else None,
+            "cache_salts": cache_salts,
+        }
+        if hit_count is not None:
+            payload["hit_count"] = hit_count
+        recorder.record(payload)
 
     def _signal_event_fd(self, event_fd: EventNotifier | None) -> None:
         try:
@@ -1283,6 +1438,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
         core = getattr(self, "_core", None)
         if core is not None:
             core.close()
+
+        recorder = getattr(self, "_latency_recorder", None)
+        if recorder is not None:
+            recorder.close()
+            self._latency_recorder = None
 
         for fd_name in ("_store_efd", "_lookup_efd", "_load_efd"):
             fd = getattr(self, fd_name, None)

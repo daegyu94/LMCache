@@ -2,6 +2,7 @@
 
 # Standard
 from unittest.mock import patch
+import json
 import os
 import select
 import tempfile
@@ -138,6 +139,7 @@ def _make_config(
     capacity_bytes: int = 0,
     io_engine: str = "posix",
     use_uring_cmd: bool = False,
+    latency_log_path: str | None = None,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path=device_path,
@@ -153,6 +155,7 @@ def _make_config(
         num_store_workers=2,
         num_lookup_workers=1,
         num_load_workers=2,
+        latency_log_path=latency_log_path,
     )
 
 
@@ -358,6 +361,54 @@ def test_raw_block_l2_adapter_reports_successful_io_accounting():
             assert accounting["data_read_physical_bytes"] >= len(stored.byte_array)
         finally:
             adapter.close()
+
+
+@requires_raw_block_ext
+def test_raw_block_l2_adapter_records_cache_salt_latency_and_usage():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        latency_path = os.path.join(td, "l2_latency.jsonl")
+        with open(dev_path, "wb") as file_obj:
+            file_obj.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(
+            _make_config(dev_path, latency_log_path=latency_path)
+        )
+        try:
+            salt = "app-2:chat"
+            key = _create_object_key(9, cache_salt=salt)
+            miss = _create_object_key(10, cache_salt=salt)
+            stored = _create_memory_obj(fill_value=9.0)
+            assert _run_store(adapter, [key], [stored]) is True
+
+            _, lookup = _run_lookup(adapter, [key, miss])
+            assert lookup is not None
+            assert lookup.popcount() == 1
+            loaded = _create_memory_obj(fill_value=0.0)
+            _, load = _run_load(adapter, [key], [loaded])
+            assert load is not None
+            assert load.popcount() == 1
+            adapter.submit_unlock([key, miss])
+
+            status = adapter.report_status()
+            assert status["usage"]["bytes_by_cache_salt"] == {
+                salt: status["core"]["slot_bytes"]
+            }
+        finally:
+            adapter.close()
+
+        with open(latency_path, encoding="utf-8") as source_file:
+            records = [json.loads(line) for line in source_file if line.strip()]
+
+        by_metric = {record["metric"]: record for record in records}
+        assert {"l2_e2e_write", "l2_lookup", "l2_e2e_read"} <= set(by_metric)
+        for record in by_metric.values():
+            assert record["cache_salt"] == salt
+            assert record["cache_salts"] == [salt]
+            assert record["latency_ms"] >= 0
+            assert record["timestamp_unix_s"] > 0
+        assert by_metric["l2_lookup"]["key_count"] == 2
+        assert by_metric["l2_lookup"]["hit_count"] == 1
 
 
 @requires_raw_block_ext
