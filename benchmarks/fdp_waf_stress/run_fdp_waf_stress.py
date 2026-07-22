@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -38,6 +39,13 @@ DEFAULT_RUN_ID = "waf001"
 DEFAULT_OUTPUT_ROOT = "/mnt/hc-ssd/lmcache-fdp-waf-stress"
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300
 DEFAULT_TARGET_HOST_WRITE_POLL_SECONDS = 60
+L2_LATENCY_FILENAME = "l2_latency.jsonl"
+L2_LATENCY_METRICS = (
+    "l2_e2e_write",
+    "raw_block_write",
+    "l2_e2e_read",
+    "raw_block_read",
+)
 DEFAULT_TARGET_CANCEL_GRACE_SECONDS = 30
 COUNTER_SETTLE_SECONDS = 600
 DEFAULT_NOISY_NEIGHBOR_RUNTIME_SECONDS = 315360000
@@ -734,7 +742,9 @@ def build_replay_command(
         cmd.append("--disable-metrics")
     if bool(global_cfg.get("quiet", True)):
         cmd.append("--quiet")
-    adapter_json = json.dumps(build_l2_adapter(worker, config), separators=(",", ":"))
+    adapter = build_l2_adapter(worker, config)
+    adapter["latency_log_path"] = os.path.join(worker_output_dir, L2_LATENCY_FILENAME)
+    adapter_json = json.dumps(adapter, separators=(",", ":"))
     cmd.extend(["--l2-adapter", adapter_json])
     return cmd
 
@@ -1905,6 +1915,63 @@ def _delta(after: dict[str, Any], before: dict[str, Any], key: str) -> int | Non
     return after_value - before_value
 
 
+def summarize_l2_latencies(
+    run_results: list[ReplayRunResult],
+) -> dict[str, dict[str, float | int]]:
+    """Aggregate successful measurement-phase L2 latency samples."""
+    samples: dict[str, list[float]] = {metric: [] for metric in L2_LATENCY_METRICS}
+    errors = {metric: 0 for metric in L2_LATENCY_METRICS}
+    source_file_count = 0
+
+    for result in run_results:
+        if result.phase != "measurement":
+            continue
+        path = os.path.join(result.output_dir, L2_LATENCY_FILENAME)
+        if not os.path.exists(path):
+            continue
+        source_file_count += 1
+        with open(path) as file_obj:
+            for line in file_obj:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                metric = payload.get("metric")
+                if metric not in samples:
+                    continue
+                if (
+                    metric.startswith("raw_block_")
+                    and payload.get("io_class") != "data"
+                ):
+                    continue
+                if bool(payload.get("failed", False)):
+                    errors[metric] += 1
+                    continue
+                try:
+                    latency_ms = float(payload["latency_ms"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if latency_ms >= 0:
+                    samples[metric].append(latency_ms)
+
+    summaries: dict[str, dict[str, float | int]] = {}
+    for metric in L2_LATENCY_METRICS:
+        values = sorted(samples[metric])
+        count = len(values)
+        p90_index = min(count - 1, int(0.90 * count)) if values else 0
+        p99_index = min(count - 1, int(0.99 * count)) if values else 0
+
+        summaries[metric] = {
+            "count": count,
+            "error_count": errors[metric],
+            "avg_ms": statistics.fmean(values) if values else 0.0,
+            "p90_ms": values[p90_index] if values else 0.0,
+            "p99_ms": values[p99_index] if values else 0.0,
+            "source_file_count": source_file_count,
+        }
+    return summaries
+
+
 def build_summary(
     *,
     config: dict[str, Any],
@@ -1962,6 +2029,7 @@ def build_summary(
     measurement_results = [
         result for result in run_results if result.phase == "measurement"
     ]
+    l2_latency = summarize_l2_latencies(measurement_results)
     lmcache_total_write_physical_bytes = sum(
         read_application_write_bytes(result.output_dir) or 0
         for result in measurement_results
@@ -2055,6 +2123,7 @@ def build_summary(
             noisy_neighbor_plan.size_bytes if noisy_neighbor_plan is not None else None
         ),
         "workers": worker_summaries,
+        "l2_latency": l2_latency,
         "warnings": warnings,
     }
 
@@ -2106,6 +2175,22 @@ def build_summary_md(summary: dict[str, Any]) -> str:
             f"{worker['exit_code']} | "
             f"{worker['terminated_by_target']} | "
             f"{worker['records_failed']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## L2 latency",
+            "",
+            "| metric | count | errors | avg_ms | p90_ms | p99_ms |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for metric in L2_LATENCY_METRICS:
+        latency = summary["l2_latency"][metric]
+        lines.append(
+            f"| {metric} | {latency['count']} | {latency['error_count']} | "
+            f"{latency['avg_ms']:.6f} | {latency['p90_ms']:.6f} | "
+            f"{latency['p99_ms']:.6f} |"
         )
     if summary.get("warnings"):
         lines.extend(["", "## Warnings", ""])
@@ -2418,6 +2503,9 @@ def main(argv: list[str] | None = None) -> int:
         noisy_neighbor_plan=noisy_neighbor_plan,
     )
     write_json(os.path.join(output_dir, "summary.json"), summary)
+    write_json(
+        os.path.join(output_dir, "l2_latency_summary.json"), summary["l2_latency"]
+    )
     write_text(os.path.join(output_dir, "summary.md"), build_summary_md(summary))
 
     failed = any(

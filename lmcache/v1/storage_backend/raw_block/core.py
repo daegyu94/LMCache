@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import ctypes
 import dataclasses
 import hashlib
@@ -335,6 +335,9 @@ class RawBlockCore:
         self._last_io_ts: float = time.monotonic()
         self._meta_stop_evt = threading.Event()
         self._meta_thread: Optional[threading.Thread] = None
+        self._io_latency_callback: (
+            Callable[[str, float, str, int, int, bool], None] | None
+        ) = None
 
         try:
             self._ensure_capacity_and_layout()
@@ -390,6 +393,18 @@ class RawBlockCore:
             raw_device: Object implementing the Rust raw-device methods.
         """
         self._raw = raw_device
+
+    def set_io_latency_callback(
+        self,
+        callback: Callable[[str, float, str, int, int, bool], None] | None,
+    ) -> None:
+        """Set an optional callback for completed raw-device I/O calls.
+
+        The callback receives the operation, elapsed seconds, I/O class
+        (data or metadata), physical byte count, submitted buffer count,
+        and failure status.
+        """
+        self._io_latency_callback = callback
 
     def _select_fdp_ruh(
         self,
@@ -1334,6 +1349,32 @@ class RawBlockCore:
         *,
         fdp_ruh_id: int | None = None,
     ) -> None:
+        """Measure and execute one raw-device write operation."""
+        started = time.perf_counter()
+        failed = False
+        try:
+            self._write_buffers_impl(
+                offsets,
+                buffers,
+                payload_lens,
+                total_lens,
+                fdp_ruh_id=fdp_ruh_id,
+            )
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._emit_io_latency("write", started, offsets, total_lens, failed=failed)
+
+    def _write_buffers_impl(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+        *,
+        fdp_ruh_id: int | None = None,
+    ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
         Args:
@@ -1404,6 +1445,24 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
     ) -> None:
+        """Measure and execute one raw-device read operation."""
+        started = time.perf_counter()
+        failed = False
+        try:
+            self._read_buffers_impl(offsets, buffers, payload_lens, total_lens)
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._emit_io_latency("read", started, offsets, total_lens, failed=failed)
+
+    def _read_buffers_impl(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
         """Read one or more buffers through the configured Rust I/O path.
 
         Args:
@@ -1445,6 +1504,37 @@ class RawBlockCore:
             offsets, buffers, payload_lens, total_lens, strict=True
         ):
             raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
+
+    def _emit_io_latency(
+        self,
+        operation: str,
+        started: float,
+        offsets: Sequence[int],
+        total_lens: Sequence[int],
+        *,
+        failed: bool,
+    ) -> None:
+        """Notify the configured observer without affecting device I/O."""
+        callback = self._io_latency_callback
+        if callback is None:
+            return
+        io_class = (
+            "data"
+            if offsets
+            and all(int(offset) >= self._data_base_offset for offset in offsets)
+            else "metadata"
+        )
+        try:
+            callback(
+                operation,
+                time.perf_counter() - started,
+                io_class,
+                sum(int(length) for length in total_lens),
+                len(offsets),
+                failed,
+            )
+        except Exception:
+            logger.warning("RawBlockCore I/O latency callback failed", exc_info=True)
 
     def _write_one(
         self,

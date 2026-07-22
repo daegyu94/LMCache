@@ -25,6 +25,7 @@ from benchmarks.fdp_waf_stress.run_fdp_waf_stress import (
     main,
     parse_args,
     run_single_worker_replay,
+    summarize_l2_latencies,
     waf_sample_to_tsv,
 )
 import benchmarks.fdp_waf_stress.run_fdp_waf_stress as runner
@@ -127,6 +128,9 @@ def test_replay_command_contains_required_flags(tmp_path):
     assert adapter["type"] == "raw_block"
     assert adapter["fdp_data_ruh_ids"] == [0, 1]
     assert "--jsonl-out" in cmd
+    assert adapter["latency_log_path"] == os.fspath(
+        tmp_path / "worker/l2_latency.jsonl"
+    )
 
 
 def test_dry_run_command_output(tmp_path, capsys):
@@ -432,3 +436,46 @@ def test_target_sigterm_is_success_and_keeps_completed_jsonl(tmp_path, monkeypat
     assert results[0].process_exit_code != 0
     assert results[0].exit_code == 0
     assert results[0].records_failed == 0
+
+
+def test_summarize_l2_latencies_uses_measurement_data_io_only(tmp_path):
+    output_dir = tmp_path / "measurement"
+    output_dir.mkdir()
+    samples = [
+        {"metric": "raw_block_write", "latency_ms": 1.0, "io_class": "data"},
+        {"metric": "raw_block_write", "latency_ms": 3.0, "io_class": "data"},
+        {"metric": "raw_block_write", "latency_ms": 99.0, "io_class": "metadata"},
+        {
+            "metric": "raw_block_write",
+            "latency_ms": 10.0,
+            "io_class": "data",
+            "failed": True,
+        },
+        {"metric": "l2_e2e_read", "latency_ms": 4.0},
+    ]
+    latency_path = output_dir / "l2_latency.jsonl"
+    latency_path.write_text("".join(json.dumps(sample) + "\n" for sample in samples))
+    result = runner.ReplayRunResult(
+        worker_global_index=0,
+        worker_name="hot",
+        worker_index=0,
+        iteration=0,
+        phase="measurement",
+        command=[],
+        log_path="",
+        output_dir=os.fspath(output_dir),
+        jsonl_path="",
+        exit_code=0,
+        records_failed=0,
+        started_at="",
+        ended_at="",
+    )
+
+    summary = summarize_l2_latencies([result])
+
+    assert summary["raw_block_write"]["count"] == 2
+    assert summary["raw_block_write"]["error_count"] == 1
+    assert summary["raw_block_write"]["avg_ms"] == 2.0
+    assert summary["raw_block_write"]["p90_ms"] == 3.0
+    assert summary["raw_block_write"]["p99_ms"] == 3.0
+    assert summary["l2_e2e_read"]["count"] == 1

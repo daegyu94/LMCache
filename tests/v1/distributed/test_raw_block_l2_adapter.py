@@ -3,6 +3,7 @@
 # Standard
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
+import json
 import os
 import select
 import tempfile
@@ -170,6 +171,7 @@ def _make_config(
     fdp_metadata_ruh_ids: tuple[int, ...] = (),
     meta_total_bytes: int = 1 * 1024 * 1024,
     meta_magic: str = "LMCIDX01",
+    latency_log_path: str | None = None,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path=device_path,
@@ -191,6 +193,7 @@ def _make_config(
         num_store_workers=2,
         num_lookup_workers=1,
         num_load_workers=2,
+        latency_log_path=latency_log_path,
     )
 
 
@@ -415,6 +418,49 @@ def test_raw_block_l2_adapter_store_lookup_load_roundtrip():
             adapter.submit_unlock([key1, key_miss, key3])
         finally:
             adapter.close()
+
+
+def test_raw_block_l2_adapter_records_e2e_and_device_io_latency():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        latency_path = os.path.join(td, "l2_latency.jsonl")
+        with open(dev_path, "wb") as file_obj:
+            file_obj.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(
+            _make_config(dev_path, latency_log_path=latency_path)
+        )
+        try:
+            key = _create_object_key(101)
+            stored = _create_memory_obj(fill_value=101.0)
+            assert _run_store(adapter, [key], [stored]) is True
+
+            _, lookup = _run_lookup(adapter, [key])
+            assert lookup is not None
+            loaded = _create_memory_obj(fill_value=0.0)
+            _, load_result = _run_load(adapter, [key], [loaded])
+            assert load_result is not None
+            assert torch.equal(loaded.tensor, stored.tensor)
+            adapter.submit_unlock([key])
+        finally:
+            adapter.close()
+
+        with open(latency_path) as file_obj:
+            records = [json.loads(line) for line in file_obj if line.strip()]
+
+        metrics = {record["metric"] for record in records}
+        assert {
+            "l2_e2e_write",
+            "l2_e2e_read",
+            "raw_block_write",
+            "raw_block_read",
+        }.issubset(metrics)
+        assert any(
+            record["metric"] == "raw_block_write"
+            and record["io_class"] == "data"
+            and record["latency_ms"] >= 0
+            for record in records
+        )
 
 
 def test_raw_block_l2_adapter_base_offset_separates_same_device_windows():
@@ -800,9 +846,10 @@ def test_raw_block_l2_adapter_duplicate_store_batch_counts_once():
                 accounting["data_write_payload_physical_bytes"]
                 + accounting["data_write_header_physical_bytes"]
             )
-            assert accounting["total_write_physical_bytes"] == accounting[
-                "data_write_physical_bytes"
-            ]
+            assert (
+                accounting["total_write_physical_bytes"]
+                == accounting["data_write_physical_bytes"]
+            )
 
             adapter._core.checkpoint_now()
             after_checkpoint = adapter.report_status()["core"]["io_accounting"]
@@ -811,9 +858,10 @@ def test_raw_block_l2_adapter_duplicate_store_batch_counts_once():
                 after_checkpoint["data_write_physical_bytes"]
                 + after_checkpoint["metadata_write_physical_bytes"]
             )
-            assert after_checkpoint["media_write_physical_bytes"] == after_checkpoint[
-                "total_write_physical_bytes"
-            ]
+            assert (
+                after_checkpoint["media_write_physical_bytes"]
+                == after_checkpoint["total_write_physical_bytes"]
+            )
         finally:
             adapter.close()
 
@@ -830,11 +878,14 @@ def test_raw_block_l2_adapter_delete_subtracts_exact_metadata_size():
             key_large = _create_object_key(262)
             obj_small = _create_memory_obj(size=512, fill_value=26.1)
             obj_large = _create_memory_obj(size=1024, fill_value=26.2)
-            assert _run_store(
-                adapter,
-                [key_small, key_large],
-                [obj_small, obj_large],
-            ) is True
+            assert (
+                _run_store(
+                    adapter,
+                    [key_small, key_large],
+                    [obj_small, obj_large],
+                )
+                is True
+            )
 
             assert adapter.get_usage().total_bytes_used == (
                 obj_small.get_size() + obj_large.get_size()
@@ -883,8 +934,7 @@ def test_raw_block_l2_adapter_load_hit_miss_io_accounting():
                 == obj.get_size()
             )
             assert (
-                after["media_read_logical_bytes"]
-                - before["media_read_logical_bytes"]
+                after["media_read_logical_bytes"] - before["media_read_logical_bytes"]
                 == obj.get_size()
             )
             assert adapter.get_usage().total_bytes_used == obj.get_size()
@@ -896,6 +946,7 @@ def test_raw_block_l2_adapter_l1_hit_does_not_touch_raw_block_accounting():
     # This exercises the full StorageManager tiering path. A DRAM/L1 prefix hit
     # should short-circuit before raw-block lookup/load, so raw-block counters
     # stay unchanged.
+    # First Party
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.distributed.config import (
         EvictionConfig,

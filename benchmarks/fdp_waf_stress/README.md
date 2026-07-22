@@ -160,7 +160,9 @@ Each run writes:
 - `measurement_after.json`
 - `summary.json`
 - `summary.md`
+- `l2_latency_summary.json`
 - `worker_logs/`
+  - each replay directory contains `l2_latency.jsonl`
 - `waf_samples.tsv`, when `--sample-interval-seconds` is greater than 0
 
 `waf_samples.tsv` records one sample per interval during measurement with
@@ -172,6 +174,13 @@ the delta and WAF fields are left blank and `sample_status` is `stale`. The
 default interval is 300 seconds; pass `--sample-interval-seconds 0` to disable
 periodic sampling.
 
+`summary.json`, `summary.md`, and `l2_latency_summary.json` report
+`count`, `error_count`, `avg_ms`, `p90_ms`, and `p99_ms` for L2 reads
+and writes. `l2_e2e_read/write` measures raw-block adapter task submission
+through asynchronous completion, including its queue and core overhead.
+`raw_block_read/write` measures the underlying raw-device call through
+completion. The aggregate uses measurement-phase data I/O only; the worker
+JSONL retains metadata I/O samples with `"io_class":"metadata"`.
 If a vendor media/NAND write counter is configured, `summary.json` includes
 `media_write_bytes_delta` and `waf`. Without that counter, WAF is marked
 unavailable rather than estimated.
