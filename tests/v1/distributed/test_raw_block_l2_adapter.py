@@ -409,6 +409,47 @@ def test_raw_block_l2_adapter_records_cache_salt_latency_and_usage():
             assert record["timestamp_unix_s"] > 0
         assert by_metric["l2_lookup"]["key_count"] == 2
         assert by_metric["l2_lookup"]["hit_count"] == 1
+        assert by_metric["l2_e2e_write"]["stored_slot_bytes_by_cache_salt"] == {
+            salt: status["core"]["slot_bytes"]
+        }
+
+
+@requires_raw_block_ext
+def test_raw_block_l2_adapter_records_store_bytes_per_cache_salt():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        latency_path = os.path.join(td, "l2_latency.jsonl")
+        with open(dev_path, "wb") as file_obj:
+            file_obj.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(
+            _make_config(dev_path, latency_log_path=latency_path)
+        )
+        try:
+            first_salt = "app-0:shared_prefix"
+            second_salt = "app-4:random"
+            first_key = _create_object_key(10, cache_salt=first_salt)
+            second_key = _create_object_key(11, cache_salt=second_salt)
+            first_obj = _create_memory_obj(fill_value=10.0)
+            second_obj = _create_memory_obj(fill_value=11.0)
+            assert (
+                _run_store(adapter, [first_key, second_key], [first_obj, second_obj])
+                is True
+            )
+            slot_bytes = adapter.report_status()["core"]["slot_bytes"]
+        finally:
+            adapter.close()
+
+        with open(latency_path, encoding="utf-8") as source_file:
+            records = [json.loads(line) for line in source_file if line.strip()]
+
+        write_record = next(
+            record for record in records if record["metric"] == "l2_e2e_write"
+        )
+        assert write_record["stored_slot_bytes_by_cache_salt"] == {
+            first_salt: slot_bytes,
+            second_salt: slot_bytes,
+        }
 
 
 @requires_raw_block_ext

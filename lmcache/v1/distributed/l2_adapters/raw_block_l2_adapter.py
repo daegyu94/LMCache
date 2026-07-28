@@ -1283,9 +1283,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
         bytes_transferred = 0
+        stored_slot_bytes_by_cache_salt: dict[str, int] = {}
         try:
             success, stored_keys, stored_sizes = future.result()
             bytes_transferred = sum(stored_sizes)
+            for key, size in zip(stored_keys, stored_sizes, strict=True):
+                stored_slot_bytes_by_cache_salt[key.cache_salt] = (
+                    stored_slot_bytes_by_cache_salt.get(key.cache_salt, 0) + size
+                )
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
         self._record_task_latency(
@@ -1294,6 +1299,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             cache_salts=cache_salts,
             failed=not success,
             key_count=key_count,
+            stored_slot_bytes_by_cache_salt=stored_slot_bytes_by_cache_salt,
         )
         with self._lock:
             self._store_inflight_tasks -= 1
@@ -1403,6 +1409,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         failed: bool,
         key_count: int,
         hit_count: int | None = None,
+        stored_slot_bytes_by_cache_salt: dict[str, int] | None = None,
     ) -> None:
         """Record one cache-salt-attributed L2 task latency sample."""
         recorder = self._latency_recorder
@@ -1419,6 +1426,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
         }
         if hit_count is not None:
             payload["hit_count"] = hit_count
+        if stored_slot_bytes_by_cache_salt is not None:
+            payload["stored_slot_bytes_by_cache_salt"] = stored_slot_bytes_by_cache_salt
         recorder.record(payload)
 
     def _signal_event_fd(self, event_fd: EventNotifier | None) -> None:
