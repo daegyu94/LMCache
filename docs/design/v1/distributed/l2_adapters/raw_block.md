@@ -72,6 +72,20 @@ defaulting to no directive when unset. User-facing FDP configuration rules live 
 `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command encoding
 details live in `rust/raw_block/README.md`.
 
+When FDP is enabled, `fdp_slot_reuse_policy` defaults to `pid_affinity`.
+`RawBlockCore` tracks each slot's latest placement identifier in memory and
+indexes evicted slots by identifier. Allocation first checks the matching PID
+pool, then falls back to the existing global LIFO free-slot pool, and finally
+uses a previously unallocated slot. This is a reuse preference only; allocation
+does not trigger eviction. Setting the policy to `none` preserves global LIFO
+reuse.
+
+Slot affinity is intentionally not checkpointed. The adapter's placement
+assignments are process-local and may change after restart, so persisting their
+old values could create false matches. Recovered free slots have unknown
+affinity and use the global fallback path until a new allocation records their
+current placement identifier.
+
 ## Key Design Choice
 
 The implementation is split into:

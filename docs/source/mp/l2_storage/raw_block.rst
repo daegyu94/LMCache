@@ -50,6 +50,11 @@ caller-provided load buffers during prefetch.
   ``"cache_salt_rank"`` keeps that bucket isolation and further separates
   rank-local write streams within each bucket when identifiers are available.
   The default is ``"cache_salt_prefix"`` when ``fdp_enabled=true``.
+- ``fdp_slot_reuse_policy``: Free-slot reuse policy. ``"pid_affinity"``
+  preferentially reuses an evicted slot last assigned to the same FDP placement
+  identifier, then falls back to the global free-slot pool. ``"none"`` keeps
+  global LIFO reuse. The default is ``"pid_affinity"`` when
+  ``fdp_enabled=true`` and ``"none"`` otherwise.
 - ``meta_checkpoint_placement_id``: Optional non-zero placement identifier for
   metadata checkpoint payload/header writes. Omit it to keep checkpoint writes
   on default NVMe placement.
@@ -109,6 +114,9 @@ caller-provided load buffers during prefetch.
 - Bucket-to-placement assignments are process-local. Restart recovery does not
   need them for correctness because ``cache_salt`` is part of the object key,
   but first-seen FDP placement assignments may change after adapter restart.
+- Slot PID affinity is also process-local and is not stored in metadata
+  checkpoints. Recovered slots enter the global free-slot pool without an
+  affinity and acquire their current PID affinity on the next allocation.
 - Store and retrieve requests must use the same ``cache_salt`` to address the
   same object. This is the normal LMCache key identity rule; FDP placement is a
   write directive and is not used to locate data on reads.
