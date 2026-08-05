@@ -51,6 +51,7 @@ from lmcache.cli.commands.trace._dispatch import (
     build_default_dispatcher,
 )
 from lmcache.cli.commands.trace._stats import ReplayStatsCollector
+from lmcache.cli.commands.trace.l2_stats import L2LatencyStatsSubscriber
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
@@ -100,6 +101,7 @@ class ReplayResult:
         replay_config_digest: SHA-256 of the replay-side
             StorageManagerConfig, for mismatch comparisons.  Empty
             string if the driver could not compute it.
+        l2_latency_stats: Exact replay-scoped L2 read/write statistics.
     """
 
     records_replayed: int
@@ -109,6 +111,7 @@ class ReplayResult:
     header_level: str
     header_digest: str
     replay_config_digest: str
+    l2_latency_stats: L2LatencyStatsSubscriber
 
 
 class StorageReplayDriver:
@@ -175,6 +178,8 @@ class StorageReplayDriver:
         try:
             reader = TraceReader(trace_path)
             bus = init_observability(obs_config)
+            self._l2_latency_stats = L2LatencyStatsSubscriber()
+            bus.register_subscriber(self._l2_latency_stats)
             self._sm = StorageManager(sm_config)
         except BaseException:
             # ``BaseException`` to also cover KeyboardInterrupt /
@@ -362,6 +367,7 @@ class StorageReplayDriver:
             header_level=header.level,
             header_digest=header.sm_config_digest,
             replay_config_digest=replay_digest,
+            l2_latency_stats=self._l2_latency_stats,
         )
 
 

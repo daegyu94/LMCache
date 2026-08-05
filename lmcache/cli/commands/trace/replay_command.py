@@ -85,6 +85,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also export an aggregated JSON summary.",
     )
+    parser.add_argument(
+        "--l2-stats-out",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for exact replay-scoped L2 read/write latency and "
+            "throughput JSON (default: OUTPUT_DIR/l2_replay_stats.json)."
+        ),
+    )
 
     try:
         # First Party
@@ -109,6 +118,8 @@ def run_trace_replay(args: argparse.Namespace) -> None:
       to ``PATH`` for post-hoc analysis.
     * Aggregated per-qualname summary: CSV (unless ``--no-csv``)
       and JSON (with ``--json``) written under ``--output-dir``.
+    * Exact replay-scoped L2 read/write latency and aggregate throughput JSON
+      written to ``--l2-stats-out`` or ``--output-dir``.
     * Terminal metrics table (unless ``--quiet``) using the shared
       :class:`~lmcache.cli.metrics.Metrics` renderer.
 
@@ -222,6 +233,12 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     finally:
         if jsonl_fh is not None:
             jsonl_fh.close()
+
+    l2_stats_path = args.l2_stats_out or os.path.join(
+        args.output_dir, "l2_replay_stats.json"
+    )
+    result.l2_latency_stats.write_json(l2_stats_path)
+    logger.info("L2 replay statistics written to %s", l2_stats_path)
 
     if not args.no_csv:
         csv_path = os.path.join(args.output_dir, "trace_replay_ops.csv")
