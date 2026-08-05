@@ -183,6 +183,26 @@ Install LMCache
             ``lmcache-cli`` and ``lmcache`` ship the same ``lmcache`` CLI command.
             Do not install both in the same environment.
 
+Trace Replay L2 Metrics Fork
+----------------------------
+
+For the exact replay-scoped L2 read/write latency statistics described in
+:doc:`../mp/tracing_and_debugging`, install the tracebench fork at its
+dedicated branch. The command installs the package from GitHub, so the same
+environment can be recreated on another cluster without copying a source
+checkout:
+
+.. code-block:: bash
+
+    uv pip install \
+        "lmcache @ git+https://github.com/daegyu94/LMCache.git@priv/dg/l2-latency-metrics" \
+        --no-build-isolation
+
+For a fully reproducible experiment, replace the branch name with the
+published commit SHA after the branch is pushed. Install the matching PyTorch
+and vLLM versions before this command, as the LMCache native extension is
+compiled against the environment's PyTorch.
+
 Verify Installation
 -------------------
 

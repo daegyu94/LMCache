@@ -13,7 +13,7 @@ Subcommands:
   plus per-record output (``--verbose`` / ``--jsonl-out``),
   aggregated CSV/JSON summary export (``--output-dir`` / ``--no-csv``
   / ``--json``), and a terminal metrics table (suppressible with
-  ``-q``).
+  ``-q``). Replay also writes exact L2 read/write latency statistics.
 
 Trace *capture* is not a ``trace`` subcommand — recording is bound to
 the live process via ``lmcache server --trace-level storage
@@ -254,6 +254,15 @@ class TraceCommand(BaseCommand):
             help="Also export an aggregated JSON summary.",
         )
         parser.add_argument(
+            "--l2-stats-out",
+            default=None,
+            metavar="PATH",
+            help=(
+                "Path for exact replay-scoped L2 read/write latency and "
+                "throughput JSON (default: OUTPUT_DIR/l2_replay_stats.json)."
+            ),
+        )
+        parser.add_argument(
             "-q",
             "--quiet",
             action="store_true",
@@ -291,6 +300,8 @@ class TraceCommand(BaseCommand):
           to ``PATH`` for post-hoc analysis.
         * Aggregated per-qualname summary: CSV (unless ``--no-csv``)
           and JSON (with ``--json``) written under ``--output-dir``.
+        * Exact replay-scoped L2 read/write latency and aggregate throughput
+          JSON written to ``--l2-stats-out`` or ``--output-dir``.
         * Terminal metrics table (unless ``--quiet``) using the shared
           :class:`~lmcache.cli.metrics.Metrics` renderer.
         """
@@ -401,6 +412,12 @@ class TraceCommand(BaseCommand):
         finally:
             if jsonl_fh is not None:
                 jsonl_fh.close()
+
+        l2_stats_path = args.l2_stats_out or os.path.join(
+            args.output_dir, "l2_replay_stats.json"
+        )
+        result.l2_latency_stats.write_json(l2_stats_path)
+        logger.info("L2 replay statistics written to %s", l2_stats_path)
 
         if not args.no_csv:
             csv_path = os.path.join(args.output_dir, "trace_replay_ops.csv")
