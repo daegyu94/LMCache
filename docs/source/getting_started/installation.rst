@@ -195,13 +195,12 @@ checkout:
 .. code-block:: bash
 
     uv pip install \
-        "lmcache @ git+https://github.com/daegyu94/LMCache.git@priv/dg/l2-latency-metrics" \
+        "lmcache @ git+https://github.com/daegyu94/LMCache.git@816da2b38763da4c6f6d55246c62b366e9159fd9" \
         --no-build-isolation
 
-For a fully reproducible experiment, replace the branch name with the
-published commit SHA after the branch is pushed. Install the matching PyTorch
-and vLLM versions before this command, as the LMCache native extension is
-compiled against the environment's PyTorch.
+The commit SHA pins the exact metric implementation. Install the matching
+PyTorch and vLLM versions before this command, as the LMCache native extension
+is compiled against the environment's PyTorch.
 
 Verify Installation
 -------------------
