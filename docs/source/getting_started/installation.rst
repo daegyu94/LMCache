@@ -248,6 +248,22 @@ Replace ``<IMAGE_NAME>`` and ``<TAG>`` with your desired image name and tag. See
 the example build file in `docker/ <https://github.com/LMCache/LMCache/tree/dev/docker>`_
 for an explanation of all build arguments.
 
+Trace Replay L2 Metrics Fork
+----------------------------
+
+For exact replay-scoped L2 read/write latency statistics, install the tracebench
+fork at its dedicated release tag:
+
+.. code-block:: bash
+
+    uv pip install \
+        "lmcache @ git+https://github.com/daegyu94/LMCache.git@v0.5.1-tracebench.1" \
+        --no-build-isolation
+
+The tag pins the exact metric implementation. Install the matching PyTorch and
+vLLM versions before this command, as the LMCache native extension is compiled
+against the environment's PyTorch.
+
 Verify Installation
 -------------------
 
