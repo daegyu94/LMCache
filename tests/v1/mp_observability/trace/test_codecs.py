@@ -62,6 +62,33 @@ class TestObjectKey:
         assert out == k
         assert out.object_group_id == 7
 
+    def test_cache_salt_roundtrip(self):
+        k = ObjectKey(
+            chunk_hash=b"\x00\x01\x02",
+            model_name="m",
+            kv_rank=42,
+            cache_salt="app-chat",
+        )
+        out = _roundtrip(k)
+        assert out == k
+        assert out.cache_salt == "app-chat"
+
+    def test_legacy_payload_defaults_cache_salt(self):
+        # Traces written before cache_salt was added to the codec omitted the
+        # field entirely.  Those records must still decode as unsalted keys.
+        legacy = {
+            "__t__": "ObjectKey",
+            "v": {
+                "chunk_hash": b"x",
+                "model_name": "m",
+                "kv_rank": 0,
+                "object_group_id": 0,
+            },
+        }
+        out = codecs.decode_value(legacy)
+        assert out == ObjectKey(chunk_hash=b"x", model_name="m", kv_rank=0)
+        assert out.cache_salt == ""
+
     def test_inside_list(self):
         keys = [
             ObjectKey(chunk_hash=b"a", model_name="m", kv_rank=1),
