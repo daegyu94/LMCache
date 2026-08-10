@@ -157,6 +157,7 @@ class TestRecordReplayRoundtrip:
 
         assert result.records_failed == 0
         assert result.records_replayed >= 2  # reserve_write + finish_write
+        assert result.async_drained is True
         assert result.header_level == "storage"
         # Same config used on both sides → digest matches.
         assert result.header_digest == result.replay_config_digest
@@ -183,6 +184,7 @@ class TestRecordReplayRoundtrip:
         # Everything replayed, no failures.
         assert result.records_failed == 0
         assert result.records_skipped == 0
+        assert result.async_drained is True
         qns = result.stats.summary().keys()
         # Every op from the script appears in stats.
         expected_substrings = [

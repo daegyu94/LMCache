@@ -113,6 +113,16 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "Maximum seconds to wait for async storage work to become idle "
+            "(default: 60)."
+        ),
+    )
+
     try:
         # First Party
         from lmcache.v1.distributed.config import add_storage_manager_args
@@ -249,6 +259,7 @@ def run_trace_replay(args: argparse.Namespace) -> None:
             args.trace_path,
             obs_config=obs_config,
             speedup=args.speedup,
+            drain_timeout=args.drain_timeout,
         ) as driver:
             result = driver.run(on_record=_on_record)
     finally:
@@ -303,6 +314,7 @@ def _emit_replay_metrics(
     overall.add("skipped", "Records skipped", result.records_skipped)
     overall.add("failed", "Records failed", result.records_failed)
     overall.add("speedup", "Timestamp speedup", result.speedup)
+    overall.add("async_drained", "Async drain completed", result.async_drained)
     overall.add(
         "duration",
         "Replay duration (s)",

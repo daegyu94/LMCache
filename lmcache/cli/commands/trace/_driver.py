@@ -125,6 +125,7 @@ class ReplayResult:
             string if the driver could not compute it.
         l2_latency_stats: Exact replay-scoped L2 read/write statistics.
         cache_stats: Replay-scoped L1 retrieve and L2 lookup/load outcomes.
+        async_drained: Whether all submitted Store/Prefetch controller work became idle.
         speedup: Timestamp speedup used for this replay.
     """
 
@@ -137,6 +138,7 @@ class ReplayResult:
     replay_config_digest: str
     l2_latency_stats: L2LatencyStatsSubscriber
     cache_stats: CacheOutcomeStatsSubscriber
+    async_drained: bool
     speedup: float
 
 
@@ -154,6 +156,7 @@ class StorageReplayDriver:
         dispatcher: CallDispatcher | None = None,
         obs_config: ObservabilityConfig = DEFAULT_REPLAY_OBS_CONFIG,
         speedup: float = 1.0,
+        drain_timeout: float = 60.0,
     ) -> None:
         """Construct a driver.
 
@@ -194,12 +197,17 @@ class StorageReplayDriver:
                 implement scaled-open replay without waiting for
                 asynchronous L2 operations to complete.
 
+            drain_timeout: Maximum seconds to wait for queued Store/Prefetch
+                work to become idle after dispatch.
         Raises:
-            ValueError: If speedup is not finite and positive.
+            ValueError: If speedup or drain_timeout is not finite and positive.
         """
         self._sm_config = sm_config
         self._trace_path = trace_path
         self._speedup = validate_speedup(speedup)
+        if not math.isfinite(drain_timeout) or drain_timeout <= 0:
+            raise ValueError("drain_timeout must be a finite positive number")
+        self._drain_timeout = drain_timeout
         self._dispatcher = dispatcher or build_default_dispatcher()
         self._closed = False
 
@@ -390,6 +398,7 @@ class StorageReplayDriver:
                     )
             context.open_read_contexts.pop(key_tuple, None)
 
+        async_drained = self._wait_for_async_idle()
         stats.mark_end(time.time())
 
         # Digest of the replay-side config so callers can compare
@@ -410,8 +419,59 @@ class StorageReplayDriver:
             replay_config_digest=replay_digest,
             l2_latency_stats=self._l2_latency_stats,
             cache_stats=self._cache_stats,
+            async_drained=async_drained,
             speedup=self._speedup,
         )
+
+    def _wait_for_async_idle(self) -> bool:
+        """Wait for Store/Prefetch controller work to become idle.
+
+        Returns:
+            ``True`` when two consecutive status polls observe no queued
+            or in-flight store/prefetch work; ``False`` on timeout or
+            status-report failure.
+        """
+        deadline = time.monotonic() + self._drain_timeout
+        idle_observed = False
+        while True:
+            try:
+                status = self._sm.report_status()
+            except Exception:
+                logger.warning(
+                    "trace replay: failed to report async status during drain",
+                    exc_info=True,
+                )
+                return False
+
+            store = status.get("store_controller", {})
+            prefetch = status.get("prefetch_controller", {})
+            is_idle = (
+                isinstance(store, dict)
+                and isinstance(prefetch, dict)
+                and store.get("pending_keys_count", 0) == 0
+                and store.get("in_flight_task_count", 0) == 0
+                and prefetch.get("submission_queue_size", 0) == 0
+                and prefetch.get("pending_queue_size", 0) == 0
+                and prefetch.get("in_flight_request_count", 0) == 0
+                and prefetch.get("lookup_phase_count", 0) == 0
+                and prefetch.get("load_phase_count", 0) == 0
+            )
+            if is_idle:
+                if idle_observed:
+                    return True
+                idle_observed = True
+            else:
+                idle_observed = False
+
+            now = time.monotonic()
+            if now >= deadline:
+                logger.warning(
+                    "trace replay: async drain timed out after %.1fs; status=%s",
+                    self._drain_timeout,
+                    status,
+                )
+                return False
+            time.sleep(min(0.01, deadline - now))
 
 
 #: Callback signature for per-record hooks during replay.  Arguments
