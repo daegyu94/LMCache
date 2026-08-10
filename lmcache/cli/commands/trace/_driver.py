@@ -52,6 +52,7 @@ from lmcache.cli.commands.trace._dispatch import (
     build_default_dispatcher,
 )
 from lmcache.cli.commands.trace._stats import ReplayStatsCollector
+from lmcache.cli.commands.trace.cache_stats import CacheOutcomeStatsSubscriber
 from lmcache.cli.commands.trace.l2_stats import L2LatencyStatsSubscriber
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import StorageManagerConfig
@@ -123,6 +124,7 @@ class ReplayResult:
             StorageManagerConfig, for mismatch comparisons.  Empty
             string if the driver could not compute it.
         l2_latency_stats: Exact replay-scoped L2 read/write statistics.
+        cache_stats: Replay-scoped L1 retrieve and L2 lookup/load outcomes.
         speedup: Timestamp speedup used for this replay.
     """
 
@@ -134,6 +136,7 @@ class ReplayResult:
     header_digest: str
     replay_config_digest: str
     l2_latency_stats: L2LatencyStatsSubscriber
+    cache_stats: CacheOutcomeStatsSubscriber
     speedup: float
 
 
@@ -213,6 +216,8 @@ class StorageReplayDriver:
             bus = init_observability(obs_config)
             self._l2_latency_stats = L2LatencyStatsSubscriber()
             bus.register_subscriber(self._l2_latency_stats)
+            self._cache_stats = CacheOutcomeStatsSubscriber(speedup=self._speedup)
+            bus.register_subscriber(self._cache_stats)
             self._sm = StorageManager(sm_config)
         except BaseException:
             # ``BaseException`` to also cover KeyboardInterrupt /
@@ -306,7 +311,7 @@ class StorageReplayDriver:
             A :class:`ReplayResult` summarizing the run.
         """
         stats = ReplayStatsCollector()
-        context = ReplayContext(sm=self._sm)
+        context = ReplayContext(sm=self._sm, cache_stats=self._cache_stats)
         header = self._reader.header
         t_start = time.time()
         stats.mark_start(t_start)
@@ -404,6 +409,7 @@ class StorageReplayDriver:
             header_digest=header.sm_config_digest,
             replay_config_digest=replay_digest,
             l2_latency_stats=self._l2_latency_stats,
+            cache_stats=self._cache_stats,
             speedup=self._speedup,
         )
 

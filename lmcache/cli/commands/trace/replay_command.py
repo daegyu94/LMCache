@@ -103,6 +103,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
             "(default: 1.0; 2.0 replays the schedule twice as fast)."
         ),
     )
+    parser.add_argument(
+        "--cache-stats-out",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for replay-scoped L1 retrieve and L2 lookup/load "
+            "outcomes (default: OUTPUT_DIR/cache_replay_stats.json)."
+        ),
+    )
 
     try:
         # First Party
@@ -252,6 +261,12 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     result.l2_latency_stats.write_json(l2_stats_path)
     logger.info("L2 replay statistics written to %s", l2_stats_path)
 
+    cache_stats_path = args.cache_stats_out or os.path.join(
+        args.output_dir, "cache_replay_stats.json"
+    )
+    result.cache_stats.write_json(cache_stats_path)
+    logger.info("Cache replay statistics written to %s", cache_stats_path)
+
     if not args.no_csv:
         csv_path = os.path.join(args.output_dir, "trace_replay_ops.csv")
         result.stats.export_csv(csv_path)
@@ -287,6 +302,7 @@ def _emit_replay_metrics(
     overall.add("replayed", "Records replayed", result.records_replayed)
     overall.add("skipped", "Records skipped", result.records_skipped)
     overall.add("failed", "Records failed", result.records_failed)
+    overall.add("speedup", "Timestamp speedup", result.speedup)
     overall.add(
         "duration",
         "Replay duration (s)",
