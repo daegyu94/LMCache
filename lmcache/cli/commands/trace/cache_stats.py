@@ -7,6 +7,7 @@ from __future__ import annotations
 
 # Standard
 from pathlib import Path
+from threading import Lock
 from typing import Any
 import json
 
@@ -33,6 +34,7 @@ class CacheOutcomeStatsSubscriber(EventSubscriber):
     """
 
     def __init__(self, speedup: float = 1.0) -> None:
+        self._lock = Lock()
         self._speedup = speedup
         self._l1_requests = 0
         self._l1_requested_keys = 0
@@ -66,43 +68,56 @@ class CacheOutcomeStatsSubscriber(EventSubscriber):
         """
         requested_keys = max(0, requested_keys)
         hit_keys = min(requested_keys, max(0, hit_keys))
-        self._l1_requests += 1
-        self._l1_requested_keys += requested_keys
-        self._l1_hit_keys += hit_keys
+        with self._lock:
+            self._l1_requests += 1
+            self._l1_requested_keys += requested_keys
+            self._l1_hit_keys += hit_keys
 
     def snapshot(self) -> dict[str, Any]:
         """Return JSON-serializable cache outcome aggregates."""
-        l1_miss_keys = self._l1_requested_keys - self._l1_hit_keys
-        l2_lookup_miss_keys = self._l2_lookup_requested_keys - self._l2_lookup_hit_keys
+        with self._lock:
+            l1_requests = self._l1_requests
+            l1_requested_keys = self._l1_requested_keys
+            l1_hit_keys = self._l1_hit_keys
+            l2_lookup_requests = self._l2_lookup_requests
+            l2_lookup_completed = self._l2_lookup_completed
+            l2_lookup_requested_keys = self._l2_lookup_requested_keys
+            l2_lookup_hit_keys = self._l2_lookup_hit_keys
+            l2_load_requests = self._l2_load_requests
+            l2_load_requested_keys = self._l2_load_requested_keys
+            l2_load_loaded_keys = self._l2_load_loaded_keys
+            l2_load_failed_keys = self._l2_load_failed_keys
+        l1_miss_keys = l1_requested_keys - l1_hit_keys
+        l2_lookup_miss_keys = l2_lookup_requested_keys - l2_lookup_hit_keys
         return {
             "schema_version": 1,
             "speedup": self._speedup,
             "l1_retrieve": {
-                "requests": self._l1_requests,
-                "requested_keys": self._l1_requested_keys,
-                "hit_keys": self._l1_hit_keys,
+                "requests": l1_requests,
+                "requested_keys": l1_requested_keys,
+                "hit_keys": l1_hit_keys,
                 "miss_keys": l1_miss_keys,
-                "hit_rate": _rate(self._l1_hit_keys, self._l1_requested_keys),
+                "hit_rate": _rate(l1_hit_keys, l1_requested_keys),
             },
             "l2_lookup": {
-                "submitted_requests": self._l2_lookup_requests,
-                "completed_requests": self._l2_lookup_completed,
-                "requested_keys": self._l2_lookup_requested_keys,
-                "hit_keys": self._l2_lookup_hit_keys,
+                "submitted_requests": l2_lookup_requests,
+                "completed_requests": l2_lookup_completed,
+                "requested_keys": l2_lookup_requested_keys,
+                "hit_keys": l2_lookup_hit_keys,
                 "miss_keys": l2_lookup_miss_keys,
                 "hit_rate": _rate(
-                    self._l2_lookup_hit_keys,
-                    self._l2_lookup_requested_keys,
+                    l2_lookup_hit_keys,
+                    l2_lookup_requested_keys,
                 ),
             },
             "l2_load": {
-                "submitted_requests": self._l2_load_requests,
-                "requested_keys": self._l2_load_requested_keys,
-                "loaded_keys": self._l2_load_loaded_keys,
-                "failed_keys": self._l2_load_failed_keys,
+                "submitted_requests": l2_load_requests,
+                "requested_keys": l2_load_requested_keys,
+                "loaded_keys": l2_load_loaded_keys,
+                "failed_keys": l2_load_failed_keys,
                 "success_rate": _rate(
-                    self._l2_load_loaded_keys,
-                    self._l2_load_requested_keys,
+                    l2_load_loaded_keys,
+                    l2_load_requested_keys,
                 ),
             },
         }
@@ -117,17 +132,21 @@ class CacheOutcomeStatsSubscriber(EventSubscriber):
         )
 
     def _on_lookup_submitted(self, event: Event) -> None:
-        self._l2_lookup_requests += 1
-        self._l2_lookup_requested_keys += int(event.metadata.get("key_count", 0))
+        with self._lock:
+            self._l2_lookup_requests += 1
+            self._l2_lookup_requested_keys += int(event.metadata.get("key_count", 0))
 
     def _on_lookup_completed(self, event: Event) -> None:
-        self._l2_lookup_completed += 1
-        self._l2_lookup_hit_keys += int(event.metadata.get("prefix_hit_count", 0))
+        with self._lock:
+            self._l2_lookup_completed += 1
+            self._l2_lookup_hit_keys += int(event.metadata.get("prefix_hit_count", 0))
 
     def _on_load_submitted(self, event: Event) -> None:
-        self._l2_load_requests += 1
-        self._l2_load_requested_keys += int(event.metadata.get("key_count", 0))
+        with self._lock:
+            self._l2_load_requests += 1
+            self._l2_load_requested_keys += int(event.metadata.get("key_count", 0))
 
     def _on_load_completed(self, event: Event) -> None:
-        self._l2_load_loaded_keys += int(event.metadata.get("loaded_count", 0))
-        self._l2_load_failed_keys += int(event.metadata.get("failed_count", 0))
+        with self._lock:
+            self._l2_load_loaded_keys += int(event.metadata.get("loaded_count", 0))
+            self._l2_load_failed_keys += int(event.metadata.get("failed_count", 0))
