@@ -94,6 +94,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
             "throughput JSON (default: OUTPUT_DIR/l2_replay_stats.json)."
         ),
     )
+    parser.add_argument(
+        "--speedup",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale recorded timestamp offsets for scaled-open replay "
+            "(default: 1.0; 2.0 replays the schedule twice as fast)."
+        ),
+    )
 
     try:
         # First Party
@@ -227,7 +236,10 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     try:
         with StorageReplayDriver(
-            sm_config, args.trace_path, obs_config=obs_config
+            sm_config,
+            args.trace_path,
+            obs_config=obs_config,
+            speedup=args.speedup,
         ) as driver:
             result = driver.run(on_record=_on_record)
     finally:

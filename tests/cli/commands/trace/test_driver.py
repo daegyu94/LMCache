@@ -26,7 +26,7 @@ from lmcache.cli.commands.trace._dispatch import (
     ReplayContext,
     build_default_dispatcher,
 )
-from lmcache.cli.commands.trace._driver import StorageReplayDriver
+from lmcache.cli.commands.trace._driver import StorageReplayDriver, validate_speedup
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -289,13 +289,11 @@ class TestMismatchHandling:
 
 class TestPacing:
     def test_replay_does_not_regress_past_monotonic(self, trace_path):
-        """Replay never runs *before* the recorded offset.
+        """Replay never runs before the scaled recorded offset.
 
-        Records have t_mono=0 and a positive value; the driver always
-        honors the recorded gap — there is no as-fast-as-possible
-        mode, because async read/write dependencies inside
-        ``StorageManager`` make it unsafe to collapse the recorded
-        inter-call intervals.
+        Records have t_mono=0 and a positive value; the driver honors
+        the scaled gap while leaving asynchronous L2 work independent
+        from dispatch pacing.
         """
         sm_config = _make_sm_config()
         layout = _make_layout()
@@ -317,3 +315,35 @@ class TestPacing:
         # Replay should have slept ≈ 50ms at minimum.  Use a generous
         # bound to avoid flakes under load.
         assert elapsed >= 0.04
+
+    def test_speedup_compresses_recorded_gap(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        keys = [_make_key(0)]
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write(keys, layout, mode="new")
+            time.sleep(0.05)
+            sm.finish_write(keys)
+
+        _record_sequence(trace_path, sm_config, script)
+
+        dispatch_times: list[float] = []
+
+        def on_record(_qualname: str, _latency_s: float, _failed: bool) -> None:
+            dispatch_times.append(time.monotonic())
+
+        with StorageReplayDriver(_make_sm_config(), trace_path, speedup=2.0) as driver:
+            result = driver.run(on_record=on_record)
+
+        assert result.records_failed == 0
+        assert result.speedup == 2.0
+        assert len(dispatch_times) >= 2
+        dispatch_gap = dispatch_times[1] - dispatch_times[0]
+        assert dispatch_gap >= 0.015
+        assert dispatch_gap < 0.08
+
+    @pytest.mark.parametrize("speedup", [0.0, -1.0, float("nan"), float("inf")])
+    def test_speedup_must_be_finite_and_positive(self, speedup):
+        with pytest.raises(ValueError, match="finite positive"):
+            validate_speedup(speedup)
