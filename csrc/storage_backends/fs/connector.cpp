@@ -4,6 +4,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -125,6 +129,45 @@ static bool is_aligned_for_direct_io(const void* buffer, size_t alignment) {
          reinterpret_cast<std::uintptr_t>(buffer) % alignment == 0;
 }
 
+static size_t round_up_to_alignment(size_t value, size_t alignment) {
+  if (alignment == 0) {
+    throw std::runtime_error("O_DIRECT alignment is zero");
+  }
+  const size_t remainder = value % alignment;
+  if (remainder == 0) {
+    return value;
+  }
+  const size_t padding = alignment - remainder;
+  if (value > std::numeric_limits<size_t>::max() - padding) {
+    throw std::runtime_error("O_DIRECT length alignment overflow");
+  }
+  return value + padding;
+}
+
+class AlignedBuffer {
+ public:
+  AlignedBuffer(size_t size, size_t alignment) {
+    void* data = nullptr;
+    const int rc = ::posix_memalign(&data, alignment, size);
+    if (rc != 0) {
+      throw std::runtime_error("posix_memalign failed: " +
+                               std::string(std::strerror(rc)));
+    }
+    data_ = data;
+  }
+
+  ~AlignedBuffer() { std::free(data_); }
+
+  AlignedBuffer(const AlignedBuffer&) = delete;
+  AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+  void* data() { return data_; }
+  const void* data() const { return data_; }
+
+ private:
+  void* data_ = nullptr;
+};
+
 // ---------------------------------------------------------------
 // FSConnector
 // ---------------------------------------------------------------
@@ -149,10 +192,22 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
 
   // Query disk block size for O_DIRECT
   if (use_odirect_) {
+#ifndef O_DIRECT
+    throw std::runtime_error(
+        "use_odirect=true but this platform does not define O_DIRECT");
+#else
     struct statvfs st;
-    if (statvfs(base_path_.c_str(), &st) == 0) {
-      disk_block_size_ = st.f_bsize;
+    if (statvfs(base_path_.c_str(), &st) != 0) {
+      throw std::runtime_error("statvfs failed for O_DIRECT path " +
+                               base_path_ + ": " + std::strerror(errno));
     }
+    disk_block_size_ = st.f_bsize;
+    if (disk_block_size_ == 0) {
+      throw std::runtime_error(
+          "filesystem reported a zero block size for O_DIRECT path " +
+          base_path_);
+    }
+#endif
   }
 
   start_workers();  // IMPORTANT: call at END of constructor
@@ -177,24 +232,23 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   std::string filename = key_to_filename(key);
   auto file_path = conn.base_path / filename;
 
-  int flags = O_RDONLY;
-  bool do_odirect = conn.use_odirect;
-  if (do_odirect) {
-    bool size_aligned =
-        conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    bool address_aligned = is_aligned_for_direct_io(buf, conn.disk_block_size);
-    if (size_aligned && address_aligned) {
-#ifdef O_DIRECT
-      flags |= O_DIRECT;
-#endif
-    } else {
-      // O_DIRECT rejects an otherwise valid request when the caller's
-      // staging buffer is not block-aligned. Fall back to buffered I/O so
-      // direct-I/O remains an optimization rather than a correctness
-      // requirement.
-      do_odirect = false;
-    }
+  const bool direct_io = conn.use_odirect;
+  const size_t io_len =
+      direct_io ? round_up_to_alignment(len, conn.disk_block_size) : len;
+  std::unique_ptr<AlignedBuffer> bounce;
+  void* io_buf = buf;
+  if (direct_io &&
+      (io_len != len || !is_aligned_for_direct_io(buf, conn.disk_block_size))) {
+    bounce = std::make_unique<AlignedBuffer>(io_len, conn.disk_block_size);
+    io_buf = bounce->data();
   }
+
+  int flags = O_RDONLY;
+#ifdef O_DIRECT
+  if (direct_io) {
+    flags |= O_DIRECT;
+  }
+#endif
 
   int fd = ::open(file_path.c_str(), flags);
   if (fd < 0) {
@@ -204,26 +258,29 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
 
   try {
     size_t n;
-    if (conn.read_ahead_size > 0 && len > conn.read_ahead_size) {
+    if (!direct_io && conn.read_ahead_size > 0 && len > conn.read_ahead_size) {
       // Trigger filesystem readahead with a small initial
       // read, then read the remainder.
       size_t ra = conn.read_ahead_size;
-      size_t n_head = read_all(fd, buf, ra);
+      size_t n_head = read_all(fd, io_buf, ra);
       if (n_head < ra) {
         // Short read on the head portion — treat as
         // incomplete
         n = n_head;
       } else {
-        size_t n_tail = read_all(fd, static_cast<char*>(buf) + ra, len - ra);
+        size_t n_tail = read_all(fd, static_cast<char*>(io_buf) + ra, len - ra);
         n = n_head + n_tail;
       }
     } else {
-      n = read_all(fd, buf, len);
+      n = read_all(fd, io_buf, io_len);
     }
-    if (n != len) {
+    if (n != io_len) {
       throw std::runtime_error("incomplete read for " + file_path.string() +
-                               ": expected " + std::to_string(len) + ", got " +
-                               std::to_string(n));
+                               ": expected " + std::to_string(io_len) +
+                               ", got " + std::to_string(n));
+    }
+    if (direct_io && io_buf != buf) {
+      std::memcpy(buf, io_buf, len);
     }
   } catch (...) {
     ::close(fd);
@@ -252,24 +309,27 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     tmp_path.replace_extension(TMP_EXT);
   }
 
-  int flags = O_CREAT | O_WRONLY | O_TRUNC;
-  bool do_odirect = conn.use_odirect;
-  if (do_odirect) {
-    bool size_aligned =
-        conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    bool address_aligned = is_aligned_for_direct_io(buf, conn.disk_block_size);
-    if (size_aligned && address_aligned) {
-#ifdef O_DIRECT
-      flags |= O_DIRECT;
-#endif
-    } else {
-      // O_DIRECT rejects an otherwise valid request when the caller's
-      // staging buffer is not block-aligned. Fall back to buffered I/O so
-      // direct-I/O remains an optimization rather than a correctness
-      // requirement.
-      do_odirect = false;
+  const bool direct_io = conn.use_odirect;
+  const size_t io_len =
+      direct_io ? round_up_to_alignment(len, conn.disk_block_size) : len;
+  std::unique_ptr<AlignedBuffer> bounce;
+  const void* io_buf = buf;
+  if (direct_io &&
+      (io_len != len || !is_aligned_for_direct_io(buf, conn.disk_block_size))) {
+    bounce = std::make_unique<AlignedBuffer>(io_len, conn.disk_block_size);
+    std::memcpy(bounce->data(), buf, len);
+    if (io_len > len) {
+      std::memset(static_cast<char*>(bounce->data()) + len, 0, io_len - len);
     }
+    io_buf = bounce->data();
   }
+
+  int flags = O_CREAT | O_WRONLY | O_TRUNC;
+#ifdef O_DIRECT
+  if (direct_io) {
+    flags |= O_DIRECT;
+  }
+#endif
 
   int fd = ::open(tmp_path.c_str(), flags, 0644);
   if (fd < 0) {
@@ -278,7 +338,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   }
 
   try {
-    write_all(fd, buf, len);
+    write_all(fd, io_buf, io_len);
   } catch (...) {
     ::close(fd);
     // Clean up temp file on failure
