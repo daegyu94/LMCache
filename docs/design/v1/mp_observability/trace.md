@@ -23,8 +23,9 @@ lmcache trace replay l2.lct --prepare-l2 --l2-adapter '{...}'
 
 L2 replay uses dummy payloads with the recorded object sizes. It derives
 source `store → lookup → load → unlock` dependencies and waits for the target
-completion only along those edges; unrelated operations retain their
-timestamp-scaled submission schedule. `--speedup` therefore raises offered
+completion only along those edges; the first selected submission is normalized
+to replay start, while gaps between submissions retain their timestamp-scaled
+schedule. `--speedup` therefore raises offered
 I/O submission rate but does not reduce backend latency. A saturated backend
 shows increasing dependency/buffer wait, schedule lag, and drain time.
 Replay also rejects traces whose final completeness marker is missing or

@@ -8,15 +8,46 @@ appended as a trailing field when non-empty. Unsalted keys use the
 4-field shape and salted keys use the 5-field shape.
 """
 
+# Standard
+import ctypes
+
 # Third Party
 import pytest
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
+    FSL2Adapter,
+    _buffer_is_aligned,
     _filename_to_object_key,
     _object_key_to_filename,
 )
+
+
+class TestODirectAlignment:
+    """Unaligned replay buffers must safely use buffered I/O."""
+
+    def test_buffer_address_alignment(self):
+        raw = bytearray(8192 + 4096)
+        base_address = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+        offset = (-base_address) % 4096
+        aligned = memoryview(raw)[offset : offset + 4096]
+        unaligned = memoryview(raw)[offset + 1 : offset + 4097]
+
+        assert _buffer_is_aligned(aligned, 4096)
+        assert not _buffer_is_aligned(unaligned, 4096)
+
+    def test_read_falls_back_for_unaligned_buffer(self, tmp_path):
+        path = tmp_path / "object.data"
+        payload = bytes(range(256)) * 16
+        path.write_bytes(payload)
+        raw = bytearray(len(payload) + 1)
+        dst = memoryview(raw)[1:]
+        adapter = FSL2Adapter.__new__(FSL2Adapter)
+        adapter._os_disk_bs = 4096
+
+        assert adapter._read_with_odirect(path, dst) == len(payload)
+        assert bytes(dst) == payload
 
 
 class TestFilenameRoundtrip:

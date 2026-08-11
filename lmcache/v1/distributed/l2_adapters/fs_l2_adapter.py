@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 import asyncio
+import ctypes
 import os
 import threading
 
@@ -79,6 +80,19 @@ def _readinto_full(
             break
         total += n
     return total
+
+
+def _buffer_is_aligned(
+    buf: Union[bytearray, memoryview, bytes], alignment: int
+) -> bool:
+    """Return whether *buf* starts at an address suitable for direct I/O."""
+    if alignment <= 0:
+        return False
+    try:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    except (TypeError, ValueError):
+        return False
+    return address % alignment == 0
 
 
 async def _async_readinto_full(
@@ -522,12 +536,19 @@ class FSL2Adapter(L2AdapterInterface):
         fd = -1
         size = len(dst_buf)
         try:
-            aligned = self._os_disk_bs > 0 and size % self._os_disk_bs == 0
-            if not aligned:
-                logger.warning(
-                    "Cannot use O_DIRECT for %s, size is not aligned.",
-                    file_path,
-                )
+            size_aligned = self._os_disk_bs > 0 and size % self._os_disk_bs == 0
+            address_aligned = _buffer_is_aligned(dst_buf, self._os_disk_bs)
+            if not size_aligned or not address_aligned:
+                if not size_aligned:
+                    logger.warning(
+                        "Cannot use O_DIRECT for %s, size is not aligned.",
+                        file_path,
+                    )
+                else:
+                    logger.debug(
+                        "Using buffered read for %s, buffer address is not aligned.",
+                        file_path,
+                    )
                 with open(file_path, "rb") as f:
                     return _readinto_full(f, dst_buf)
 
@@ -595,8 +616,11 @@ class FSL2Adapter(L2AdapterInterface):
                     # Decide whether O_DIRECT is usable
                     do_odirect = self._use_odirect
                     if do_odirect:
-                        aligned = self._os_disk_bs > 0 and size % self._os_disk_bs == 0
-                        if not aligned:
+                        size_aligned = (
+                            self._os_disk_bs > 0 and size % self._os_disk_bs == 0
+                        )
+                        address_aligned = _buffer_is_aligned(buf, self._os_disk_bs)
+                        if not size_aligned:
                             logger.warning(
                                 "Cannot use O_DIRECT for "
                                 "writing size %d, not "
@@ -604,6 +628,13 @@ class FSL2Adapter(L2AdapterInterface):
                                 "%d.",
                                 size,
                                 self._os_disk_bs,
+                            )
+                            do_odirect = False
+                        elif not address_aligned:
+                            logger.debug(
+                                "Using buffered write for %s, buffer address "
+                                "is not aligned.",
+                                file_path,
                             )
                             do_odirect = False
 

@@ -199,6 +199,34 @@ def test_plan_preserves_overlapping_store_lookup_submission(tmp_path):
     assert plan.prepare_objects == {}
 
 
+def test_replay_normalizes_leading_schedule_gap(tmp_path):
+    trace = tmp_path / "l2.lct"
+    common = {"adapter_index": 0, "l2_name": "mock"}
+    event_mono = time.monotonic() + 1.0
+    _write_trace(
+        trace,
+        [
+            (
+                EventType.L2_LOOKUP_TASK_SUBMITTED,
+                {
+                    **common,
+                    "request_id": 12,
+                    "task_id": 1,
+                    "keys": [_key(9)],
+                    "layout_desc": _layout(),
+                    "trace_t_mono": event_mono,
+                },
+            )
+        ],
+    )
+
+    with L2ReplayDriver(_config(), str(trace), drain_timeout=0.05) as driver:
+        result = driver.run()
+
+    assert result["operations_submitted"] == {"lookup_task": 1}
+    assert result["source_submission_window_seconds"] == 0.0
+
+
 def test_plan_preserves_cache_salt(tmp_path):
     trace = tmp_path / "l2.lct"
     key = _key(7, cache_salt="tenant-a")

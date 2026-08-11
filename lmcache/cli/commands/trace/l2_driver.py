@@ -386,6 +386,9 @@ class L2ReplayDriver:
     def run(self) -> dict[str, Any]:
         """Run causal timestamp-scaled L2 replay and return JSON-safe stats."""
         pending = list(self._plan.operations)
+        schedule_origin = (
+            self._plan.operations[0].t_mono if self._plan.operations else 0.0
+        )
         completed: set[TaskKey] = set()
         completion_times: dict[TaskKey, float] = {}
         stores: dict[int, tuple[ReplayOperation, list[MemoryObj], float]] = {}
@@ -421,7 +424,7 @@ class L2ReplayDriver:
             now = time.monotonic()
             progress = False
             for op in list(pending):
-                target = started + op.t_mono / self._speedup
+                target = started + (op.t_mono - schedule_origin) / self._speedup
                 if now < target or not op.dependencies.issubset(completed):
                     continue
                 objects: list[MemoryObj] = []
@@ -521,6 +524,7 @@ class L2ReplayDriver:
             if progress:
                 last_progress = time.monotonic()
                 continue
+
             if time.monotonic() - last_progress > self._drain_timeout:
                 raise RuntimeError(
                     "L2 replay made no progress before drain timeout: "
@@ -536,7 +540,7 @@ class L2ReplayDriver:
             else 0.0
         )
         source_window = (
-            self._plan.operations[-1].t_mono / self._speedup
+            (self._plan.operations[-1].t_mono - schedule_origin) / self._speedup
             if self._plan.operations
             else 0.0
         )

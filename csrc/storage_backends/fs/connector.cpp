@@ -2,6 +2,7 @@
 
 #include "connector.h"
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -119,6 +120,11 @@ static size_t read_all(int fd, void* buf, size_t len) {
   return total;
 }
 
+static bool is_aligned_for_direct_io(const void* buffer, size_t alignment) {
+  return alignment > 0 &&
+         reinterpret_cast<std::uintptr_t>(buffer) % alignment == 0;
+}
+
 // ---------------------------------------------------------------
 // FSConnector
 // ---------------------------------------------------------------
@@ -174,12 +180,18 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   int flags = O_RDONLY;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+    bool size_aligned =
+        conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
+    bool address_aligned = is_aligned_for_direct_io(buf, conn.disk_block_size);
+    if (size_aligned && address_aligned) {
 #ifdef O_DIRECT
       flags |= O_DIRECT;
 #endif
     } else {
+      // O_DIRECT rejects an otherwise valid request when the caller's
+      // staging buffer is not block-aligned. Fall back to buffered I/O so
+      // direct-I/O remains an optimization rather than a correctness
+      // requirement.
       do_odirect = false;
     }
   }
@@ -243,12 +255,18 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   int flags = O_CREAT | O_WRONLY | O_TRUNC;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+    bool size_aligned =
+        conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
+    bool address_aligned = is_aligned_for_direct_io(buf, conn.disk_block_size);
+    if (size_aligned && address_aligned) {
 #ifdef O_DIRECT
       flags |= O_DIRECT;
 #endif
     } else {
+      // O_DIRECT rejects an otherwise valid request when the caller's
+      // staging buffer is not block-aligned. Fall back to buffered I/O so
+      // direct-I/O remains an optimization rather than a correctness
+      // requirement.
       do_odirect = false;
     }
   }
