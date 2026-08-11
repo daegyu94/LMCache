@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.cli.commands.trace._driver import ReplayResult
     from lmcache.cli.commands.trace._stats import ReplayStatsCollector
+    from lmcache.v1.distributed.config import StorageManagerConfig
 
 
 class ReplayCommand(BaseCommand):
@@ -122,6 +123,16 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
             "(default: 60)."
         ),
     )
+    parser.add_argument(
+        "--prepare-l2",
+        action="store_true",
+        help="Prepopulate source-resident objects before replaying an L2 trace.",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Prepare an L2 trace target and exit without measured replay.",
+    )
 
     try:
         # First Party
@@ -156,7 +167,7 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     """
     # First Party
     from lmcache.cli.commands.trace._driver import StorageReplayDriver
-    from lmcache.v1.distributed.config import StorageManagerConfig, parse_args_to_config
+    from lmcache.v1.distributed.config import parse_args_to_config
     from lmcache.v1.mp_observability.config import parse_args_to_observability_config
     from lmcache.v1.mp_observability.trace.reader import TraceReader
 
@@ -181,6 +192,14 @@ def run_trace_replay(args: argparse.Namespace) -> None:
         jsonl_parent = os.path.dirname(os.path.abspath(args.jsonl_out))
         if jsonl_parent:
             os.makedirs(jsonl_parent, exist_ok=True)
+
+    with TraceReader(args.trace_path) as trace_reader:
+        trace_level = trace_reader.header.level
+    if trace_level == "l2":
+        _run_l2_trace_replay(args, sm_config)
+        return
+    if args.prepare_l2 or args.prepare_only:
+        raise ValueError("--prepare-l2/--prepare-only require an L2 trace")
 
     # ANSI: bold + yellow for the banner text, reset at the end.
     bold = "\033[1;33m"
@@ -292,6 +311,42 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     if result.records_failed > 0:
         sys.exit(1)
+
+
+def _run_l2_trace_replay(
+    args: argparse.Namespace,
+    sm_config: "StorageManagerConfig",
+) -> None:
+    """Prepare and/or replay an L2 adapter-level trace."""
+    # First Party
+    from lmcache.cli.commands.trace.l2_driver import L2ReplayDriver, write_json
+
+    with L2ReplayDriver(
+        sm_config,
+        args.trace_path,
+        speedup=args.speedup,
+        drain_timeout=args.drain_timeout,
+    ) as driver:
+        if args.prepare_l2 or args.prepare_only:
+            prepare_result = driver.prepare()
+            prepare_path = os.path.join(args.output_dir, "l2_prepare_manifest.json")
+            write_json(prepare_path, prepare_result)
+            logger.info("L2 prepare manifest written to %s", prepare_path)
+        if args.prepare_only:
+            return
+        replay_result = driver.run()
+
+    stats_path = args.l2_stats_out or os.path.join(
+        args.output_dir, "l2_replay_stats.json"
+    )
+    write_json(stats_path, replay_result)
+    logger.info("L2 replay statistics written to %s", stats_path)
+    if not replay_result["valid"]:
+        logger.error(
+            "L2 replay outcome mismatch: %s",
+            replay_result["outcome_mismatches"],
+        )
+        raise SystemExit(1)
 
 
 def _emit_replay_metrics(
