@@ -53,11 +53,12 @@ def _config() -> StorageManagerConfig:
     )
 
 
-def _key(value: int) -> ObjectKey:
+def _key(value: int, *, cache_salt: str = "") -> ObjectKey:
     return ObjectKey(
         chunk_hash=value.to_bytes(4, "big"),
         model_name="test",
         kv_rank=0,
+        cache_salt=cache_salt,
     )
 
 
@@ -151,6 +152,20 @@ def test_plan_derives_store_lookup_load_dependencies(tmp_path):
     assert load.dependencies == {lookup.task_key}
     assert unlock.dependencies == {load.task_key}
     assert plan.prepare_objects == {}
+
+
+def test_plan_preserves_cache_salt(tmp_path):
+    trace = tmp_path / "l2.lct"
+    key = _key(7, cache_salt="tenant-a")
+    _write_trace(trace, _store_then_read_events(key))
+
+    plan = L2TracePlan.from_file(str(trace))
+
+    assert all(operation.args["keys"] == [key] for operation in plan.operations)
+    assert all(
+        operation.args["keys"][0].cache_salt == "tenant-a"
+        for operation in plan.operations
+    )
 
 
 def test_prepare_and_replay_read_before_trace(tmp_path):
