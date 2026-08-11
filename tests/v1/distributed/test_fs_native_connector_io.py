@@ -49,5 +49,19 @@ def test_odirect_handles_unaligned_buffer_and_length(tmp_path):
             assert bytes(read_view) == payload
             data_path = tmp_path / f"test-model@0x00000000@0@{payload_size}.data"
             assert data_path.stat().st_size >= payload_size
+
+        stats = client.get_io_stats()
+        assert stats["write_ops"] == 3
+        assert stats["read_ops"] == 3
+        assert stats["write_direct_ops"] == 3
+        assert stats["read_direct_ops"] == 3
+        assert stats["write_buffered_ops"] == 0
+        assert stats["read_buffered_ops"] == 0
+        assert stats["write_bytes"] == 4097 + 8192 + 8193
+        assert stats["read_bytes"] == 4097 + 8192 + 8193
+        assert stats["write_direct_bytes"] >= stats["write_bytes"]
+        assert stats["read_direct_bytes"] >= stats["read_bytes"]
+        assert stats["write_errors"] == 0
+        assert stats["read_errors"] == 0
     finally:
         client.close()

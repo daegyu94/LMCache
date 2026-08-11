@@ -10,7 +10,10 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
+import math
+import threading
+import time
 
 if TYPE_CHECKING:
     from lmcache.v1.distributed.internal_api import (
@@ -29,6 +32,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
+    NativeConnectorL2Adapter,
+)
 
 logger = init_logger(__name__)
 
@@ -45,6 +51,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - io_log_interval_sec: emit cumulative I/O progress logs at
+      this interval; zero disables progress logs.
     """
 
     def __init__(
@@ -55,6 +63,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        io_log_interval_sec: float = 0,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -62,6 +71,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.io_log_interval_sec = io_log_interval_sec
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -90,6 +100,15 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        io_log_interval_sec = d.get("io_log_interval_sec", 0)
+        if (
+            isinstance(io_log_interval_sec, bool)
+            or not isinstance(io_log_interval_sec, (int, float))
+            or not math.isfinite(io_log_interval_sec)
+            or io_log_interval_sec < 0
+        ):
+            raise ValueError("io_log_interval_sec must be a finite non-negative number")
+
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -97,6 +116,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            io_log_interval_sec=float(io_log_interval_sec),
         )
 
     @classmethod
@@ -116,7 +136,137 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- io_log_interval_sec (float): cumulative I/O "
+            "progress-log interval in seconds (default 0 = disabled)"
+        )
+
+
+class FSNativeL2Adapter(NativeConnectorL2Adapter):
+    """Native FS adapter with aggregate and optional progress I/O logs."""
+
+    def __init__(
+        self,
+        native_client: Any,
+        max_capacity_gb: float = 0,
+        type_name: str = "",
+        extra_status: dict[str, Any] | None = None,
+        io_log_interval_sec: float = 0,
+    ) -> None:
+        self._io_log_interval_sec = io_log_interval_sec
+        self._io_log_started_at = time.monotonic()
+        self._io_log_stop = threading.Event()
+        self._io_log_thread: threading.Thread | None = None
+        self._io_log_close_lock = threading.Lock()
+        self._io_log_closed = False
+
+        super().__init__(
+            native_client,
+            max_capacity_gb=max_capacity_gb,
+            type_name=type_name,
+            extra_status=extra_status,
+        )
+
+        if self._io_log_interval_sec > 0:
+            self._io_log_thread = threading.Thread(
+                target=self._io_progress_loop,
+                daemon=True,
+                name="fs-native-io-progress",
+            )
+            self._io_log_thread.start()
+
+    def close(self) -> None:
+        """Stop logging, close the connector, and emit the final summary."""
+        with self._io_log_close_lock:
+            if self._io_log_closed:
+                return
+            self._io_log_closed = True
+
+        self._io_log_stop.set()
+        if self._io_log_thread is not None:
+            self._io_log_thread.join(timeout=5.0)
+
+        try:
+            super().close()
+        finally:
+            self._log_io_stats("summary")
+
+    def _io_progress_loop(self) -> None:
+        while not self._io_log_stop.wait(self._io_log_interval_sec):
+            self._log_io_stats("progress")
+
+    def _log_io_stats(self, phase: str) -> None:
+        get_io_stats = getattr(self._client, "get_io_stats", None)
+        if not callable(get_io_stats):
+            return
+
+        try:
+            raw_stats = get_io_stats()
+            stats = {key: int(value) for key, value in raw_stats.items()}
+        except Exception:
+            logger.exception("Failed to collect FS native I/O statistics")
+            return
+
+        elapsed = max(time.monotonic() - self._io_log_started_at, 1e-9)
+
+        read_ops = stats.get("read_ops", 0)
+        read_bytes = stats.get("read_bytes", 0)
+        read_direct_ops = stats.get("read_direct_ops", 0)
+        read_direct_bytes = stats.get("read_direct_bytes", 0)
+        read_buffered_ops = stats.get("read_buffered_ops", 0)
+        read_buffered_bytes = stats.get("read_buffered_bytes", 0)
+        read_errors = stats.get("read_errors", 0)
+        write_ops = stats.get("write_ops", 0)
+        write_bytes = stats.get("write_bytes", 0)
+        write_direct_ops = stats.get("write_direct_ops", 0)
+        write_direct_bytes = stats.get("write_direct_bytes", 0)
+        write_buffered_ops = stats.get("write_buffered_ops", 0)
+        write_buffered_bytes = stats.get("write_buffered_bytes", 0)
+        write_errors = stats.get("write_errors", 0)
+
+        read_avg_latency_ms = (
+            stats.get("read_latency_ns", 0) / read_ops / 1e6 if read_ops else 0.0
+        )
+        write_avg_latency_ms = (
+            stats.get("write_latency_ns", 0) / write_ops / 1e6 if write_ops else 0.0
+        )
+        read_max_latency_ms = stats.get("read_max_latency_ns", 0) / 1e6
+        write_max_latency_ms = stats.get("write_max_latency_ns", 0) / 1e6
+
+        logger.info(
+            "FS native I/O %s: elapsed=%.1fs "
+            "read_ops=%d read_bytes=%d read_GiB=%.2f read_GiB/s=%.2f "
+            "read_direct_ops=%d read_direct_bytes=%d "
+            "read_buffered_ops=%d read_buffered_bytes=%d read_errors=%d "
+            "read_avg_latency_ms=%.3f read_max_latency_ms=%.3f "
+            "write_ops=%d write_bytes=%d write_GiB=%.2f write_GiB/s=%.2f "
+            "write_direct_ops=%d write_direct_bytes=%d "
+            "write_buffered_ops=%d write_buffered_bytes=%d write_errors=%d "
+            "write_avg_latency_ms=%.3f write_max_latency_ms=%.3f",
+            phase,
+            elapsed,
+            read_ops,
+            read_bytes,
+            read_bytes / 1024**3,
+            read_bytes / elapsed / 1024**3,
+            read_direct_ops,
+            read_direct_bytes,
+            read_buffered_ops,
+            read_buffered_bytes,
+            read_errors,
+            read_avg_latency_ms,
+            read_max_latency_ms,
+            write_ops,
+            write_bytes,
+            write_bytes / 1024**3,
+            write_bytes / elapsed / 1024**3,
+            write_direct_ops,
+            write_direct_bytes,
+            write_buffered_ops,
+            write_buffered_bytes,
+            write_errors,
+            write_avg_latency_ms,
+            write_max_latency_ms,
         )
 
 
@@ -137,12 +287,6 @@ def _create_fs_native_l2_adapter(
             "extension. Build with: pip install -e ."
         ) from e
 
-    # Lazy import to avoid circular dependency
-    # First Party
-    from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (  # noqa: E501
-        NativeConnectorL2Adapter,
-    )
-
     assert isinstance(config, FSNativeL2AdapterConfig)
     native_client = LMCacheFSClient(
         config.base_path,
@@ -152,13 +296,15 @@ def _create_fs_native_l2_adapter(
         config.read_ahead_size or 0,
     )
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, "
+        "read_ahead=%s, io_log_interval_sec=%s)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
         config.read_ahead_size,
+        config.io_log_interval_sec,
     )
-    return NativeConnectorL2Adapter(
+    return FSNativeL2Adapter(
         native_client,
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
@@ -167,7 +313,9 @@ def _create_fs_native_l2_adapter(
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
+            "io_log_interval_sec": config.io_log_interval_sec,
         },
+        io_log_interval_sec=config.io_log_interval_sec,
     )
 
 

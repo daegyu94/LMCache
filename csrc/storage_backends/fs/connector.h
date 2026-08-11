@@ -6,11 +6,13 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lmcache {
@@ -48,6 +50,9 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
               size_t read_ahead_size = 0);
   ~FSConnector() override;
 
+  // Return a point-in-time snapshot of data-file I/O counters.
+  std::unordered_map<std::string, uint64_t> get_io_stats() const;
+
  protected:
   WorkerFSConn create_connection() override;
   void do_single_get(WorkerFSConn& conn, const std::string& key, void* buf,
@@ -83,6 +88,27 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   bool use_odirect_;
   size_t disk_block_size_;
   size_t read_ahead_size_;
+
+  struct IOStats {
+    std::atomic<uint64_t> read_ops{0};
+    std::atomic<uint64_t> read_bytes{0};
+    std::atomic<uint64_t> read_direct_ops{0};
+    std::atomic<uint64_t> read_direct_bytes{0};
+    std::atomic<uint64_t> read_buffered_ops{0};
+    std::atomic<uint64_t> read_buffered_bytes{0};
+    std::atomic<uint64_t> read_errors{0};
+    std::atomic<uint64_t> read_latency_ns{0};
+    std::atomic<uint64_t> read_max_latency_ns{0};
+    std::atomic<uint64_t> write_ops{0};
+    std::atomic<uint64_t> write_bytes{0};
+    std::atomic<uint64_t> write_direct_ops{0};
+    std::atomic<uint64_t> write_direct_bytes{0};
+    std::atomic<uint64_t> write_buffered_ops{0};
+    std::atomic<uint64_t> write_buffered_bytes{0};
+    std::atomic<uint64_t> write_errors{0};
+    std::atomic<uint64_t> write_latency_ns{0};
+    std::atomic<uint64_t> write_max_latency_ns{0};
+  } io_stats_;
 };
 
 }  // namespace connector

@@ -3,6 +3,7 @@
 #include "connector.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -231,6 +232,26 @@ static void write_direct(int fd, const void* data, size_t len,
   }
 }
 
+static void update_max_latency(std::atomic<uint64_t>& target,
+                               uint64_t latency_ns) {
+  uint64_t current = target.load(std::memory_order_relaxed);
+  while (current < latency_ns &&
+         !target.compare_exchange_weak(current, latency_ns,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
+static void record_latency(std::atomic<uint64_t>& total_latency_ns,
+                           std::atomic<uint64_t>& max_latency_ns,
+                           std::chrono::steady_clock::time_point started) {
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  const auto latency_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  total_latency_ns.fetch_add(latency_ns, std::memory_order_relaxed);
+  update_max_latency(max_latency_ns, latency_ns);
+}
+
 // ---------------------------------------------------------------
 // FSConnector
 // ---------------------------------------------------------------
@@ -279,6 +300,32 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
 
 FSConnector::~FSConnector() { close(); }
 
+std::unordered_map<std::string, uint64_t> FSConnector::get_io_stats() const {
+  auto load = [](const std::atomic<uint64_t>& value) {
+    return value.load(std::memory_order_relaxed);
+  };
+  return {
+      {"read_ops", load(io_stats_.read_ops)},
+      {"read_bytes", load(io_stats_.read_bytes)},
+      {"read_direct_ops", load(io_stats_.read_direct_ops)},
+      {"read_direct_bytes", load(io_stats_.read_direct_bytes)},
+      {"read_buffered_ops", load(io_stats_.read_buffered_ops)},
+      {"read_buffered_bytes", load(io_stats_.read_buffered_bytes)},
+      {"read_errors", load(io_stats_.read_errors)},
+      {"read_latency_ns", load(io_stats_.read_latency_ns)},
+      {"read_max_latency_ns", load(io_stats_.read_max_latency_ns)},
+      {"write_ops", load(io_stats_.write_ops)},
+      {"write_bytes", load(io_stats_.write_bytes)},
+      {"write_direct_ops", load(io_stats_.write_direct_ops)},
+      {"write_direct_bytes", load(io_stats_.write_direct_bytes)},
+      {"write_buffered_ops", load(io_stats_.write_buffered_ops)},
+      {"write_buffered_bytes", load(io_stats_.write_buffered_bytes)},
+      {"write_errors", load(io_stats_.write_errors)},
+      {"write_latency_ns", load(io_stats_.write_latency_ns)},
+      {"write_max_latency_ns", load(io_stats_.write_max_latency_ns)},
+  };
+}
+
 WorkerFSConn FSConnector::create_connection() {
   WorkerFSConn conn;
   conn.base_path = base_path_;
@@ -293,6 +340,16 @@ WorkerFSConn FSConnector::create_connection() {
 
 void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
                                 void* buf, size_t len, size_t chunk_size) {
+  const auto started = std::chrono::steady_clock::now();
+  io_stats_.read_ops.fetch_add(1, std::memory_order_relaxed);
+  io_stats_.read_bytes.fetch_add(len, std::memory_order_relaxed);
+  if (conn.use_odirect) {
+    io_stats_.read_direct_ops.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    io_stats_.read_buffered_ops.fetch_add(1, std::memory_order_relaxed);
+    io_stats_.read_buffered_bytes.fetch_add(len, std::memory_order_relaxed);
+  }
+
   std::string filename = key_to_filename(key);
   auto file_path = conn.base_path / filename;
 
@@ -305,6 +362,9 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
 
   int fd = ::open(file_path.c_str(), flags);
   if (fd < 0) {
+    io_stats_.read_errors.fetch_add(1, std::memory_order_relaxed);
+    record_latency(io_stats_.read_latency_ns, io_stats_.read_max_latency_ns,
+                   started);
     throw std::runtime_error("open for read failed: " + file_path.string() +
                              ": " + strerror(errno));
   }
@@ -318,6 +378,7 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
       }
       const size_t alignment = conn.direct_io_alignment;
       const size_t io_len = round_up_to_alignment(len, alignment);
+      io_stats_.read_direct_bytes.fetch_add(io_len, std::memory_order_relaxed);
       void* io_buf = buf;
       if (len > 0 &&
           (io_len != len || !is_aligned_for_direct_io(buf, alignment))) {
@@ -349,10 +410,15 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
                                ", got " + std::to_string(n));
     }
   } catch (...) {
+    io_stats_.read_errors.fetch_add(1, std::memory_order_relaxed);
+    record_latency(io_stats_.read_latency_ns, io_stats_.read_max_latency_ns,
+                   started);
     ::close(fd);
     throw;
   }
   ::close(fd);
+  record_latency(io_stats_.read_latency_ns, io_stats_.read_max_latency_ns,
+                 started);
 }
 
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
@@ -364,6 +430,16 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   // Skip if already stored on disk
   if (std::filesystem::exists(file_path)) {
     return;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  io_stats_.write_ops.fetch_add(1, std::memory_order_relaxed);
+  io_stats_.write_bytes.fetch_add(len, std::memory_order_relaxed);
+  if (conn.use_odirect) {
+    io_stats_.write_direct_ops.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    io_stats_.write_buffered_ops.fetch_add(1, std::memory_order_relaxed);
+    io_stats_.write_buffered_bytes.fetch_add(len, std::memory_order_relaxed);
   }
 
   // Determine temp file path
@@ -384,6 +460,9 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
 
   int fd = ::open(tmp_path.c_str(), flags, 0644);
   if (fd < 0) {
+    io_stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
+    record_latency(io_stats_.write_latency_ns, io_stats_.write_max_latency_ns,
+                   started);
     throw std::runtime_error("open for write failed: " + tmp_path.string() +
                              ": " + strerror(errno));
   }
@@ -396,6 +475,7 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
       }
       const size_t alignment = conn.direct_io_alignment;
       const size_t io_len = round_up_to_alignment(len, alignment);
+      io_stats_.write_direct_bytes.fetch_add(io_len, std::memory_order_relaxed);
       const void* io_buf = buf;
       if (len > 0 &&
           (io_len != len || !is_aligned_for_direct_io(buf, alignment))) {
@@ -411,12 +491,17 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
       write_all(fd, buf, len);
     }
   } catch (...) {
+    io_stats_.write_errors.fetch_add(1, std::memory_order_relaxed);
+    record_latency(io_stats_.write_latency_ns, io_stats_.write_max_latency_ns,
+                   started);
     ::close(fd);
     // Clean up temp file on failure
     std::filesystem::remove(tmp_path);
     throw;
   }
   ::close(fd);
+  record_latency(io_stats_.write_latency_ns, io_stats_.write_max_latency_ns,
+                 started);
 
   // Atomic rename: tmp -> final
   std::error_code ec;

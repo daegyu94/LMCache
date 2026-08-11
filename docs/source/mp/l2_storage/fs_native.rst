@@ -26,6 +26,8 @@ I/O queue depth on a single Python thread.
   issuing a warm-up read of this many bytes at open time.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
   for client-side usage tracking.  Default ``0`` disables tracking.
+- ``io_log_interval_sec`` (float, default ``0``): Emit cumulative I/O
+  progress logs at this interval in seconds.  ``0`` disables progress logs.
 
 .. important::
 
@@ -41,6 +43,14 @@ I/O queue depth on a single Python thread.
    filesystems or direct-I/O syscall failures are reported instead of being
    retried with buffered I/O.
 
+   The adapter always emits one aggregate I/O summary when it closes.  The
+   summary and optional progress logs are written to the LMCache process log
+   and include logical bytes, direct/buffered operation counts, errors, and
+   average/maximum latency.  The ``*_bytes`` fields are logical payload bytes;
+   ``*_direct_bytes`` additionally includes alignment padding issued to the
+   direct-I/O syscall.  For example, set ``io_log_interval_sec`` to ``5`` to
+   emit a cumulative progress line every five seconds.
+
 **Configuration examples:**
 
 .. code-block:: bash
@@ -53,6 +63,9 @@ I/O queue depth on a single Python thread.
 
     # O_DIRECT for real-disk benchmarking
     --l2-adapter '{"type": "fs_native", "base_path": "/data/lmcache/l2", "num_workers": 32, "use_odirect": true}'
+
+    # Aggregate summary plus cumulative progress every five seconds
+    --l2-adapter '{"type": "fs_native", "base_path": "/data/lmcache/l2", "use_odirect": true, "io_log_interval_sec": 5}'
 
 **Buffer-only mode example.**  L1 acts as a pure write buffer that
 absorbs the peak burst of in-flight chunks while the C++ worker pool
