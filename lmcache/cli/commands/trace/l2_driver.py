@@ -327,11 +327,14 @@ class L2ReplayDriver:
         """Run causal timestamp-scaled L2 replay and return JSON-safe stats."""
         pending = list(self._plan.operations)
         completed: set[TaskKey] = set()
+        completion_times: dict[TaskKey, float] = {}
         stores: dict[int, tuple[ReplayOperation, list[MemoryObj], float]] = {}
         lookups: dict[int, tuple[ReplayOperation, list[MemoryObj], float]] = {}
         loads: dict[int, tuple[ReplayOperation, list[MemoryObj], float]] = {}
         dispatch_times: list[float] = []
         schedule_lags: list[float] = []
+        dependency_waits: list[float] = []
+        buffer_waits: list[float] = []
         mismatches: list[str] = []
         counts: dict[str, int] = defaultdict(int)
         bytes_submitted: dict[str, int] = defaultdict(int)
@@ -375,6 +378,12 @@ class L2ReplayDriver:
                 counts[op.operation] += 1
                 dispatch_times.append(dispatched)
                 schedule_lags.append(max(0.0, dispatched - target))
+                dependency_ready = max(
+                    [target]
+                    + [completion_times[dependency] for dependency in op.dependencies]
+                )
+                dependency_waits.append(max(0.0, dependency_ready - target))
+                buffer_waits.append(max(0.0, dispatched - dependency_ready))
                 progress = True
 
             for (
@@ -393,6 +402,7 @@ class L2ReplayDriver:
                     mismatches.append(f"store:{op.task_key}")
                 if op.task_key is not None:
                     completed.add(op.task_key)
+                    completion_times[op.task_key] = time.monotonic()
                 progress = True
 
             for target_id in list(lookups):
@@ -406,6 +416,7 @@ class L2ReplayDriver:
                     mismatches.append(f"lookup:{op.task_key}")
                 if op.task_key is not None:
                     completed.add(op.task_key)
+                    completion_times[op.task_key] = time.monotonic()
                 progress = True
 
             for target_id in list(loads):
@@ -422,6 +433,7 @@ class L2ReplayDriver:
                     mismatches.append(f"load:{op.task_key}")
                 if op.task_key is not None:
                     completed.add(op.task_key)
+                    completion_times[op.task_key] = time.monotonic()
                 progress = True
 
             if progress:
@@ -462,6 +474,10 @@ class L2ReplayDriver:
             "mean_schedule_lag_seconds": (
                 sum(schedule_lags) / len(schedule_lags) if schedule_lags else 0.0
             ),
+            "max_dependency_wait_seconds": max(dependency_waits, default=0.0),
+            "total_dependency_wait_seconds": sum(dependency_waits),
+            "max_buffer_wait_seconds": max(buffer_waits, default=0.0),
+            "total_buffer_wait_seconds": sum(buffer_waits),
             "operations_submitted": dict(counts),
             "bytes_submitted": dict(bytes_submitted),
             "total_bytes_submitted": total_bytes,

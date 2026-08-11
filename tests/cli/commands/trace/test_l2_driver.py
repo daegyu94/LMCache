@@ -177,3 +177,5 @@ def test_causal_replay_store_then_read_is_valid(tmp_path):
     assert result["total_bytes_submitted"] == 8192
     assert result["actual_submission_window_seconds"] >= 0
     assert result["drain_seconds"] >= 0
+    assert result["total_dependency_wait_seconds"] >= 0
+    assert result["total_buffer_wait_seconds"] >= 0
