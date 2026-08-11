@@ -154,6 +154,51 @@ def test_plan_derives_store_lookup_load_dependencies(tmp_path):
     assert plan.prepare_objects == {}
 
 
+def test_plan_preserves_overlapping_store_lookup_submission(tmp_path):
+    trace = tmp_path / "l2.lct"
+    key = _key(8)
+    common = {"adapter_index": 0, "l2_name": "mock"}
+    _write_trace(
+        trace,
+        [
+            (
+                EventType.L2_STORE_SUBMITTED,
+                {**common, "task_id": 1, "keys": [key], "object_sizes": [4096]},
+            ),
+            (
+                EventType.L2_LOOKUP_TASK_SUBMITTED,
+                {
+                    **common,
+                    "request_id": 11,
+                    "task_id": 2,
+                    "keys": [key],
+                    "layout_desc": _layout(),
+                },
+            ),
+            (
+                EventType.L2_STORE_COMPLETED,
+                {
+                    **common,
+                    "task_id": 1,
+                    "succeeded_count": 1,
+                    "failed_count": 0,
+                    "bytes_transferred": 4096,
+                },
+            ),
+            (
+                EventType.L2_LOOKUP_TASK_COMPLETED,
+                {**common, "request_id": 11, "task_id": 2, "hit_indices": [0]},
+            ),
+        ],
+    )
+
+    plan = L2TracePlan.from_file(str(trace))
+    _, lookup = plan.operations
+
+    assert lookup.dependencies == set()
+    assert plan.prepare_objects == {}
+
+
 def test_plan_preserves_cache_salt(tmp_path):
     trace = tmp_path / "l2.lct"
     key = _key(7, cache_salt="tenant-a")

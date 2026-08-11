@@ -212,13 +212,21 @@ class L2TracePlan:
             hit_indices = completion.get("hit_indices", [])
             for index in hit_indices:
                 object_key = lookup.args["keys"][index]
-                candidates = [
+                completed_store_candidates = [
                     item
                     for item in successful_store_by_key.get(object_key, [])
                     if item[0] < complete_seq
                 ]
-                if candidates:
-                    lookup.dependencies.add(max(candidates)[1])
+                # A store that completes while lookup is in flight may explain
+                # the hit, but it is not a source happens-before dependency.
+                dependency_candidates = [
+                    item
+                    for item in completed_store_candidates
+                    if item[0] < lookup.sequence
+                ]
+                if dependency_candidates:
+                    lookup.dependencies.add(max(dependency_candidates)[1])
+                if completed_store_candidates:
                     continue
                 size = size_by_key.get(object_key)
                 if size is None:
