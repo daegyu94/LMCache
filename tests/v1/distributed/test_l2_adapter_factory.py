@@ -698,9 +698,11 @@ class _FakeNativeConnector:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self._efd = create_event_notifier()
+        self._closed = False
 
     def event_fd(self):
-        return -1
+        return self._efd.fileno()
 
     def submit_batch_get(self, keys, memoryviews):
         return 0
@@ -715,7 +717,9 @@ class _FakeNativeConnector:
         return []
 
     def close(self):
-        pass
+        if not self._closed:
+            self._closed = True
+            self._efd.close()
 
 
 class _MissingMethodConnector:

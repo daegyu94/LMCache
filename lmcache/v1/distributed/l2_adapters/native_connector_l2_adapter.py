@@ -111,7 +111,16 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     ) -> None:
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         self._client = native_client
-        self._client_fd: int = int(native_client.event_fd())
+        client_fd = int(native_client.event_fd())
+        if client_fd < 0:
+            close = getattr(native_client, "close", None)
+            if callable(close):
+                close()
+            raise ValueError(
+                "native connector event_fd() must return a non-negative "
+                f"file descriptor, got {client_fd}"
+            )
+        self._client_fd = client_fd
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
 

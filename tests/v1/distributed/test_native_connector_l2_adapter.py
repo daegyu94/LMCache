@@ -155,6 +155,13 @@ class MockNativeConnector:
             pass
 
 
+class InvalidEventFdConnector(MockNativeConnector):
+    """Connector that exposes an unusable event fd."""
+
+    def event_fd(self) -> int:
+        return -1
+
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -740,6 +747,14 @@ class TestEndToEndWorkflow:
 
 
 class TestClose:
+    def test_negative_event_fd_fails_before_starting_demux_thread(self):
+        client = InvalidEventFdConnector()
+
+        with pytest.raises(ValueError, match="non-negative file descriptor"):
+            NativeConnectorL2Adapter(client)
+
+        assert client._closed is True
+
     def test_close_does_not_raise(self):
         mock_client = MockNativeConnector()
         adp = NativeConnectorL2Adapter(mock_client)
