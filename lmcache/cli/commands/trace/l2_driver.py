@@ -72,20 +72,36 @@ class L2TracePlan:
     operations: list[ReplayOperation]
     completions: dict[TaskKey, dict[str, Any]]
     prepare_objects: dict[ObjectKey, int]
+    trace_percent: float
+    source_operations_total: int
 
     @classmethod
-    def from_file(cls, trace_path: str) -> "L2TracePlan":
+    def from_file(
+        cls,
+        trace_path: str,
+        *,
+        trace_percent: float = 100.0,
+    ) -> "L2TracePlan":
         """Parse an L2 trace and derive causal dependencies.
 
         Args:
             trace_path: L2 ``.lct`` file.
+            trace_percent: Percentage of source submissions to select from
+                the beginning of the trace.
 
         Returns:
             Replay plan ordered by source submission sequence.
 
         Raises:
-            ValueError: The trace is not L2-level or uses multiple adapters.
+            ValueError: The trace or percentage is invalid, or the trace uses
+                multiple adapters.
         """
+        if (
+            not math.isfinite(trace_percent)
+            or trace_percent <= 0
+            or trace_percent > 100
+        ):
+            raise ValueError("trace_percent must be finite and in (0, 100]")
         decoded: list[tuple[int, float, str, dict[str, Any]]] = []
         footer: dict[str, Any] | None = None
         with TraceReader(trace_path) as reader:
@@ -137,8 +153,14 @@ class L2TracePlan:
         size_by_key: dict[ObjectKey, int] = {}
 
         submit_names = {_STORE_SUBMIT, _LOOKUP_SUBMIT, _LOAD_SUBMIT, _UNLOCK, _DELETE}
+        source_operations_total = sum(
+            1 for _, _, name, _ in decoded if name in submit_names
+        )
+        selected_operations = math.ceil(source_operations_total * trace_percent / 100.0)
         for sequence, t_mono, name, args in decoded:
             if name in submit_names:
+                if len(operations) >= selected_operations:
+                    continue
                 operation = name.split(".")[1]
                 key = None
                 if name in {_STORE_SUBMIT, _LOOKUP_SUBMIT, _LOAD_SUBMIT}:
@@ -218,8 +240,14 @@ class L2TracePlan:
 
         return cls(
             operations=operations,
-            completions=completions,
+            completions={
+                key: completion
+                for key, completion in completions.items()
+                if key in by_task
+            },
             prepare_objects=prepare_objects,
+            trace_percent=trace_percent,
+            source_operations_total=source_operations_total,
         )
 
 
@@ -271,11 +299,15 @@ class L2ReplayDriver:
         trace_path: str,
         *,
         speedup: float = 1.0,
+        trace_percent: float = 100.0,
         drain_timeout: float = 60.0,
     ) -> None:
         if not math.isfinite(speedup) or speedup <= 0:
             raise ValueError("speedup must be a finite positive number")
-        self._plan = L2TracePlan.from_file(trace_path)
+        self._plan = L2TracePlan.from_file(
+            trace_path,
+            trace_percent=trace_percent,
+        )
         self._storage_manager = StorageManager(sm_config, start_controllers=False)
         adapters = self._storage_manager.l2_adapters_snapshot()
         if len(adapters) != 1:
@@ -485,6 +517,9 @@ class L2ReplayDriver:
         return {
             "valid": not mismatches,
             "speedup": self._speedup,
+            "trace_percent": self._plan.trace_percent,
+            "source_operations_total": self._plan.source_operations_total,
+            "operations_selected": len(self._plan.operations),
             "source_submission_window_seconds": source_window,
             "actual_submission_window_seconds": submission_window,
             "total_replay_seconds": elapsed,

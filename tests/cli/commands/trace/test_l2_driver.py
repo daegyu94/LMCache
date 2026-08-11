@@ -198,3 +198,26 @@ def test_plan_rejects_trace_without_end_marker(tmp_path):
 
     with pytest.raises(ValueError, match="missing end marker"):
         L2TracePlan.from_file(str(trace))
+
+
+def test_plan_selects_leading_percentage_of_submissions(tmp_path):
+    trace = tmp_path / "l2.lct"
+    _write_trace(trace, _store_then_read_events(_key(5)))
+
+    plan = L2TracePlan.from_file(str(trace), trace_percent=50.0)
+
+    assert plan.source_operations_total == 4
+    assert [operation.operation for operation in plan.operations] == [
+        "store",
+        "lookup_task",
+    ]
+    assert plan.operations[1].dependencies == {plan.operations[0].task_key}
+
+
+@pytest.mark.parametrize("trace_percent", [0.0, -1.0, 100.1, float("nan")])
+def test_trace_percent_must_be_finite_and_in_range(tmp_path, trace_percent):
+    trace = tmp_path / "l2.lct"
+    _write_trace(trace, _store_then_read_events(_key(6)))
+
+    with pytest.raises(ValueError, match="trace_percent"):
+        L2TracePlan.from_file(str(trace), trace_percent=trace_percent)

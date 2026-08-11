@@ -29,6 +29,8 @@ I/O submission rate but does not reduce backend latency. A saturated backend
 shows increasing dependency/buffer wait, schedule lag, and drain time.
 Replay also rejects traces whose final completeness marker is missing or
 reports recorder/EventBus drops.
+`--trace-percent N` limits L2 replay and prepare to the first `N%` of source
+task submissions; matching completion records remain available for validation.
 
 For configuration reference see [README.md](README.md). For event metadata
 contracts see [EVENTS.md](EVENTS.md).

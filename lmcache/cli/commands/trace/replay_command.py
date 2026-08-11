@@ -105,6 +105,15 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--trace-percent",
+        type=float,
+        default=100.0,
+        help=(
+            "Replay the first N percent of L2 task submissions "
+            "(default: 100; L2 traces only)."
+        ),
+    )
+    parser.add_argument(
         "--cache-stats-out",
         default=None,
         metavar="PATH",
@@ -198,8 +207,10 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     if trace_level == "l2":
         _run_l2_trace_replay(args, sm_config)
         return
-    if args.prepare_l2 or args.prepare_only:
-        raise ValueError("--prepare-l2/--prepare-only require an L2 trace")
+    if args.prepare_l2 or args.prepare_only or args.trace_percent != 100.0:
+        raise ValueError(
+            "--prepare-l2/--prepare-only/--trace-percent require an L2 trace"
+        )
 
     # ANSI: bold + yellow for the banner text, reset at the end.
     bold = "\033[1;33m"
@@ -325,6 +336,7 @@ def _run_l2_trace_replay(
         sm_config,
         args.trace_path,
         speedup=args.speedup,
+        trace_percent=args.trace_percent,
         drain_timeout=args.drain_timeout,
     ) as driver:
         if args.prepare_l2 or args.prepare_only:
