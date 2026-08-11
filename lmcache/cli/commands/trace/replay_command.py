@@ -353,12 +353,14 @@ def _run_l2_trace_replay(
     )
     write_json(stats_path, replay_result)
     logger.info("L2 replay statistics written to %s", stats_path)
-    if not replay_result["valid"]:
-        logger.error(
-            "L2 replay outcome mismatch: %s",
-            replay_result["outcome_mismatches"],
+    if not replay_result["outcome_matches_source"]:
+        logger.warning(
+            "L2 replay outcomes differ from the source; replay remains successful: "
+            "mismatch_count=%s by_operation=%s samples=%s",
+            replay_result["outcome_mismatch_count"],
+            replay_result["outcome_mismatch_counts"],
+            replay_result["outcome_mismatch_samples"],
         )
-        raise SystemExit(1)
 
 
 def _emit_replay_metrics(

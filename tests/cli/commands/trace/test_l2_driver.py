@@ -3,7 +3,10 @@
 """Tests for direct causal L2 trace replay."""
 
 # Standard
+from argparse import Namespace
 from pathlib import Path
+from unittest import mock
+import json
 import struct
 import time
 
@@ -12,6 +15,8 @@ import pytest
 import torch
 
 # First Party
+from lmcache.cli.commands.trace import l2_driver as l2_driver_module
+from lmcache.cli.commands.trace import replay_command
 from lmcache.cli.commands.trace.l2_driver import L2ReplayDriver, L2TracePlan
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
@@ -160,7 +165,7 @@ def test_prepare_and_replay_read_before_trace(tmp_path):
 
     assert prepared["prepared_objects"] == 1
     assert prepared["prepared_bytes"] == 4096
-    assert result["valid"] is True
+    assert result["outcome_matches_source"] is True
     assert result["operations_submitted"] == {
         "lookup_task": 1,
         "load_task": 1,
@@ -175,12 +180,95 @@ def test_causal_replay_store_then_read_is_valid(tmp_path):
     with L2ReplayDriver(_config(), str(trace), speedup=10.0) as driver:
         result = driver.run()
 
-    assert result["valid"] is True
+    assert result["outcome_matches_source"] is True
     assert result["total_bytes_submitted"] == 8192
     assert result["actual_submission_window_seconds"] >= 0
     assert result["drain_seconds"] >= 0
     assert result["total_dependency_wait_seconds"] >= 0
     assert result["total_buffer_wait_seconds"] >= 0
+
+
+def test_outcome_mismatch_is_reported_as_metrics(tmp_path):
+    trace = tmp_path / "l2.lct"
+    events = _store_then_read_events(_key(4))[:2]
+    events[1][1]["succeeded_count"] = 0
+    events[1][1]["failed_count"] = 1
+    _write_trace(trace, events)
+
+    with L2ReplayDriver(_config(), str(trace), speedup=10.0) as driver:
+        result = driver.run()
+
+    assert "valid" not in result
+    assert result["outcome_matches_source"] is False
+    assert result["outcome_comparisons"] == {"store": 1}
+    assert result["outcome_mismatch_count"] == 1
+    assert result["outcome_mismatch_counts"] == {"store": 1}
+    assert result["outcome_mismatch_rate"] == 1.0
+    assert len(result["outcome_mismatch_samples"]) == 1
+    assert result["operations_without_outcome_comparison"] == {
+        "unlock": 0,
+        "delete": 0,
+    }
+
+
+def test_delete_is_reported_without_outcome_validation(tmp_path):
+    trace = tmp_path / "l2.lct"
+    key = _key(5)
+    _write_trace(
+        trace,
+        [
+            (
+                EventType.L2_DELETE_SUBMITTED,
+                {
+                    "adapter_index": 0,
+                    "l2_name": "mock",
+                    "keys": [key],
+                },
+            )
+        ],
+    )
+
+    with L2ReplayDriver(_config(), str(trace), speedup=10.0) as driver:
+        result = driver.run()
+
+    assert result["outcome_matches_source"] is True
+    assert result["outcome_comparisons"] == {}
+    assert result["outcome_mismatch_count"] == 0
+    assert result["operations_without_outcome_comparison"] == {
+        "unlock": 0,
+        "delete": 1,
+    }
+
+
+def test_cli_outcome_mismatch_does_not_fail(tmp_path, monkeypatch):
+    replay_result = {
+        "outcome_matches_source": False,
+        "outcome_mismatch_count": 1,
+        "outcome_mismatch_counts": {"store": 1},
+        "outcome_mismatch_samples": ["store:sample"],
+    }
+    driver = mock.MagicMock()
+    driver.__enter__.return_value = driver
+    driver.run.return_value = replay_result
+    monkeypatch.setattr(
+        l2_driver_module,
+        "L2ReplayDriver",
+        mock.Mock(return_value=driver),
+    )
+    args = Namespace(
+        trace_path="unused.lct",
+        speedup=1.0,
+        trace_percent=100.0,
+        drain_timeout=60.0,
+        prepare_l2=False,
+        prepare_only=False,
+        output_dir=str(tmp_path),
+        l2_stats_out=None,
+    )
+
+    replay_command._run_l2_trace_replay(args, _config())
+
+    assert json.loads((tmp_path / "l2_replay_stats.json").read_text()) == replay_result
 
 
 def test_plan_rejects_trace_without_end_marker(tmp_path):

@@ -40,6 +40,7 @@ _LOAD_COMPLETE = "l2.load_task.completed"
 _UNLOCK = "l2.unlock.submitted"
 _DELETE = "l2.delete.submitted"
 _TRACE_END = "l2.trace.end"
+_OUTCOME_MISMATCH_SAMPLE_LIMIT = 100
 
 
 def _task_key(operation: str, args: dict[str, Any]) -> TaskKey:
@@ -386,9 +387,25 @@ class L2ReplayDriver:
         schedule_lags: list[float] = []
         dependency_waits: list[float] = []
         buffer_waits: list[float] = []
-        mismatches: list[str] = []
+        outcome_comparisons: dict[str, int] = defaultdict(int)
+        outcome_mismatch_counts: dict[str, int] = defaultdict(int)
+        outcome_mismatch_count = 0
+        outcome_mismatch_samples: list[str] = []
         counts: dict[str, int] = defaultdict(int)
         bytes_submitted: dict[str, int] = defaultdict(int)
+
+        def record_outcome_comparison(
+            operation: str, task_key: TaskKey, matches: bool
+        ) -> None:
+            nonlocal outcome_mismatch_count
+            outcome_comparisons[operation] += 1
+            if matches:
+                return
+            outcome_mismatch_count += 1
+            outcome_mismatch_counts[operation] += 1
+            if len(outcome_mismatch_samples) < _OUTCOME_MISMATCH_SAMPLE_LIMIT:
+                outcome_mismatch_samples.append(f"{operation}:{task_key}")
+
         started = time.monotonic()
         last_progress = started
 
@@ -449,8 +466,9 @@ class L2ReplayDriver:
                 assert op.task_key is not None
                 expected = self._plan.completions.get(op.task_key, {})
                 expected_ok = int(expected.get("succeeded_count", 0)) > 0
-                if store_result.is_successful() != expected_ok:
-                    mismatches.append(f"store:{op.task_key}")
+                record_outcome_comparison(
+                    "store", op.task_key, store_result.is_successful() == expected_ok
+                )
                 if op.task_key is not None:
                     completed.add(op.task_key)
                     completion_times[op.task_key] = time.monotonic()
@@ -463,8 +481,11 @@ class L2ReplayDriver:
                 op, _, _ = lookups.pop(target_id)
                 assert op.task_key is not None
                 expected = self._plan.completions.get(op.task_key, {})
-                if lookup_result.get_indices_list() != expected.get("hit_indices", []):
-                    mismatches.append(f"lookup:{op.task_key}")
+                record_outcome_comparison(
+                    "lookup_task",
+                    op.task_key,
+                    lookup_result.get_indices_list() == expected.get("hit_indices", []),
+                )
                 if op.task_key is not None:
                     completed.add(op.task_key)
                     completion_times[op.task_key] = time.monotonic()
@@ -478,10 +499,12 @@ class L2ReplayDriver:
                 self._buffers.release(objects)
                 assert op.task_key is not None
                 expected = self._plan.completions.get(op.task_key, {})
-                if load_result.get_indices_list() != expected.get(
-                    "success_indices", []
-                ):
-                    mismatches.append(f"load:{op.task_key}")
+                record_outcome_comparison(
+                    "load_task",
+                    op.task_key,
+                    load_result.get_indices_list()
+                    == expected.get("success_indices", []),
+                )
                 if op.task_key is not None:
                     completed.add(op.task_key)
                     completion_times[op.task_key] = time.monotonic()
@@ -515,7 +538,6 @@ class L2ReplayDriver:
             max(0.0, finished - max(dispatch_times)) if dispatch_times else 0.0
         )
         return {
-            "valid": not mismatches,
             "speedup": self._speedup,
             "trace_percent": self._plan.trace_percent,
             "source_operations_total": self._plan.source_operations_total,
@@ -536,7 +558,20 @@ class L2ReplayDriver:
             "bytes_submitted": dict(bytes_submitted),
             "total_bytes_submitted": total_bytes,
             "throughput_bytes_per_second": total_bytes / elapsed if elapsed else 0.0,
-            "outcome_mismatches": mismatches,
+            "outcome_matches_source": outcome_mismatch_count == 0,
+            "outcome_comparisons": dict(outcome_comparisons),
+            "outcome_mismatch_count": outcome_mismatch_count,
+            "outcome_mismatch_counts": dict(outcome_mismatch_counts),
+            "outcome_mismatch_rate": (
+                outcome_mismatch_count / sum(outcome_comparisons.values())
+                if outcome_comparisons
+                else 0.0
+            ),
+            "outcome_mismatch_samples": outcome_mismatch_samples,
+            "operations_without_outcome_comparison": {
+                "unlock": counts.get("unlock", 0),
+                "delete": counts.get("delete", 0),
+            },
         }
 
 
