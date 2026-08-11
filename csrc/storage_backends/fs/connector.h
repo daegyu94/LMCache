@@ -6,8 +6,10 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,10 @@ static constexpr const char* PATH_SLASH_REPLACEMENT = "-SEP-";
 static constexpr const char* FILE_EXT = ".data";
 static constexpr const char* TMP_EXT = ".tmp";
 
+struct AlignedBufferDeleter {
+  void operator()(void* ptr) const { std::free(ptr); }
+};
+
 // Per-worker connection state for the FS connector.
 // Each worker maintains its own I/O buffer for O_DIRECT.
 struct WorkerFSConn {
@@ -27,6 +33,9 @@ struct WorkerFSConn {
   std::filesystem::path tmp_dir;  // empty if not configured
   bool use_odirect = false;
   size_t disk_block_size = 0;
+  size_t direct_io_alignment = 0;
+  size_t direct_io_buffer_size = 0;
+  std::unique_ptr<void, AlignedBufferDeleter> direct_io_buffer;
   // If > 0, trigger filesystem readahead by issuing a small
   // initial read of this many bytes before reading the rest.
   size_t read_ahead_size = 0;
