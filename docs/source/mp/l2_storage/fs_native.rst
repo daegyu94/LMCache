@@ -19,9 +19,8 @@ I/O queue depth on a single Python thread.
 - ``relative_tmp_dir`` (str, default ``""``): Relative sub-directory for
   temporary files during writes (atomic rename on completion).
 - ``use_odirect`` (bool, default ``false``): Bypass the page cache via
-  ``O_DIRECT``.  Required to measure real disk bandwidth.  The connector
-  keeps this mode enabled for every operation and uses an aligned temporary
-  buffer when the caller's buffer is not suitable for direct I/O.
+  ``O_DIRECT``.  Required to measure real disk bandwidth.  See alignment
+  caveat below.
 - ``read_ahead_size`` (int, optional): Trigger filesystem readahead by
   issuing a warm-up read of this many bytes at open time.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
@@ -29,15 +28,31 @@ I/O queue depth on a single Python thread.
 
 .. important::
 
-   ``O_DIRECT`` requires the buffer address, transfer length, and file
-   offset to be aligned to the filesystem block size.  The connector
-   queries that block size at construction time, keeps ``O_DIRECT`` on for
-   all reads and writes, and uses a block-aligned bounce buffer for an
-   unaligned caller buffer.  A non-block-sized object is zero-padded in the
-   file and trimmed back to its logical size on read.  Therefore a fresh
-   directory can use arbitrary object sizes without falling back to buffered
-   I/O.  Existing files written by an older direct-I/O implementation must
-   be rewritten if their physical size is not block-aligned.
+   ``O_DIRECT`` has two independent alignment requirements:
+
+   1. **Length alignment.**  The transfer length must be a multiple of
+      the filesystem's block size.  The connector queries the disk block
+      size at construction time and, on each operation, checks
+      ``len % disk_block_size``.  If the length is **not** a multiple,
+      the connector silently falls back to a buffered open (no
+      ``O_DIRECT``) for that operation -- correctness is preserved but
+      you do not get true direct I/O.  To ensure ``O_DIRECT`` is
+      actually used, choose ``--chunk-size`` so that the resulting
+      per-chunk byte size is a multiple of the FS block size.  GPFS and
+      similar parallel filesystems often use large blocks (e.g. several
+      MiB).
+
+   2. **Memory-buffer alignment.**  The I/O buffer pointer itself must
+      also be aligned (typically to 4096 bytes on local disks, or to the
+      FS block size on parallel filesystems).  This is controlled by
+      ``--l1-align-bytes`` (default ``4096``) -- raise it to match the
+      FS block size when running on a filesystem with larger blocks.  If
+      the buffer is misaligned, the underlying ``read``/``write`` syscall
+      returns ``EINVAL`` (this is **not** caught by the length-fallback
+      path above and will surface as a runtime error).
+
+   If unsure, start with ``use_odirect: false`` and confirm correctness
+   before enabling ``O_DIRECT``.
 
 **Configuration examples:**
 
