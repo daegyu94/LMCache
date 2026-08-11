@@ -27,6 +27,8 @@ completion only along those edges; unrelated operations retain their
 timestamp-scaled submission schedule. `--speedup` therefore raises offered
 I/O submission rate but does not reduce backend latency. A saturated backend
 shows increasing dependency/buffer wait, schedule lag, and drain time.
+Replay also rejects traces whose final completeness marker is missing or
+reports recorder/EventBus drops.
 
 For configuration reference see [README.md](README.md). For event metadata
 contracts see [EVENTS.md](EVENTS.md).

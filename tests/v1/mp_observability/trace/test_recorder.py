@@ -115,6 +115,14 @@ class TestGateLifecycle:
         rec.close()  # must not raise
         assert is_tracing_enabled() is False
 
+    def test_l2_recorder_does_not_enable_storage_call_gate(self, trace_path):
+        assert is_tracing_enabled() is False
+        rec = L2TraceRecorder(trace_path)
+        try:
+            assert is_tracing_enabled() is False
+        finally:
+            rec.close()
+
 
 class TestRecordRoundtrip:
     def test_l2_task_event_roundtrip(self, trace_path):
@@ -146,11 +154,36 @@ class TestRecordRoundtrip:
         with TraceReader(trace_path) as reader:
             assert reader.header.level == "l2"
             records = list(reader.records())
-        assert len(records) == 1
+        assert len(records) == 2
         assert records[0].qualname == "l2.store.submitted"
         decoded = codecs.decode_args(records[0].args)
         assert decoded["keys"] == [key]
         assert decoded["object_sizes"] == [4096]
+        assert records[1].qualname == "l2.trace.end"
+        footer = codecs.decode_args(records[1].args)
+        assert footer == {
+            "recorder_dropped_count": 0,
+            "event_bus_dropped_count": 0,
+        }
+
+    def test_l2_footer_captures_event_bus_drops(self, trace_path):
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=0))
+        rec = L2TraceRecorder(trace_path)
+        bus.register_subscriber(rec)
+        bus.publish(
+            Event(
+                event_type=EventType.L2_STORE_SUBMITTED,
+                metadata={"trace_t_mono": time.monotonic()},
+            )
+        )
+        bus.stop()
+
+        with TraceReader(trace_path) as reader:
+            records = list(reader.records())
+        assert len(records) == 1
+        assert records[0].qualname == "l2.trace.end"
+        footer = codecs.decode_args(records[0].args)
+        assert footer["event_bus_dropped_count"] == 1
 
     def test_records_via_eventbus(self, trace_path):
         bus = EventBus(EventBusConfig(enabled=True))

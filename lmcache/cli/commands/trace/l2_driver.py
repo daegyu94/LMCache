@@ -39,6 +39,7 @@ _LOAD_SUBMIT = "l2.load_task.submitted"
 _LOAD_COMPLETE = "l2.load_task.completed"
 _UNLOCK = "l2.unlock.submitted"
 _DELETE = "l2.delete.submitted"
+_TRACE_END = "l2.trace.end"
 
 
 def _task_key(operation: str, args: dict[str, Any]) -> TaskKey:
@@ -86,20 +87,38 @@ class L2TracePlan:
             ValueError: The trace is not L2-level or uses multiple adapters.
         """
         decoded: list[tuple[int, float, str, dict[str, Any]]] = []
+        footer: dict[str, Any] | None = None
         with TraceReader(trace_path) as reader:
             if reader.header.level != "l2":
                 raise ValueError(
                     f"L2 replay requires header.level='l2', got {reader.header.level!r}"
                 )
             for sequence, record in enumerate(reader.records()):
+                args = codecs.decode_args(record.args)
+                if record.qualname == _TRACE_END:
+                    if footer is not None:
+                        raise ValueError("invalid L2 trace: duplicate end marker")
+                    footer = args
+                    continue
                 decoded.append(
                     (
                         sequence,
                         record.t_mono,
                         record.qualname,
-                        codecs.decode_args(record.args),
+                        args,
                     )
                 )
+
+        if footer is None:
+            raise ValueError("incomplete L2 trace: missing end marker")
+        recorder_dropped = int(footer.get("recorder_dropped_count", 0))
+        event_bus_dropped = int(footer.get("event_bus_dropped_count", 0))
+        if recorder_dropped or event_bus_dropped:
+            raise ValueError(
+                "incomplete L2 trace: "
+                f"recorder_dropped={recorder_dropped}, "
+                f"event_bus_dropped={event_bus_dropped}"
+            )
 
         adapter_indices = {
             int(args["adapter_index"])

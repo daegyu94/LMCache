@@ -4,9 +4,11 @@
 
 # Standard
 from pathlib import Path
+import struct
 import time
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -179,3 +181,20 @@ def test_causal_replay_store_then_read_is_valid(tmp_path):
     assert result["drain_seconds"] >= 0
     assert result["total_dependency_wait_seconds"] >= 0
     assert result["total_buffer_wait_seconds"] >= 0
+
+
+def test_plan_rejects_trace_without_end_marker(tmp_path):
+    trace = tmp_path / "l2.lct"
+    _write_trace(trace, _store_then_read_events(_key(4)))
+
+    data = trace.read_bytes()
+    offset = 0
+    frame_offsets = []
+    while offset < len(data):
+        frame_offsets.append(offset)
+        frame_size = struct.unpack(">I", data[offset : offset + 4])[0]
+        offset += 4 + frame_size
+    trace.write_bytes(data[: frame_offsets[-1]])
+
+    with pytest.raises(ValueError, match="missing end marker"):
+        L2TracePlan.from_file(str(trace))
