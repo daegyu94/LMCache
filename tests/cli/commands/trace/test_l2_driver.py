@@ -199,6 +199,59 @@ def test_plan_preserves_overlapping_store_lookup_submission(tmp_path):
     assert plan.prepare_objects == {}
 
 
+def test_plan_does_not_prepare_after_initial_lookup_miss(tmp_path):
+    trace = tmp_path / "l2.lct"
+    key = _key(10)
+    common = {"adapter_index": 0, "l2_name": "mock"}
+    _write_trace(
+        trace,
+        [
+            (
+                EventType.L2_LOOKUP_TASK_SUBMITTED,
+                {
+                    **common,
+                    "request_id": 21,
+                    "task_id": 1,
+                    "keys": [key],
+                    "layout_desc": _layout(),
+                },
+            ),
+            (
+                EventType.L2_LOOKUP_TASK_COMPLETED,
+                {
+                    **common,
+                    "request_id": 21,
+                    "task_id": 1,
+                    "hit_indices": [],
+                },
+            ),
+            (
+                EventType.L2_LOOKUP_TASK_SUBMITTED,
+                {
+                    **common,
+                    "request_id": 22,
+                    "task_id": 2,
+                    "keys": [key],
+                    "layout_desc": _layout(),
+                },
+            ),
+            (
+                EventType.L2_LOOKUP_TASK_COMPLETED,
+                {
+                    **common,
+                    "request_id": 22,
+                    "task_id": 2,
+                    "hit_indices": [0],
+                },
+            ),
+        ],
+    )
+
+    plan = L2TracePlan.from_file(str(trace))
+
+    assert plan.prepare_objects == {}
+
+
 def test_replay_normalizes_leading_schedule_gap(tmp_path):
     trace = tmp_path / "l2.lct"
     common = {"adapter_index": 0, "l2_name": "mock"}

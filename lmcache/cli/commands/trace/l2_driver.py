@@ -68,7 +68,7 @@ class ReplayOperation:
 
 @dataclass
 class L2TracePlan:
-    """Parsed submissions, outcomes, dependencies, and prepare objects."""
+    """Parsed submissions, outcomes, dependencies, and safe prepare objects."""
 
     operations: list[ReplayOperation]
     completions: dict[TaskKey, dict[str, Any]]
@@ -187,6 +187,22 @@ class L2TracePlan:
                 completions[key] = args
                 completion_sequence[key] = sequence
 
+        # A later hit must not prepare an object whose first source lookup was
+        # a miss. Track the first selected lookup submission even when its
+        # completion is absent, so an unknown first outcome stays unprepared.
+        first_lookup_by_object: dict[ObjectKey, tuple[int, TaskKey, int]] = {}
+        for replay_operation in operations:
+            if (
+                replay_operation.operation != "lookup_task"
+                or replay_operation.task_key is None
+            ):
+                continue
+            for index, object_key in enumerate(replay_operation.args["keys"]):
+                first_lookup_by_object.setdefault(
+                    object_key,
+                    (replay_operation.sequence, replay_operation.task_key, index),
+                )
+
         successful_store_by_key: dict[ObjectKey, list[tuple[int, TaskKey]]] = (
             defaultdict(list)
         )
@@ -201,7 +217,6 @@ class L2TracePlan:
                     (completion_sequence[key], key)
                 )
 
-        prepare_objects: dict[ObjectKey, int] = {}
         for key, completion in completions.items():
             if key[0] != "lookup_task":
                 continue
@@ -209,9 +224,10 @@ class L2TracePlan:
             if lookup is None:
                 continue
             complete_seq = completion_sequence[key]
-            hit_indices = completion.get("hit_indices", [])
-            for index in hit_indices:
-                object_key = lookup.args["keys"][index]
+            hit_indices = {int(index) for index in completion.get("hit_indices", [])}
+            for index, object_key in enumerate(lookup.args["keys"]):
+                if index not in hit_indices:
+                    continue
                 completed_store_candidates = [
                     item
                     for item in successful_store_by_key.get(object_key, [])
@@ -226,13 +242,31 @@ class L2TracePlan:
                 ]
                 if dependency_candidates:
                     lookup.dependencies.add(max(dependency_candidates)[1])
-                if completed_store_candidates:
-                    continue
-                size = size_by_key.get(object_key)
-                if size is None:
-                    layout = lookup.args["layout_desc"]
-                    size = _layout_size(layout)
-                prepare_objects[object_key] = size
+
+        prepare_objects: dict[ObjectKey, int] = {}
+        for object_key, (_, lookup_task_key, index) in first_lookup_by_object.items():
+            first_lookup_completion = completions.get(lookup_task_key)
+            if first_lookup_completion is None:
+                continue
+            hit_indices = {
+                int(index) for index in first_lookup_completion.get("hit_indices", [])
+            }
+            if index not in hit_indices:
+                continue
+            lookup = by_task[lookup_task_key]
+            complete_seq = completion_sequence[lookup_task_key]
+            completed_store_candidates = [
+                item
+                for item in successful_store_by_key.get(object_key, [])
+                if item[0] < complete_seq
+            ]
+            if completed_store_candidates:
+                continue
+            size = size_by_key.get(object_key)
+            if size is None:
+                layout = lookup.args["layout_desc"]
+                size = _layout_size(layout)
+            prepare_objects[object_key] = size
 
         for op in operations:
             request_id = op.args.get("request_id")
@@ -342,7 +376,12 @@ class L2ReplayDriver:
         self._storage_manager.close()
 
     def prepare(self) -> dict[str, Any]:
-        """Store source-resident read objects before measured replay."""
+        """Store safely inferred source-resident objects before replay.
+
+        Only objects whose first selected source lookup was a hit and whose
+        hit cannot be explained by a preceding successful store completion
+        are prepared.
+        """
         started = time.monotonic()
         items = list(self._plan.prepare_objects.items())
         tasks: dict[int, tuple[list[MemoryObj], int]] = {}
