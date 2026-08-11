@@ -65,7 +65,8 @@ class ObservabilityConfig:
 
     trace_level: str | None = None
     """If set, enables trace recording at the given level.  Currently
-    only ``"storage"`` is supported.  See
+    ``"storage"`` records public StorageManager calls and ``"l2"`` records
+    actual L2 adapter task submissions and completions.  See
     :mod:`lmcache.v1.mp_observability.trace` for details."""
 
     trace_output: str | None = None
@@ -207,10 +208,10 @@ def add_observability_args(
     trace_group.add_argument(
         "--trace-level",
         type=str,
-        choices=["storage"],
+        choices=["storage", "l2"],
         default=None,
-        help="Enable trace recording at the given level. Currently only "
-        "'storage' is supported (records StorageManager public-API calls).",
+        help="Enable trace recording at the given level. 'storage' records "
+        "StorageManager public-API calls; 'l2' records L2 adapter tasks.",
     )
     trace_group.add_argument(
         "--trace-output",

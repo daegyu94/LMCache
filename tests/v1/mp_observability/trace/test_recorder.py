@@ -19,6 +19,7 @@ import torch
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
+from lmcache.v1.mp_observability.trace import codecs
 from lmcache.v1.mp_observability.trace.decorator import (
     is_tracing_enabled,
     publish_call_event,
@@ -30,7 +31,10 @@ from lmcache.v1.mp_observability.trace.format import (
     TRACE_SCHEMA_VERSION,
 )
 from lmcache.v1.mp_observability.trace.reader import TraceReader
-from lmcache.v1.mp_observability.trace.recorder import StorageTraceRecorder
+from lmcache.v1.mp_observability.trace.recorder import (
+    L2TraceRecorder,
+    StorageTraceRecorder,
+)
 import lmcache.v1.mp_observability.event_bus as _bus_module
 
 
@@ -113,6 +117,41 @@ class TestGateLifecycle:
 
 
 class TestRecordRoundtrip:
+    def test_l2_task_event_roundtrip(self, trace_path):
+        bus = EventBus(EventBusConfig(enabled=True))
+        _bus_module._global_bus = bus
+        bus.start()
+
+        rec = L2TraceRecorder(trace_path)
+        bus.register_subscriber(rec)
+        key = ObjectKey(chunk_hash=b"\x01", model_name="m", kv_rank=1)
+        try:
+            bus.publish(
+                Event(
+                    event_type=EventType.L2_STORE_SUBMITTED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "adapter_index": 0,
+                        "task_id": 7,
+                        "l2_name": "fs_native",
+                        "keys": [key],
+                        "object_sizes": [4096],
+                    },
+                )
+            )
+            _flush(bus)
+        finally:
+            bus.stop()
+
+        with TraceReader(trace_path) as reader:
+            assert reader.header.level == "l2"
+            records = list(reader.records())
+        assert len(records) == 1
+        assert records[0].qualname == "l2.store.submitted"
+        decoded = codecs.decode_args(records[0].args)
+        assert decoded["keys"] == [key]
+        assert decoded["object_sizes"] == [4096]
+
     def test_records_via_eventbus(self, trace_path):
         bus = EventBus(EventBusConfig(enabled=True))
         _bus_module._global_bus = bus
@@ -151,9 +190,6 @@ class TestRecordRoundtrip:
     def test_layout_desc_roundtrip(self, trace_path):
         """End-to-end: a publish carrying a MemoryLayoutDesc round-trips
         through codec encode → file → reader → codec decode."""
-        # First Party
-        from lmcache.v1.mp_observability.trace import codecs
-
         bus = EventBus(EventBusConfig(enabled=True))
         _bus_module._global_bus = bus
         bus.start()

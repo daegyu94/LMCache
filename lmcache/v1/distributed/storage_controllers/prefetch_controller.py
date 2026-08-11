@@ -19,6 +19,7 @@ from typing import Iterable
 import enum
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -813,6 +814,20 @@ class PrefetchController(StorageControllerInterface):
         for adapter_id, adapter in routing_adapters.items():
             task_id = adapter.submit_lookup_and_lock_task(keys, layout_desc)
             pending_lookup_tasks[adapter_id] = task_id
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_LOOKUP_TASK_SUBMITTED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "request_id": request_id,
+                        "adapter_index": adapter_id,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_id].type_name,
+                        "keys": list(keys),
+                        "layout_desc": layout_desc,
+                    },
+                )
+            )
 
         request = InFlightPrefetchRequest(
             request_id=request_id,
@@ -992,10 +1007,13 @@ class PrefetchController(StorageControllerInterface):
                 Event(
                     event_type=EventType.L2_LOAD_TASK_SUBMITTED,
                     metadata={
+                        "trace_t_mono": time.monotonic(),
                         "request_id": request.request_id,
                         "adapter_index": adapter_idx,
                         "task_id": task_id,
                         "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "keys": list(per_adapter_keys),
+                        "object_sizes": [obj.get_size() for obj in per_adapter_objs],
                         "key_count": len(per_adapter_keys),
                         "total_bytes": total_bytes,
                     },
@@ -1079,6 +1097,19 @@ class PrefetchController(StorageControllerInterface):
                 continue
             request.lookup_results[adapter_idx] = result
             del request.pending_lookup_tasks[adapter_idx]
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_LOOKUP_TASK_COMPLETED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "request_id": request.request_id,
+                        "adapter_index": adapter_idx,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "hit_indices": result.get_indices_list(),
+                    },
+                )
+            )
 
     def _poll_load_results(
         self,
@@ -1101,10 +1132,12 @@ class PrefetchController(StorageControllerInterface):
                 Event(
                     event_type=EventType.L2_LOAD_TASK_COMPLETED,
                     metadata={
+                        "trace_t_mono": time.monotonic(),
                         "request_id": request.request_id,
                         "adapter_index": adapter_idx,
                         "task_id": task_id,
                         "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "success_indices": result.get_indices_list(),
                     },
                 )
             )
@@ -1207,12 +1240,14 @@ class PrefetchController(StorageControllerInterface):
             unlock_keys = to_unlock_bitmap.gather(request.keys)
             if unlock_keys:
                 self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+                self._publish_unlock(adapter_idx, request.request_id, unlock_keys)
 
     def _unlock_all_plan_keys(self, request: InFlightPrefetchRequest) -> None:
         """Phase 2 unlock: release L2 locks for all keys in the load plan."""
         for adapter_idx, load_bitmap in request.load_plan.items():
             unlock_keys = load_bitmap.gather(request.keys)
             self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+            self._publish_unlock(adapter_idx, request.request_id, unlock_keys)
 
     def _unlock_all_lookups(self, request: InFlightPrefetchRequest) -> None:
         """Unlock all keys locked during lookup (nothing to load case)."""
@@ -1220,6 +1255,26 @@ class PrefetchController(StorageControllerInterface):
             unlock_keys = lookup_bitmap.gather(request.keys)
             if unlock_keys:
                 self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+                self._publish_unlock(adapter_idx, request.request_id, unlock_keys)
+
+    def _publish_unlock(
+        self,
+        adapter_idx: int,
+        request_id: PrefetchRequestId,
+        keys: list[ObjectKey],
+    ) -> None:
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_UNLOCK_SUBMITTED,
+                metadata={
+                    "trace_t_mono": time.monotonic(),
+                    "request_id": request_id,
+                    "adapter_index": adapter_idx,
+                    "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                    "keys": list(keys),
+                },
+            )
+        )
 
     # =========================================================================
     # Completion and cleanup

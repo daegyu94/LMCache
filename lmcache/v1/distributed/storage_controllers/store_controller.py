@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import enum
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -670,9 +671,12 @@ class StoreController(StorageControllerInterface):
                 Event(
                     event_type=EventType.L2_STORE_SUBMITTED,
                     metadata={
+                        "trace_t_mono": time.monotonic(),
                         "adapter_index": adapter_index,
                         "task_id": task_id,
                         "l2_name": self._adapter_descriptors[adapter_index].type_name,
+                        "keys": list(successful_keys),
+                        "object_sizes": [obj.get_size() for obj in successful_objs],
                         "key_count": len(successful_keys),
                         "total_bytes": total_bytes,
                         "key_count_per_salt": Counter(
@@ -736,6 +740,7 @@ class StoreController(StorageControllerInterface):
 
         l2_name = self._adapter_descriptors[adapter_index].type_name
         completion_meta: dict[str, object] = {
+            "trace_t_mono": time.monotonic(),
             "adapter_index": adapter_index,
             "task_id": task_id,
             "l2_name": l2_name,
