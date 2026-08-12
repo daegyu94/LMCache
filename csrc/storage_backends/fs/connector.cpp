@@ -154,6 +154,18 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
 
 FSConnector::~FSConnector() { close(); }
 
+std::unordered_map<std::string, uint64_t> FSConnector::get_io_stats() const {
+  auto load = [](const std::atomic<uint64_t>& value) {
+    return value.load(std::memory_order_relaxed);
+  };
+  return {
+      {"read_ops", load(io_stats_.read_ops)},
+      {"read_bytes", load(io_stats_.read_bytes)},
+      {"write_ops", load(io_stats_.write_ops)},
+      {"write_bytes", load(io_stats_.write_bytes)},
+  };
+}
+
 WorkerFSConn FSConnector::create_connection() {
   WorkerFSConn conn;
   conn.base_path = base_path_;
@@ -218,6 +230,8 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
     throw;
   }
   ::close(fd);
+  io_stats_.read_ops.fetch_add(1, std::memory_order_relaxed);
+  io_stats_.read_bytes.fetch_add(len, std::memory_order_relaxed);
 }
 
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
@@ -279,6 +293,8 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     throw std::runtime_error("rename failed: " + tmp_path.string() + " -> " +
                              file_path.string() + ": " + ec.message());
   }
+  io_stats_.write_ops.fetch_add(1, std::memory_order_relaxed);
+  io_stats_.write_bytes.fetch_add(len, std::memory_order_relaxed);
 }
 
 bool FSConnector::do_single_exists(WorkerFSConn& conn, const std::string& key) {

@@ -10,7 +10,10 @@ Backed by the native C++ filesystem connector wrapped with
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
+import math
+import threading
+import time
 
 if TYPE_CHECKING:
     from lmcache.v1.distributed.internal_api import (
@@ -29,6 +32,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
+    NativeConnectorL2Adapter,
+)
 
 logger = init_logger(__name__)
 
@@ -45,6 +51,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
       reading this many bytes first (optional).
+    - io_log_interval_sec: emit interval I/O throughput logs at
+      this interval; zero disables progress logs.
     """
 
     def __init__(
@@ -55,6 +63,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        io_log_interval_sec: float = 0,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
@@ -62,6 +71,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.io_log_interval_sec = io_log_interval_sec
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
@@ -90,6 +100,15 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        io_log_interval_sec = d.get("io_log_interval_sec", 0)
+        if (
+            isinstance(io_log_interval_sec, bool)
+            or not isinstance(io_log_interval_sec, (int, float))
+            or not math.isfinite(io_log_interval_sec)
+            or io_log_interval_sec < 0
+        ):
+            raise ValueError("io_log_interval_sec must be a finite non-negative number")
+
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -97,6 +116,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
             max_capacity_gb=float(max_capacity_gb),
+            io_log_interval_sec=float(io_log_interval_sec),
         )
 
     @classmethod
@@ -116,7 +136,118 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "first (optional)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n"
+            "- io_log_interval_sec (float): interval I/O "
+            "throughput-log interval in seconds (default 0 = disabled)"
+        )
+
+
+class FSNativeL2Adapter(NativeConnectorL2Adapter):
+    """Native FS adapter with optional interval I/O logs."""
+
+    def __init__(
+        self,
+        native_client: Any,
+        max_capacity_gb: float = 0,
+        type_name: str = "",
+        extra_status: dict[str, Any] | None = None,
+        io_log_interval_sec: float = 0,
+    ) -> None:
+        self._io_log_interval_sec = io_log_interval_sec
+        self._io_log_started_at = time.monotonic()
+        self._io_log_last_at = self._io_log_started_at
+        self._io_log_last_stats = {
+            "read_ops": 0,
+            "read_bytes": 0,
+            "write_ops": 0,
+            "write_bytes": 0,
+        }
+        self._io_log_stop = threading.Event()
+        self._io_log_thread: threading.Thread | None = None
+        self._io_log_close_lock = threading.Lock()
+        self._io_log_closed = False
+
+        super().__init__(
+            native_client,
+            max_capacity_gb=max_capacity_gb,
+            type_name=type_name,
+            extra_status=extra_status,
+        )
+
+        if self._io_log_interval_sec > 0:
+            self._io_log_thread = threading.Thread(
+                target=self._io_progress_loop,
+                daemon=True,
+                name="fs-native-io-progress",
+            )
+            self._io_log_thread.start()
+
+    def close(self) -> None:
+        """Stop logging, emit the final interval, and close the connector."""
+        with self._io_log_close_lock:
+            if self._io_log_closed:
+                return
+            self._io_log_closed = True
+
+        self._io_log_stop.set()
+        if self._io_log_thread is not None:
+            self._io_log_thread.join(timeout=5.0)
+
+        self._log_io_interval()
+        super().close()
+
+    def _io_progress_loop(self) -> None:
+        while not self._io_log_stop.wait(self._io_log_interval_sec):
+            self._log_io_interval()
+
+    def _log_io_interval(self) -> None:
+        get_io_stats = getattr(self._client, "get_io_stats", None)
+        if not callable(get_io_stats):
+            return
+
+        try:
+            raw_stats = get_io_stats()
+            stats = {key: int(value) for key, value in raw_stats.items()}
+        except Exception:
+            logger.exception("Failed to collect FS native I/O statistics")
+            return
+
+        now = time.monotonic()
+        elapsed = max(now - self._io_log_started_at, 1e-9)
+        interval = max(now - self._io_log_last_at, 1e-9)
+        deltas = {
+            key: max(0, stats.get(key, 0) - self._io_log_last_stats[key])
+            for key in self._io_log_last_stats
+        }
+        self._io_log_last_at = now
+        self._io_log_last_stats = {
+            key: stats.get(key, 0) for key in self._io_log_last_stats
+        }
+
+        read_ops = deltas["read_ops"]
+        read_bytes = deltas["read_bytes"]
+        write_ops = deltas["write_ops"]
+        write_bytes = deltas["write_bytes"]
+        total_ops = read_ops + write_ops
+        total_bytes = read_bytes + write_bytes
+        gib = 1024**3
+
+        logger.info(
+            "FS native I/O interval: elapsed=%.3fs interval=%.3fs "
+            "total_ops=%d total_bytes=%d total_GiB/s=%.3f "
+            "read_ops=%d read_bytes=%d read_GiB/s=%.3f "
+            "write_ops=%d write_bytes=%d write_GiB/s=%.3f",
+            elapsed,
+            interval,
+            total_ops,
+            total_bytes,
+            total_bytes / interval / gib,
+            read_ops,
+            read_bytes,
+            read_bytes / interval / gib,
+            write_ops,
+            write_bytes,
+            write_bytes / interval / gib,
         )
 
 
@@ -137,12 +268,6 @@ def _create_fs_native_l2_adapter(
             "extension. Build with: pip install -e ."
         ) from e
 
-    # Lazy import to avoid circular dependency
-    # First Party
-    from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (  # noqa: E501
-        NativeConnectorL2Adapter,
-    )
-
     assert isinstance(config, FSNativeL2AdapterConfig)
     native_client = LMCacheFSClient(
         config.base_path,
@@ -152,13 +277,15 @@ def _create_fs_native_l2_adapter(
         config.read_ahead_size or 0,
     )
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, "
+        "read_ahead=%s, io_log_interval_sec=%s)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
         config.read_ahead_size,
+        config.io_log_interval_sec,
     )
-    return NativeConnectorL2Adapter(
+    return FSNativeL2Adapter(
         native_client,
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
@@ -167,7 +294,9 @@ def _create_fs_native_l2_adapter(
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
             "read_ahead_size": config.read_ahead_size,
+            "io_log_interval_sec": config.io_log_interval_sec,
         },
+        io_log_interval_sec=config.io_log_interval_sec,
     )
 
 

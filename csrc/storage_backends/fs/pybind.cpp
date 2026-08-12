@@ -11,5 +11,6 @@ PYBIND11_MODULE(lmcache_fs, m) {
            py::arg("base_path"), py::arg("num_workers"),
            py::arg("relative_tmp_dir") = "", py::arg("use_odirect") = false,
            py::arg("read_ahead_size") = 0)
+      .def("get_io_stats", &lmcache::connector::FSConnector::get_io_stats)
           LMCACHE_BIND_CONNECTOR_METHODS(lmcache::connector::FSConnector);
 }

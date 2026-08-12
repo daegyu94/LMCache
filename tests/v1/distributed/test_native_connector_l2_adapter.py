@@ -7,6 +7,7 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 """
 
 # Standard
+from unittest.mock import patch
 import ctypes
 import select
 import threading
@@ -46,6 +47,7 @@ class MockNativeConnector:
       - submit_batch_set(keys, memoryviews) -> int
       - submit_batch_exists(keys) -> int
       - drain_completions() -> list[tuple[int, bool, str, list[bool] | None]]
+      - get_io_stats() -> dict[str, int]
       - close()
     """
 
@@ -137,6 +139,14 @@ class MockNativeConnector:
             completions = list(self._completions)
             self._completions.clear()
         return completions
+
+    def get_io_stats(self) -> dict[str, int]:
+        return {
+            "read_ops": 1,
+            "read_bytes": 1024,
+            "write_ops": 1,
+            "write_bytes": 2048,
+        }
 
     def close(self):
         if not self._closed:
@@ -969,6 +979,7 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ""
         assert config.use_odirect is False
         assert config.read_ahead_size is None
+        assert config.io_log_interval_sec == 0.0
 
     def test_from_dict_full(self):
         # First Party
@@ -984,6 +995,7 @@ class TestFSNativeL2AdapterConfig:
                 "relative_tmp_dir": ".tmp",
                 "use_odirect": True,
                 "read_ahead_size": 4096,
+                "io_log_interval_sec": 5,
             }
         )
         assert config.base_path == "/data/kv_cache"
@@ -991,6 +1003,7 @@ class TestFSNativeL2AdapterConfig:
         assert config.relative_tmp_dir == ".tmp"
         assert config.use_odirect is True
         assert config.read_ahead_size == 4096
+        assert config.io_log_interval_sec == 5.0
 
     def test_from_dict_missing_base_path_raises(self):
         # First Party
@@ -1106,6 +1119,22 @@ class TestFSNativeL2AdapterConfig:
                 }
             )
 
+    @pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf")])
+    def test_from_dict_invalid_io_log_interval_sec_raises(self, value):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2AdapterConfig,
+        )
+
+        with pytest.raises(ValueError, match="io_log_interval_sec"):
+            FSNativeL2AdapterConfig.from_dict(
+                {
+                    "type": "fs_native",
+                    "base_path": "/tmp/x",
+                    "io_log_interval_sec": value,
+                }
+            )
+
     def test_registered_as_fs_native(self):
         # First Party
         from lmcache.v1.distributed.l2_adapters.config import (
@@ -1126,6 +1155,67 @@ class TestFSNativeL2AdapterConfig:
         assert "num_workers" in h
         assert "use_odirect" in h
         assert "read_ahead_size" in h
+        assert "io_log_interval_sec" in h
+
+    def test_adapter_logs_final_io_interval_on_close(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2Adapter,
+        )
+
+        adapter = FSNativeL2Adapter(MockNativeConnector())
+        try:
+            with patch(
+                "lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter.logger"
+            ) as mock_logger:
+                adapter.close()
+        finally:
+            adapter.close()
+
+        interval_calls = [
+            call.args
+            for call in mock_logger.info.call_args_list
+            if call.args and call.args[0].startswith("FS native I/O interval:")
+        ]
+        assert len(interval_calls) == 1
+        assert interval_calls[0][3:5] == (2, 3072)
+        assert interval_calls[0][6:8] == (1, 1024)
+        assert interval_calls[0][9:11] == (1, 2048)
+
+    def test_adapter_logs_interval_deltas(self):
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+            FSNativeL2Adapter,
+        )
+
+        two_intervals_seen = threading.Event()
+        with patch(
+            "lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter.logger"
+        ) as mock_logger:
+            interval_calls = []
+
+            def record_log(*args, **kwargs):
+                if args and args[0].startswith("FS native I/O interval:"):
+                    interval_calls.append(args)
+                    if len(interval_calls) >= 2:
+                        two_intervals_seen.set()
+
+            mock_logger.info.side_effect = record_log
+            adapter = FSNativeL2Adapter(
+                MockNativeConnector(),
+                io_log_interval_sec=0.01,
+            )
+            try:
+                assert two_intervals_seen.wait(timeout=1.0)
+            finally:
+                adapter.close()
+
+        assert interval_calls[0][3:5] == (2, 3072)
+        assert interval_calls[0][6:8] == (1, 1024)
+        assert interval_calls[0][9:11] == (1, 2048)
+        assert interval_calls[1][3:5] == (0, 0)
+        assert interval_calls[1][6:8] == (0, 0)
+        assert interval_calls[1][9:11] == (0, 0)
 
     def test_type_name_lookup(self):
         # First Party
