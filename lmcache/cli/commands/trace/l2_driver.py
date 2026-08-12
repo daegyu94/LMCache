@@ -41,6 +41,7 @@ _UNLOCK = "l2.unlock.submitted"
 _DELETE = "l2.delete.submitted"
 _TRACE_END = "l2.trace.end"
 _OUTCOME_MISMATCH_SAMPLE_LIMIT = 100
+_PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 
 
 def _task_key(operation: str, args: dict[str, Any]) -> TaskKey:
@@ -470,6 +471,29 @@ class L2ReplayDriver:
 
         started = time.monotonic()
         last_progress = started
+        last_progress_log = started
+
+        def log_progress(now: float) -> None:
+            nonlocal last_progress_log
+            if now - last_progress_log < _PROGRESS_LOG_INTERVAL_SECONDS:
+                return
+            dispatched = len(self._plan.operations) - len(pending)
+            in_flight = len(stores) + len(lookups) + len(loads)
+            logger.info(
+                "L2 replay progress: elapsed=%.1fs dispatched=%d/%d "
+                "completed=%d pending=%d in_flight(store=%d lookup=%d load=%d) "
+                "bytes_submitted=%d",
+                now - started,
+                dispatched,
+                len(self._plan.operations),
+                dispatched - in_flight,
+                len(pending),
+                len(stores),
+                len(lookups),
+                len(loads),
+                sum(bytes_submitted.values()),
+            )
+            last_progress_log = now
 
         while pending or stores or lookups or loads:
             now = time.monotonic()
@@ -572,6 +596,7 @@ class L2ReplayDriver:
                     completion_times[op.task_key] = time.monotonic()
                 progress = True
 
+            log_progress(time.monotonic())
             if progress:
                 last_progress = time.monotonic()
                 continue

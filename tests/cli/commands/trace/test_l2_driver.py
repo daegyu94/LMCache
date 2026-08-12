@@ -371,6 +371,21 @@ def test_causal_replay_store_then_read_is_valid(tmp_path):
     assert result["total_buffer_wait_seconds"] >= 0
 
 
+def test_replay_logs_periodic_progress(tmp_path, monkeypatch):
+    trace = tmp_path / "l2.lct"
+    _write_trace(trace, _store_then_read_events(_key(31)))
+    monkeypatch.setattr(l2_driver_module, "_PROGRESS_LOG_INTERVAL_SECONDS", 0.0)
+
+    with mock.patch.object(l2_driver_module.logger, "info") as log_info:
+        with L2ReplayDriver(_config(), str(trace), speedup=10.0) as driver:
+            driver.run()
+
+    assert any(
+        call.args and call.args[0].startswith("L2 replay progress:")
+        for call in log_info.call_args_list
+    )
+
+
 def test_outcome_mismatch_is_reported_as_metrics(tmp_path):
     trace = tmp_path / "l2.lct"
     events = _store_then_read_events(_key(4))[:2]
