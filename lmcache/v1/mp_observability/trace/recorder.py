@@ -33,7 +33,11 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.mp_observability.event import Event, EventType
-from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
+from lmcache.v1.mp_observability.event_bus import (
+    EventBus,
+    EventCallback,
+    EventSubscriber,
+)
 from lmcache.v1.mp_observability.trace import codecs
 from lmcache.v1.mp_observability.trace.decorator import set_tracing_enabled
 from lmcache.v1.mp_observability.trace.format import (
@@ -62,12 +66,18 @@ class TraceRecorder(EventSubscriber, ABC):
 
     * file management (open / write / fsync / close)
     * header emission
-    * the trace-gate flip (on at construction, off at ``close()``)
+    * the storage-call trace-gate lifecycle when requested by a subclass
 
     Subclasses implement :meth:`get_subscriptions`.
     """
 
-    def __init__(self, output_path: str, level: str) -> None:
+    def __init__(
+        self,
+        output_path: str,
+        level: str,
+        *,
+        enable_call_tracing: bool = False,
+    ) -> None:
         self._output_path = output_path
         self._level = level
         self._fd = open(output_path, "wb", buffering=0)
@@ -75,6 +85,9 @@ class TraceRecorder(EventSubscriber, ABC):
         self._closed = False
         self._dropped_count = 0
         self._header_written = False
+        self._enable_call_tracing = enable_call_tracing
+        self._event_bus: EventBus | None = None
+        self._event_bus_dropped_at_register = 0
         self._t_mono_start = time.monotonic()
         self._t_wall_start = time.time()
 
@@ -85,7 +98,8 @@ class TraceRecorder(EventSubscriber, ABC):
         # header and the final header have different byte lengths.
         # Flip the trace gate AFTER the file is open so a racing publish
         # cannot land on a half-initialized recorder.
-        set_tracing_enabled(True)
+        if self._enable_call_tracing:
+            set_tracing_enabled(True)
         logger.info("trace recorder writing to %s (level=%s)", output_path, level)
 
     # ---- subclass extension points ------------------------------------
@@ -104,6 +118,12 @@ class TraceRecorder(EventSubscriber, ABC):
     def dropped_count(self) -> int:
         """Number of records that failed to encode/write."""
         return self._dropped_count
+
+    def register(self, bus: EventBus) -> None:
+        """Subscribe to *bus* and remember its drop counter baseline."""
+        self._event_bus = bus
+        self._event_bus_dropped_at_register = bus.dropped_events_count()
+        super().register(bus)
 
     def attach_storage_config(self, config: StorageManagerConfig) -> None:
         """Write the header populated from the StorageManagerConfig.
@@ -144,11 +164,13 @@ class TraceRecorder(EventSubscriber, ABC):
             if self._closed:
                 return
             self._closed = True
-            set_tracing_enabled(False)
+            if self._enable_call_tracing:
+                set_tracing_enabled(False)
             try:
                 if not self._header_written:
                     self._write_header(sm_config_json="", sm_config_digest="")
                     self._header_written = True
+                self._write_footer()
                 self._fd.flush()
                 os.fsync(self._fd.fileno())
             except OSError:
@@ -176,6 +198,9 @@ class TraceRecorder(EventSubscriber, ABC):
             sm_config_digest=sm_config_digest,
         )
         self._write_frame(encode_header(header))
+
+    def _write_footer(self) -> None:
+        """Write an optional recorder-specific final record."""
 
     def _write_frame(self, frame: bytes) -> None:
         # Single write so the prefix and body land atomically for frames
@@ -344,7 +369,11 @@ class StorageTraceRecorder(TraceRecorder):
     """Records every ``TRACE_CALL`` event into a ``"storage"``-level file."""
 
     def __init__(self, output_path: str) -> None:
-        super().__init__(output_path=output_path, level="storage")
+        super().__init__(
+            output_path=output_path,
+            level="storage",
+            enable_call_tracing=True,
+        )
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         return {EventType.TRACE_CALL: self._on_trace_call}
@@ -369,3 +398,22 @@ class L2TraceRecorder(TraceRecorder):
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         return {event_type: self._on_l2_event for event_type in self._EVENT_TYPES}
+
+    def _write_footer(self) -> None:
+        event_bus_dropped = 0
+        if self._event_bus is not None:
+            event_bus_dropped = max(
+                0,
+                self._event_bus.dropped_events_count()
+                - self._event_bus_dropped_at_register,
+            )
+        frame = self._encode_record(
+            qualname="l2.trace.end",
+            args={
+                "recorder_dropped_count": self._dropped_count,
+                "event_bus_dropped_count": event_bus_dropped,
+            },
+            t_mono=time.monotonic(),
+            t_wall=time.time(),
+        )
+        self._write_frame(frame)

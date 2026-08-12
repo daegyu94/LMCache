@@ -13,6 +13,25 @@ document covers both halves:
   `lmcache trace replay`; there is no separate `bench trace-replay`
   command.
 
+The `l2` level records actual adapter task submissions and completions rather
+than StorageManager calls:
+
+```bash
+lmcache server --trace-level l2 --trace-output l2.lct
+lmcache trace replay l2.lct --prepare-l2 --l2-adapter '{...}'
+```
+
+L2 replay uses dummy payloads with the recorded object sizes. It derives
+source `store → lookup → load → unlock` dependencies and waits for the target
+completion only along those edges; unrelated operations retain their
+timestamp-scaled submission schedule. `--speedup` therefore raises offered
+I/O submission rate but does not reduce backend latency. A saturated backend
+shows increasing dependency/buffer wait, schedule lag, and drain time.
+Replay also rejects traces whose final completeness marker is missing or
+reports recorder/EventBus drops.
+`--trace-percent N` limits L2 replay and prepare to the first `N%` of source
+task submissions; matching completion records remain available for validation.
+
 For configuration reference see [README.md](README.md). For event metadata
 contracts see [EVENTS.md](EVENTS.md).
 
@@ -77,7 +96,7 @@ Three pieces, each in its own module under
 | `decorator.py` | `@enable_tracing`, the trace gate, `publish_call_event` helper for context managers |
 | `codecs.py` | Per-type encode/decode registry shared by recorder and (PR2) replay driver |
 | `format.py` | `Header` + `Record` msgspec structs; length-prefixed framing |
-| `recorder.py` | `TraceRecorder` ABC + `StorageTraceRecorder` `EventSubscriber` |
+| `recorder.py` | `TraceRecorder` ABC plus storage and L2 `EventSubscriber` implementations |
 | `reader.py` | Streaming `TraceReader` (used by `trace info` / replay in PR2) |
 | `lifecycle.py` | `maybe_initialize_trace_recorder` server-side wiring helper |
 

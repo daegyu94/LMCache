@@ -66,7 +66,21 @@ logger = init_logger(__name__)
 
 
 class StorageManager:
-    def __init__(self, config: StorageManagerConfig):
+    def __init__(
+        self,
+        config: StorageManagerConfig,
+        *,
+        start_controllers: bool = True,
+    ):
+        """Create a storage manager.
+
+        Args:
+            config: Storage and cache configuration.
+            start_controllers: Start normal asynchronous L1/L2 controllers.
+                Set to ``False`` only for tools that drive L2 adapters directly,
+                such as L2 trace replay.
+        """
+        self._controllers_started = start_controllers
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
@@ -75,7 +89,8 @@ class StorageManager:
             l1_manager=self._l1_manager,
             eviction_config=config.eviction_config,
         )
-        self._eviction_controller.start()
+        if start_controllers:
+            self._eviction_controller.start()
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -132,7 +147,8 @@ class StorageManager:
         self._l2_eviction_controller = L2EvictionController(
             l2_eviction_states, quota_manager=self._quota_manager
         )
-        self._l2_eviction_controller.start()
+        if start_controllers:
+            self._l2_eviction_controller.start()
 
         # Controllers receive the initial set as ordered lists; they key
         # their own copies by ``descriptor.index`` (== adapter_id) and learn
@@ -143,7 +159,8 @@ class StorageManager:
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
         )
-        self._store_controller.start()
+        if start_controllers:
+            self._store_controller.start()
 
         # Prefetch controller
         self._prefetch_controller = PrefetchController(
@@ -153,7 +170,8 @@ class StorageManager:
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
         )
-        self._prefetch_controller.start()
+        if start_controllers:
+            self._prefetch_controller.start()
 
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -787,6 +805,17 @@ class StorageManager:
         """Descriptor of the L1 memory buffer backing this storage manager."""
         return self._l1_memory_desc
 
+    def l2_adapters_snapshot(
+        self,
+    ) -> list[tuple[int, AdapterDescriptor, L2AdapterInterface]]:
+        """Return a stable snapshot of active L2 adapters.
+
+        The returned adapter objects may be driven directly only when this
+        manager was created with ``start_controllers=False``. Normal serving
+        code should use the StorageManager APIs instead.
+        """
+        return self._snapshot_adapters()
+
     def get_l2_usages(
         self,
     ) -> list[tuple[int | float, dict[str, object]]]:
@@ -997,10 +1026,11 @@ class StorageManager:
         """
         Close the storage manager and release all resources.
         """
-        self._prefetch_controller.stop()
-        self._store_controller.stop()
-        self._eviction_controller.stop()
-        self._l2_eviction_controller.stop()
+        if self._controllers_started:
+            self._prefetch_controller.stop()
+            self._store_controller.stop()
+            self._eviction_controller.stop()
+            self._l2_eviction_controller.stop()
 
         PeriodicEventNotifier.shutdown()
 
