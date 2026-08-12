@@ -32,12 +32,14 @@ from lmcache.v1.mp_observability.trace.lifecycle import (
 )
 from lmcache.v1.mp_observability.trace.reader import TraceReader
 from lmcache.v1.mp_observability.trace.recorder import (
+    L2TraceRecorder,
     StorageTraceRecorder,
     TraceRecorder,
 )
 
 __all__ = [
     "Header",
+    "L2TraceRecorder",
     "Record",
     "StorageTraceRecorder",
     "TraceReader",

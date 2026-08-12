@@ -21,6 +21,7 @@ from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.mp_observability.config import ObservabilityConfig
 from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.mp_observability.trace.recorder import (
+    L2TraceRecorder,
     StorageTraceRecorder,
     TraceRecorder,
 )
@@ -63,9 +64,9 @@ def maybe_initialize_trace_recorder(
     level = obs_config.trace_level
     if not level:
         return None
-    if level != "storage":
+    if level not in {"storage", "l2"}:
         raise ValueError(
-            f"unsupported trace level {level!r}; only 'storage' is supported"
+            f"unsupported trace level {level!r}; expected 'storage' or 'l2'"
         )
 
     output_path = obs_config.trace_output or _default_trace_path()
@@ -77,7 +78,11 @@ def maybe_initialize_trace_recorder(
             output_path,
         )
 
-    recorder = StorageTraceRecorder(output_path=output_path)
+    recorder = (
+        StorageTraceRecorder(output_path=output_path)
+        if level == "storage"
+        else L2TraceRecorder(output_path=output_path)
+    )
     recorder.attach_storage_config(storage_manager_config)
     bus.register_subscriber(recorder)
     return recorder

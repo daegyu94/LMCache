@@ -406,6 +406,18 @@ class L2EvictionController(StorageControllerInterface):
     def _execute_eviction_action(
         self, adapter: L2AdapterInterface, action: EvictionAction
     ):
+        if action.keys:
+            get_event_bus().publish(
+                Event(
+                    event_type=EventType.L2_DELETE_SUBMITTED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "adapter_index": -1,
+                        "l2_name": type(adapter).__name__,
+                        "keys": list(action.keys),
+                    },
+                )
+            )
         if action.destination == EvictionDestination.DISCARD:
             adapter.delete(action.keys)
         else:

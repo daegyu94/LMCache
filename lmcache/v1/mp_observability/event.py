@@ -47,11 +47,15 @@ class EventType(Enum):
     L2_PREFETCH_LOOKUP_COMPLETED = "l2.prefetch.lookup.completed"
     L2_PREFETCH_LOAD_SUBMITTED = "l2.prefetch.load.submitted"
     L2_PREFETCH_LOAD_COMPLETED = "l2.prefetch.load.completed"
+    L2_LOOKUP_TASK_SUBMITTED = "l2.lookup_task.submitted"
+    L2_LOOKUP_TASK_COMPLETED = "l2.lookup_task.completed"
     # Per-adapter load task events, for throughput correlation.  Fire once
     # per (request_id, adapter_index) pair, unlike the request-level
     # L2_PREFETCH_LOAD_* events above which aggregate across adapters.
     L2_LOAD_TASK_SUBMITTED = "l2.load_task.submitted"
     L2_LOAD_TASK_COMPLETED = "l2.load_task.completed"
+    L2_UNLOCK_SUBMITTED = "l2.unlock.submitted"
+    L2_DELETE_SUBMITTED = "l2.delete.submitted"
 
     # L2 Eviction Controller events
     L2_KEYS_EVICTED = "l2.keys.evicted"

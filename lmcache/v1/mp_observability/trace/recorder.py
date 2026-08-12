@@ -200,15 +200,12 @@ class TraceRecorder(EventSubscriber, ABC):
             # co-temporal with ``event.timestamp`` (wall-clock) instead
             # of picking up the drain-thread delay.
             publish_t_mono = event.metadata["t_mono"]
-            encoded_args = codecs.encode_args(args)
-            t_mono = max(0.0, publish_t_mono - self._t_mono_start)
-            record = Record(
-                t_mono=t_mono,
-                t_wall=event.timestamp,
+            frame = self._encode_record(
                 qualname=qualname,
-                args=encoded_args,
+                args=args,
+                t_mono=publish_t_mono,
+                t_wall=event.timestamp,
             )
-            frame = encode_record(record)
         except Exception:
             self._dropped_count += 1
             logger.warning(
@@ -237,6 +234,59 @@ class TraceRecorder(EventSubscriber, ABC):
                     "trace recorder: write failed; dropping record",
                     exc_info=True,
                 )
+
+    def _on_l2_event(self, event: Event) -> None:
+        """Encode one L2 task lifecycle event."""
+        try:
+            metadata = dict(event.metadata)
+            publish_t_mono = metadata.pop("trace_t_mono")
+            frame = self._encode_record(
+                qualname=event.event_type.value,
+                args=metadata,
+                t_mono=publish_t_mono,
+                t_wall=event.timestamp,
+            )
+        except Exception:
+            self._dropped_count += 1
+            logger.warning(
+                "trace recorder: failed to encode L2 event %s; dropping",
+                event.event_type.value,
+                exc_info=True,
+            )
+            return
+
+        with self._lock:
+            if self._closed:
+                self._dropped_count += 1
+                return
+            try:
+                if not self._header_written:
+                    self._write_header(sm_config_json="", sm_config_digest="")
+                    self._header_written = True
+                self._write_frame(frame)
+            except OSError:
+                self._dropped_count += 1
+                logger.warning(
+                    "trace recorder: write failed; dropping L2 event",
+                    exc_info=True,
+                )
+
+    def _encode_record(
+        self,
+        *,
+        qualname: str,
+        args: dict[str, Any],
+        t_mono: float,
+        t_wall: float,
+    ) -> bytes:
+        encoded_args = codecs.encode_args(args)
+        record = Record(
+            t_mono=max(0.0, t_mono - self._t_mono_start),
+            t_wall=t_wall,
+            qualname=qualname,
+            args=encoded_args,
+        )
+        return encode_record(record)
 
     @staticmethod
     def _safe_config_dict(config: StorageManagerConfig) -> dict[str, Any]:
@@ -298,3 +348,24 @@ class StorageTraceRecorder(TraceRecorder):
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         return {EventType.TRACE_CALL: self._on_trace_call}
+
+
+class L2TraceRecorder(TraceRecorder):
+    """Record actual L2 adapter task submissions and completions."""
+
+    _EVENT_TYPES = (
+        EventType.L2_STORE_SUBMITTED,
+        EventType.L2_STORE_COMPLETED,
+        EventType.L2_LOOKUP_TASK_SUBMITTED,
+        EventType.L2_LOOKUP_TASK_COMPLETED,
+        EventType.L2_LOAD_TASK_SUBMITTED,
+        EventType.L2_LOAD_TASK_COMPLETED,
+        EventType.L2_UNLOCK_SUBMITTED,
+        EventType.L2_DELETE_SUBMITTED,
+    )
+
+    def __init__(self, output_path: str) -> None:
+        super().__init__(output_path=output_path, level="l2")
+
+    def get_subscriptions(self) -> dict[EventType, EventCallback]:
+        return {event_type: self._on_l2_event for event_type in self._EVENT_TYPES}

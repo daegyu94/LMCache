@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Iterable
 import enum
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -913,6 +914,20 @@ class PrefetchController(StorageControllerInterface):
                 spec.keys, spec.group_layout_descs
             )
             request.pending_lookup_tasks[adapter_id] = task_id
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_LOOKUP_TASK_SUBMITTED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "request_id": request_id,
+                        "adapter_index": adapter_id,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_id].type_name,
+                        "keys": list(spec.keys),
+                        "group_layout_descs": dict(spec.group_layout_descs),
+                    },
+                )
+            )
         self._in_flight_requests[request_id] = request
         self._status_in_flight_count += 1
         self._status_lookup_phase_count += 1
@@ -1162,10 +1177,13 @@ class PrefetchController(StorageControllerInterface):
                 Event(
                     event_type=EventType.L2_LOAD_TASK_SUBMITTED,
                     metadata={
+                        "trace_t_mono": time.monotonic(),
                         "request_id": request.request_id,
                         "adapter_index": adapter_idx,
                         "task_id": task_id,
                         "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "keys": list(per_adapter_keys),
+                        "object_sizes": [obj.get_size() for obj in per_adapter_objs],
                         "key_count": len(per_adapter_keys),
                         "total_bytes": total_bytes,
                     },
@@ -1251,6 +1269,19 @@ class PrefetchController(StorageControllerInterface):
             request.lookup_results[adapter_idx] = result
             request.l2_adapter2readlocks[adapter_idx] = result
             del request.pending_lookup_tasks[adapter_idx]
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_LOOKUP_TASK_COMPLETED,
+                    metadata={
+                        "trace_t_mono": time.monotonic(),
+                        "request_id": request.request_id,
+                        "adapter_index": adapter_idx,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "hit_indices": result.get_indices_list(),
+                    },
+                )
+            )
 
     def _poll_load_results(
         self,
@@ -1273,10 +1304,12 @@ class PrefetchController(StorageControllerInterface):
                 Event(
                     event_type=EventType.L2_LOAD_TASK_COMPLETED,
                     metadata={
+                        "trace_t_mono": time.monotonic(),
                         "request_id": request.request_id,
                         "adapter_index": adapter_idx,
                         "task_id": task_id,
                         "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        "success_indices": result.get_indices_list(),
                     },
                 )
             )
@@ -1443,11 +1476,32 @@ class PrefetchController(StorageControllerInterface):
             unlock_keys = (held & (~keep_bitmap)).gather(request.keys)
             if unlock_keys:
                 self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+                self._publish_unlock(adapter_idx, request.request_id, unlock_keys)
             remaining = held & keep_bitmap
             if remaining.popcount() == 0:
                 del request.l2_adapter2readlocks[adapter_idx]
             else:
                 request.l2_adapter2readlocks[adapter_idx] = remaining
+
+    def _publish_unlock(
+        self,
+        adapter_idx: int,
+        request_id: PrefetchRequestId,
+        keys: list[ObjectKey],
+    ) -> None:
+        """Publish an adapter-level unlock submission event."""
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_UNLOCK_SUBMITTED,
+                metadata={
+                    "trace_t_mono": time.monotonic(),
+                    "request_id": request_id,
+                    "adapter_index": adapter_idx,
+                    "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                    "keys": list(keys),
+                },
+            )
+        )
 
     # =========================================================================
     # Completion and cleanup
