@@ -85,6 +85,33 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also export an aggregated JSON summary.",
     )
+    parser.add_argument(
+        "--l2-stats-out",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for exact replay-scoped L2 read/write latency and "
+            "throughput JSON (default: OUTPUT_DIR/l2_replay_stats.json)."
+        ),
+    )
+    parser.add_argument(
+        "--speedup",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale recorded timestamp offsets for scaled-open replay "
+            "(default: 1.0; 2.0 replays the schedule twice as fast)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-stats-out",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for replay-scoped L1 retrieve and L2 lookup/load "
+            "outcomes (default: OUTPUT_DIR/cache_replay_stats.json)."
+        ),
+    )
 
     try:
         # First Party
@@ -109,6 +136,8 @@ def run_trace_replay(args: argparse.Namespace) -> None:
       to ``PATH`` for post-hoc analysis.
     * Aggregated per-qualname summary: CSV (unless ``--no-csv``)
       and JSON (with ``--json``) written under ``--output-dir``.
+    * Exact replay-scoped L2 read/write latency and aggregate throughput JSON
+      written to ``--l2-stats-out`` or ``--output-dir``.
     * Terminal metrics table (unless ``--quiet``) using the shared
       :class:`~lmcache.cli.metrics.Metrics` renderer.
 
@@ -216,12 +245,27 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     try:
         with StorageReplayDriver(
-            sm_config, args.trace_path, obs_config=obs_config
+            sm_config,
+            args.trace_path,
+            obs_config=obs_config,
+            speedup=args.speedup,
         ) as driver:
             result = driver.run(on_record=_on_record)
     finally:
         if jsonl_fh is not None:
             jsonl_fh.close()
+
+    l2_stats_path = args.l2_stats_out or os.path.join(
+        args.output_dir, "l2_replay_stats.json"
+    )
+    result.l2_latency_stats.write_json(l2_stats_path)
+    logger.info("L2 replay statistics written to %s", l2_stats_path)
+
+    cache_stats_path = args.cache_stats_out or os.path.join(
+        args.output_dir, "cache_replay_stats.json"
+    )
+    result.cache_stats.write_json(cache_stats_path)
+    logger.info("Cache replay statistics written to %s", cache_stats_path)
 
     if not args.no_csv:
         csv_path = os.path.join(args.output_dir, "trace_replay_ops.csv")
@@ -258,6 +302,7 @@ def _emit_replay_metrics(
     overall.add("replayed", "Records replayed", result.records_replayed)
     overall.add("skipped", "Records skipped", result.records_skipped)
     overall.add("failed", "Records failed", result.records_failed)
+    overall.add("speedup", "Timestamp speedup", result.speedup)
     overall.add(
         "duration",
         "Replay duration (s)",

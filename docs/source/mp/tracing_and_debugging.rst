@@ -137,6 +137,14 @@ so collapsing the recorded gaps races the internal queues and causes
 non-deterministic retrieve misses. If the replay host is slower than
 the recording host, the loop simply lags the recorded schedule.
 
+**L2 statistics.** Replay also correlates adapter-level
+``L2_STORE_SUBMITTED`` → ``L2_STORE_COMPLETED`` and
+``L2_LOAD_TASK_SUBMITTED`` → ``L2_LOAD_TASK_COMPLETED`` events. The resulting
+``l2_replay_stats.json`` reports exact average/p50/p90/p99 latency in
+microseconds and aggregate throughput separately for each ``l2_name``. The
+same collector applies to ``fs_native`` and NIXL backends such as HF3FS; it is
+not tied to a particular filesystem implementation.
+
 **Output.** Every replay prints a terminal metrics table and writes
 a per-qualname CSV by default:
 
@@ -173,6 +181,11 @@ Additional per-record output is controlled by:
      - Also write ``trace_replay_summary.json`` (per-qualname
        count / mean / p50 / p90 / p99 / min / max, plus total
        duration).
+   * - ``--l2-stats-out PATH``
+     - Write exact replay-scoped L2 read/write statistics. The default is
+       ``OUTPUT_DIR/l2_replay_stats.json``. Samples use four-byte unsigned
+       microseconds; the JSON includes average, p50, p90, p99, and aggregate
+       throughput per adapter.
    * - ``--verbose``
      - Print one ``[N/total] OK|FAIL <qualname> (Xms)`` line per
        record to stdout in addition to the INFO log.

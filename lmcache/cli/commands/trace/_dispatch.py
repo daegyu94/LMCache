@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 # First Party
+from lmcache.cli.commands.trace.cache_stats import CacheOutcomeStatsSubscriber
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.storage_manager import StorageManager
@@ -55,6 +56,7 @@ class ReplayContext:
     """
 
     sm: StorageManager
+    cache_stats: CacheOutcomeStatsSubscriber | None = None
     open_read_contexts: dict[tuple[ObjectKey, ...], deque[AbstractContextManager]] = (
         field(default_factory=dict)
     )
@@ -175,7 +177,12 @@ def _enter_read_prefetched(ctx: ReplayContext, args: dict[str, Any]) -> None:
     """
     keys = args["keys"]
     cm = ctx.sm.read_prefetched_results(keys)
-    cm.__enter__()
+    result = cm.__enter__()
+    if ctx.cache_stats is not None:
+        ctx.cache_stats.record_l1_retrieve(
+            requested_keys=len(keys),
+            hit_keys=0 if result is None else len(result),
+        )
     key_tuple = tuple(keys)
     ctx.open_read_contexts.setdefault(key_tuple, deque()).append(cm)
 

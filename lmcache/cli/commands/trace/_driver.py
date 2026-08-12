@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 import hashlib
 import json
+import math
 import time
 
 # First Party
@@ -51,6 +52,8 @@ from lmcache.cli.commands.trace._dispatch import (
     build_default_dispatcher,
 )
 from lmcache.cli.commands.trace._stats import ReplayStatsCollector
+from lmcache.cli.commands.trace.cache_stats import CacheOutcomeStatsSubscriber
+from lmcache.cli.commands.trace.l2_stats import L2LatencyStatsSubscriber
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
@@ -67,6 +70,26 @@ if TYPE_CHECKING:
     from lmcache.v1.mp_observability.event_bus import EventBus
 
 logger = init_logger(__name__)
+
+
+def validate_speedup(speedup: float) -> float:
+    """Validate and return a replay timestamp speedup.
+
+    Args:
+        speedup: Positive finite factor applied to recorded monotonic
+            timestamp offsets.  1.0 preserves the recorded schedule;
+            values greater than one compress the schedule.
+
+    Returns:
+        The validated speedup value.
+
+    Raises:
+        ValueError: If speedup is not finite and positive.
+    """
+    if not math.isfinite(speedup) or speedup <= 0:
+        raise ValueError("speedup must be a finite positive number")
+    return speedup
+
 
 #: Default :class:`ObservabilityConfig` for replay sessions.
 #:
@@ -100,6 +123,9 @@ class ReplayResult:
         replay_config_digest: SHA-256 of the replay-side
             StorageManagerConfig, for mismatch comparisons.  Empty
             string if the driver could not compute it.
+        l2_latency_stats: Exact replay-scoped L2 read/write statistics.
+        cache_stats: Replay-scoped L1 retrieve and L2 lookup/load outcomes.
+        speedup: Timestamp speedup used for this replay.
     """
 
     records_replayed: int
@@ -109,6 +135,9 @@ class ReplayResult:
     header_level: str
     header_digest: str
     replay_config_digest: str
+    l2_latency_stats: L2LatencyStatsSubscriber
+    cache_stats: CacheOutcomeStatsSubscriber
+    speedup: float
 
 
 class StorageReplayDriver:
@@ -124,6 +153,7 @@ class StorageReplayDriver:
         trace_path: str,
         dispatcher: CallDispatcher | None = None,
         obs_config: ObservabilityConfig = DEFAULT_REPLAY_OBS_CONFIG,
+        speedup: float = 1.0,
     ) -> None:
         """Construct a driver.
 
@@ -158,9 +188,18 @@ class StorageReplayDriver:
                 installs this config as the global singleton via
                 :func:`init_observability` and stops the resulting
                 bus on :meth:`close`.
+            speedup: Positive finite factor applied to recorded
+                monotonic timestamp offsets. 1.0 preserves the
+                existing replay schedule; values greater than one
+                implement scaled-open replay without waiting for
+                asynchronous L2 operations to complete.
+
+        Raises:
+            ValueError: If speedup is not finite and positive.
         """
         self._sm_config = sm_config
         self._trace_path = trace_path
+        self._speedup = validate_speedup(speedup)
         self._dispatcher = dispatcher or build_default_dispatcher()
         self._closed = False
 
@@ -175,6 +214,10 @@ class StorageReplayDriver:
         try:
             reader = TraceReader(trace_path)
             bus = init_observability(obs_config)
+            self._l2_latency_stats = L2LatencyStatsSubscriber()
+            bus.register_subscriber(self._l2_latency_stats)
+            self._cache_stats = CacheOutcomeStatsSubscriber(speedup=self._speedup)
+            bus.register_subscriber(self._cache_stats)
             self._sm = StorageManager(sm_config)
         except BaseException:
             # ``BaseException`` to also cover KeyboardInterrupt /
@@ -223,6 +266,11 @@ class StorageReplayDriver:
         """
         return self._sm
 
+    @property
+    def speedup(self) -> float:
+        """Return the timestamp speedup configured for this replay."""
+        return self._speedup
+
     def close(self) -> None:
         """Close the StorageManager, stop the bus, and close the reader.
 
@@ -248,13 +296,11 @@ class StorageReplayDriver:
     ) -> ReplayResult:
         """Replay every record in the trace.
 
-        Dispatch is always paced to the recorded ``t_mono`` offsets
-        via ``time.sleep``: the replay never runs *ahead* of the
-        recording.  Running ahead is unsafe because ``StorageManager``
-        reads and writes are async — collapsing the recorded gaps
-        races the async queues and leads to retrieve misses.  If the
-        replay host is slower than recording, the loop simply lags
-        the recorded schedule.
+        Dispatch is paced to ``record.t_mono / speedup`` via
+        ``time.sleep``.  The speedup changes only the recorded
+        API-call schedule; it does not wait for asynchronous L2 store
+        or load completion.  If the replay host is slower than the
+        scaled schedule, the loop simply lags the target schedule.
 
         Args:
             on_record: Optional per-record callback invoked after
@@ -265,7 +311,7 @@ class StorageReplayDriver:
             A :class:`ReplayResult` summarizing the run.
         """
         stats = ReplayStatsCollector()
-        context = ReplayContext(sm=self._sm)
+        context = ReplayContext(sm=self._sm, cache_stats=self._cache_stats)
         header = self._reader.header
         t_start = time.time()
         stats.mark_start(t_start)
@@ -275,10 +321,10 @@ class StorageReplayDriver:
 
         for record in self._reader.records():
             # Sleep just long enough to align to the recorded
-            # offset from the start of replay.  No speedup — if
+            # offset from the start of replay.  If
             # the replay machine is slower than recording, the
             # loop simply runs behind.
-            target = t_wall_origin + record.t_mono
+            target = t_wall_origin + record.t_mono / self._speedup
             now = time.monotonic()
             if now < target:
                 time.sleep(target - now)
@@ -362,6 +408,9 @@ class StorageReplayDriver:
             header_level=header.level,
             header_digest=header.sm_config_digest,
             replay_config_digest=replay_digest,
+            l2_latency_stats=self._l2_latency_stats,
+            cache_stats=self._cache_stats,
+            speedup=self._speedup,
         )
 
 
