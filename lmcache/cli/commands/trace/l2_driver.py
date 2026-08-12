@@ -18,6 +18,7 @@ import time
 import torch
 
 # First Party
+from lmcache.cli.commands.trace.l2_stats import L2LatencyStatsSubscriber
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import StorageManagerConfig
@@ -370,6 +371,10 @@ class L2ReplayDriver:
             self._storage_manager.close()
             raise ValueError("L2 replay requires exactly one target adapter")
         self._adapter: L2AdapterInterface = adapters[0][2]
+        adapter_status = self._adapter.report_status()
+        adapter_type = adapter_status.get("type")
+        self._adapter_name = str(adapter_type or type(self._adapter).__name__)
+        self._latency_stats = L2LatencyStatsSubscriber()
         self._buffers = ReplayBufferPool(self._storage_manager)
         self._speedup = speedup
         self._drain_timeout = drain_timeout
@@ -513,6 +518,7 @@ class L2ReplayDriver:
                 dispatched = time.monotonic()
                 if op.operation == "store":
                     task_id = self._adapter.submit_store_task(op.args["keys"], objects)
+                    self._latency_stats.record_submission("write", self._adapter_name)
                     stores[task_id] = (op, objects, dispatched)
                 elif op.operation == "lookup_task":
                     task_id = self._adapter.submit_lookup_and_lock_task(
@@ -521,6 +527,7 @@ class L2ReplayDriver:
                     lookups[task_id] = (op, objects, dispatched)
                 elif op.operation == "load_task":
                     task_id = self._adapter.submit_load_task(op.args["keys"], objects)
+                    self._latency_stats.record_submission("read", self._adapter_name)
                     loads[task_id] = (op, objects, dispatched)
                 elif op.operation == "unlock":
                     self._adapter.submit_unlock(op.args["keys"])
@@ -547,7 +554,14 @@ class L2ReplayDriver:
                 state = stores.pop(task_id, None)
                 if state is None:
                     continue
-                op, objects, _ = state
+                op, objects, dispatched = state
+                completion_time = time.monotonic()
+                self._latency_stats.record_completion(
+                    "write",
+                    self._adapter_name,
+                    round((completion_time - dispatched) * 1_000_000),
+                    sum(int(size) for size in op.args["object_sizes"]),
+                )
                 self._buffers.release(objects)
                 assert op.task_key is not None
                 expected = self._plan.completions.get(op.task_key, {})
@@ -557,7 +571,7 @@ class L2ReplayDriver:
                 )
                 if op.task_key is not None:
                     completed.add(op.task_key)
-                    completion_times[op.task_key] = time.monotonic()
+                    completion_times[op.task_key] = completion_time
                 progress = True
 
             for target_id in list(lookups):
@@ -581,7 +595,14 @@ class L2ReplayDriver:
                 load_result = self._adapter.query_load_result(target_id)
                 if load_result is None:
                     continue
-                op, objects, _ = loads.pop(target_id)
+                op, objects, dispatched = loads.pop(target_id)
+                completion_time = time.monotonic()
+                self._latency_stats.record_completion(
+                    "read",
+                    self._adapter_name,
+                    round((completion_time - dispatched) * 1_000_000),
+                    sum(int(size) for size in op.args["object_sizes"]),
+                )
                 self._buffers.release(objects)
                 assert op.task_key is not None
                 expected = self._plan.completions.get(op.task_key, {})
@@ -593,7 +614,7 @@ class L2ReplayDriver:
                 )
                 if op.task_key is not None:
                     completed.add(op.task_key)
-                    completion_times[op.task_key] = time.monotonic()
+                    completion_times[op.task_key] = completion_time
                 progress = True
 
             log_progress(time.monotonic())
@@ -626,6 +647,7 @@ class L2ReplayDriver:
             max(0.0, finished - max(dispatch_times)) if dispatch_times else 0.0
         )
         return {
+            **self._latency_stats.snapshot(),
             "speedup": self._speedup,
             "trace_percent": self._plan.trace_percent,
             "source_operations_total": self._plan.source_operations_total,

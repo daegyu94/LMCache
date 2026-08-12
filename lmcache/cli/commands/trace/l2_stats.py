@@ -106,6 +106,26 @@ class L2LatencyStatsSubscriber(EventSubscriber):
             EventType.L2_LOAD_TASK_COMPLETED: self._on_load_completed,
         }
 
+    def record_submission(self, operation: str, l2_name: str) -> None:
+        """Record a direct replay task submission."""
+        if operation not in {"read", "write"}:
+            raise ValueError(f"unsupported L2 latency operation: {operation!r}")
+        self._accumulator(operation, l2_name).submitted += 1
+
+    def record_completion(
+        self,
+        operation: str,
+        l2_name: str,
+        latency_us: int,
+        total_bytes: int,
+    ) -> None:
+        """Record a direct replay task completion and latency sample."""
+        if operation not in {"read", "write"}:
+            raise ValueError(f"unsupported L2 latency operation: {operation!r}")
+        self._accumulator(operation, l2_name).record(
+            max(0, int(latency_us)), max(0, int(total_bytes))
+        )
+
     def snapshot(self) -> dict[str, Any]:
         """Return exact JSON-serializable replay statistics.
 
@@ -143,7 +163,7 @@ class L2LatencyStatsSubscriber(EventSubscriber):
         if key is None:
             return
         l2_name = str(event.metadata.get("l2_name", "unknown"))
-        self._accumulator("write", l2_name).submitted += 1
+        self.record_submission("write", l2_name)
         self._pending_store[key] = (
             event.timestamp,
             int(event.metadata.get("total_bytes", 0)),
@@ -161,7 +181,7 @@ class L2LatencyStatsSubscriber(EventSubscriber):
         if key is None:
             return
         l2_name = str(event.metadata.get("l2_name", "unknown"))
-        self._accumulator("read", l2_name).submitted += 1
+        self.record_submission("read", l2_name)
         self._pending_load[key] = (
             event.timestamp,
             int(event.metadata.get("total_bytes", 0)),

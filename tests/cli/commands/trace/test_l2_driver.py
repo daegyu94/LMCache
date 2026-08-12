@@ -369,6 +369,18 @@ def test_causal_replay_store_then_read_is_valid(tmp_path):
     assert result["drain_seconds"] >= 0
     assert result["total_dependency_wait_seconds"] >= 0
     assert result["total_buffer_wait_seconds"] >= 0
+    assert result["schema_version"] == 1
+    assert result["latency_unit"] == "microseconds"
+    write_stats = result["operations"]["write"]["MockL2Adapter"]
+    assert write_stats["submitted"] == 1
+    assert write_stats["completed"] == 1
+    assert write_stats["total_bytes"] == 4096
+    assert write_stats["p50_latency_us"] is not None
+    read_stats = result["operations"]["read"]["MockL2Adapter"]
+    assert read_stats["submitted"] == 1
+    assert read_stats["completed"] == 1
+    assert read_stats["total_bytes"] == 4096
+    assert read_stats["p50_latency_us"] is not None
 
 
 def test_replay_logs_periodic_progress(tmp_path, monkeypatch):
