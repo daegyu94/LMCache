@@ -2,6 +2,7 @@
 """MPCacheServer compositor and unified cache server entry point."""
 
 # Standard
+from types import FrameType
 import argparse
 import shutil
 import signal
@@ -443,23 +444,46 @@ def run_cache_server(
         )
     else:
         torch_dev.init()
-    server.start()
+    shutdown_requested = False
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-    logger.info("LMCache cache server is running...")
+    def request_shutdown(signum: int, _frame: FrameType | None) -> None:
+        nonlocal shutdown_requested
+        shutdown_requested = True
+        logger.info("Received %s; shutting down server...", signal.Signals(signum).name)
 
-    if return_engine:
-        return server, engine
+    if not return_engine:
+        signal.signal(signal.SIGTERM, request_shutdown)
 
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down server...")
-        event_bus.stop()
-        server.close()
-        engine.close()
+        server.start()
+        logger.info("LMCache cache server is running...")
+
+        if return_engine:
+            return server, engine
+
+        try:
+            while not shutdown_requested:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt; shutting down server...")
     finally:
-        shutdown_gc_monitor()
+        if not return_engine:
+            try:
+                try:
+                    # Stop accepting requests before closing the engine. Keep
+                    # EventBus alive until engine shutdown has emitted its final
+                    # completion events, then drain it and finalize trace files.
+                    server.close()
+                finally:
+                    try:
+                        engine.close()
+                    finally:
+                        event_bus.stop()
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+                shutdown_gc_monitor()
+
     return None
 
 
