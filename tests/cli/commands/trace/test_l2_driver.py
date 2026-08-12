@@ -421,6 +421,44 @@ def test_outcome_mismatch_is_reported_as_metrics(tmp_path):
     }
 
 
+def test_outcome_mismatch_samples_are_limited(tmp_path):
+    trace = tmp_path / "l2.lct"
+    common = {"adapter_index": 0, "l2_name": "mock"}
+    events = []
+    for task_id in range(12):
+        events.extend(
+            [
+                (
+                    EventType.L2_STORE_SUBMITTED,
+                    {
+                        **common,
+                        "task_id": task_id,
+                        "keys": [_key(task_id + 100)],
+                        "object_sizes": [4096],
+                    },
+                ),
+                (
+                    EventType.L2_STORE_COMPLETED,
+                    {
+                        **common,
+                        "task_id": task_id,
+                        "succeeded_count": 0,
+                        "failed_count": 1,
+                        "bytes_transferred": 0,
+                    },
+                ),
+            ]
+        )
+    _write_trace(trace, events)
+
+    with L2ReplayDriver(_config(), str(trace), speedup=10.0) as driver:
+        result = driver.run()
+
+    assert result["outcome_mismatch_count"] == 12
+    assert result["outcome_mismatch_counts"] == {"store": 12}
+    assert len(result["outcome_mismatch_samples"]) == 10
+
+
 def test_delete_is_reported_without_outcome_validation(tmp_path):
     trace = tmp_path / "l2.lct"
     key = _key(5)

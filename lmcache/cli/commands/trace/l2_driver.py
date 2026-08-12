@@ -41,7 +41,7 @@ _LOAD_COMPLETE = "l2.load_task.completed"
 _UNLOCK = "l2.unlock.submitted"
 _DELETE = "l2.delete.submitted"
 _TRACE_END = "l2.trace.end"
-_OUTCOME_MISMATCH_SAMPLE_LIMIT = 100
+_OUTCOME_MISMATCH_SAMPLE_LIMIT = 10
 _PROGRESS_LOG_INTERVAL_SECONDS = 5.0
 
 
