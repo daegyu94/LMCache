@@ -393,6 +393,48 @@ Source: ``lmcache/v1/distributed/config.py``
        controller poll loops for L2 adapters that lack native
        async completion callbacks.
 
+L2 QoS
+------
+
+LMCache MP automatically carries each client process's Linux cgroup v2
+``io.weight`` into the shared storage manager.  The client reads its own
+``io.weight`` during the ZMQ handshake; the server then applies that value to
+a byte-weighted fair scheduler shared by L2 store, lookup, and load tasks.
+This is application-level scheduling: the client cgroup is not visible to the
+server kernel, so passing a weight to an adapter call alone cannot make the
+kernel classify the I/O under the client cgroup.
+
+The automatic profile is enabled by default.  If the client cgroup is not
+visible, LMCache uses weight ``100``.  Set ``LMCACHE_QOS_WEIGHT`` to override
+the discovered value, and set ``LMCACHE_QOS_DOMAIN`` when several sockets
+belong to one logical LLM instance.  The weight is relative; it controls
+admission share, not an exact byte-rate guarantee.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--l2-qos-disable``
+     - disabled
+     - Disable shared-L2 weighted scheduling.
+   * - ``--l2-qos-quantum-bytes``
+     - ``1048576``
+     - Base byte quantum granted to a weight-100 domain per scheduling round.
+   * - ``--l2-qos-max-inflight-tasks``
+     - ``4``
+     - Global number of concrete L2 submissions in flight; ``0`` means unlimited.
+   * - ``--l2-qos-max-inflight-bytes``
+     - ``0``
+     - Global estimated bytes in flight; ``0`` means unlimited.
+
+For a runnable Docker harness that compares two cgroup-weighted clients,
+see ``examples/l2_qos/README.md`` in the repository. On cgroup v2 Docker
+may map ``--blkio-weight`` to a different numeric range in ``io.weight``;
+LMCache uses the values it actually reads from the client cgroup.
+
 L2 Adapters
 -----------
 

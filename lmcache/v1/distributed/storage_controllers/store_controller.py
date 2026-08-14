@@ -12,6 +12,7 @@ The controller runs a background thread with an event-driven loop that:
 # Standard
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from typing import Callable
 import enum
 import select
 import threading
@@ -35,6 +36,11 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.multiprocess.qos import (
+    DEFAULT_QOS_PROFILE,
+    QosProfile,
+    qos_profile_context,
+)
 from lmcache.v1.platform import (
     consume_fd,
     create_event_notifier,
@@ -77,10 +83,14 @@ class StoreListener(L1ManagerListener):
     and signals an eventfd to wake up the controller's select.poll().
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_keys_deleted: Callable[[list[ObjectKey]], None] | None = None,
+    ) -> None:
         self._pending_keys: list[ObjectKey] = []
         self._lock = threading.Lock()
         self._event_fd = create_event_notifier()
+        self._on_keys_deleted = on_keys_deleted
 
     def get_event_fd(self) -> int:
         """
@@ -142,7 +152,8 @@ class StoreListener(L1ManagerListener):
         pass
 
     def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
-        pass
+        if self._on_keys_deleted is not None:
+            self._on_keys_deleted(keys)
 
     def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
         # No op here because we don't want to trigger store when the
@@ -182,6 +193,9 @@ class InFlightStoreTask:
     read_locked_keys: list[ObjectKey]
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
+
+    qos_profile: QosProfile = DEFAULT_QOS_PROFILE
+    """QoS domain attributed to this L2 store task."""
 
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
@@ -250,9 +264,11 @@ class StoreController(StorageControllerInterface):
         self._pending_adapter_ops: list[AddAdapterOp | RemoveAdapterOp] = []
         self._adapter_ctrl_efd = create_event_notifier()
 
-        self._listener = StoreListener()
-        self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
+        self._qos_profiles: dict[ObjectKey, QosProfile] = {}
+        self._qos_profiles_lock = threading.Lock()
+        self._listener = StoreListener(self.discard_qos_profiles)
+        self._l1_manager.register_listener(self._listener)
 
         # (adapter_index, task_id) -> InFlightStoreTask
         # Composite key is needed because task IDs are only unique
@@ -424,6 +440,27 @@ class StoreController(StorageControllerInterface):
             )
         return observations
 
+    def register_qos_profiles(
+        self,
+        keys: list[ObjectKey],
+        qos_profile: QosProfile,
+    ) -> None:
+        """Associate completed-write keys with an L2 QoS profile.
+
+        The registration is separate from cache identity because the L1 write
+        completion callback runs on a background thread after the MP request
+        context has ended.
+        """
+        with self._qos_profiles_lock:
+            for key in keys:
+                self._qos_profiles[key] = qos_profile
+
+    def discard_qos_profiles(self, keys: list[ObjectKey]) -> None:
+        """Forget profiles for keys removed from L1 before store processing."""
+        with self._qos_profiles_lock:
+            for key in keys:
+                self._qos_profiles.pop(key, None)
+
     # Private methods
 
     def _store_loop(self) -> None:
@@ -554,24 +591,30 @@ class StoreController(StorageControllerInterface):
             done.set()
 
     def _process_new_keys(self, keys: list[ObjectKey]) -> None:
-        """
-        Process a batch of newly written keys.
+        """Route completed L1 writes by shape and QoS domain."""
+        with self._qos_profiles_lock:
+            profiles = {
+                key: self._qos_profiles.pop(key, DEFAULT_QOS_PROFILE) for key in keys
+            }
 
-        1. Ask the policy which adapters each key should go to.
-        2. For each adapter target, reserve read access on L1 to get
-           MemoryObj references (skip keys that fail — best-effort).
-        3. Submit store tasks to L2 adapters.
-        4. Track in-flight tasks for later cleanup.
+        for shape_group in _group_keys_by_shape(keys).values():
+            keys_by_domain: dict[str, list[ObjectKey]] = defaultdict(list)
+            profiles_by_domain: dict[str, QosProfile] = {}
+            for key in shape_group:
+                profile = profiles[key]
+                keys_by_domain[profile.domain_id].append(key)
+                profiles_by_domain.setdefault(profile.domain_id, profile)
+            for domain_id, domain_keys in keys_by_domain.items():
+                self._submit_store_for_single_shape(
+                    domain_keys, profiles_by_domain[domain_id]
+                )
 
-        Args:
-            keys (list[ObjectKey]): Keys that finished writing to L1.
-        """
-
-        for group in _group_keys_by_shape(keys).values():
-            self._submit_store_for_single_shape(group)
-
-    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
-        """Submit ``keys`` (all same shape) to their target adapters."""
+    def _submit_store_for_single_shape(
+        self,
+        keys: list[ObjectKey],
+        qos_profile: QosProfile = DEFAULT_QOS_PROFILE,
+    ) -> None:
+        """Submit same-shape keys from one QoS domain to L2 adapters."""
         # Only route to adapters that are live (not draining). Descriptors
         # for draining adapters are kept for in-flight completion handling
         # but excluded here so no new task targets them.
@@ -653,12 +696,14 @@ class StoreController(StorageControllerInterface):
                 continue
 
             adapter = self._l2_adapters[adapter_index]
-            task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            with qos_profile_context(qos_profile):
+                task_id = adapter.submit_store_task(successful_keys, successful_objs)
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
+                qos_profile=qos_profile,
             )
             self._status_in_flight_count += 1
 

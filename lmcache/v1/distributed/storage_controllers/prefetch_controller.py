@@ -85,6 +85,11 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.multiprocess.qos import (
+    DEFAULT_QOS_PROFILE,
+    QosProfile,
+    qos_profile_context,
+)
 from lmcache.v1.platform import (
     consume_fd,
     create_event_notifier,
@@ -193,6 +198,8 @@ class InFlightPrefetchRequest:
     request_id: PrefetchRequestId
     keys: list[ObjectKey]
     phase: PrefetchPhase
+    qos_profile: QosProfile = DEFAULT_QOS_PROFILE
+    """QoS domain used for lookup and load submissions."""
     extra_count: int = 0
     """Extra read locks per key (on top of the default 1) to acquire when
     transitioning from write-locked to read-locked.  Must match the
@@ -306,7 +313,9 @@ class PrefetchController(StorageControllerInterface):
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
-        self._pending_queue: list[tuple[PrefetchRequestId, PrefetchRequestSpec]] = []
+        self._pending_queue: list[
+            tuple[PrefetchRequestId, PrefetchRequestSpec, QosProfile]
+        ] = []
 
         # Shadow counters for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -316,7 +325,9 @@ class PrefetchController(StorageControllerInterface):
 
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
-        self._submission_queue: list[tuple[PrefetchRequestId, PrefetchRequestSpec]] = []
+        self._submission_queue: list[
+            tuple[PrefetchRequestId, PrefetchRequestSpec, QosProfile]
+        ] = []
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
 
@@ -395,6 +406,7 @@ class PrefetchController(StorageControllerInterface):
     def submit_prefetch_request(
         self,
         spec: PrefetchRequestSpec,
+        qos_profile: QosProfile | None = None,
     ) -> PrefetchRequestId:
         """
         Submit a prefetch request.
@@ -429,10 +441,12 @@ class PrefetchController(StorageControllerInterface):
         Returns:
             A request ID for tracking via query_prefetch_result.
         """
+        if qos_profile is None:
+            qos_profile = DEFAULT_QOS_PROFILE
         with self._submission_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
-            self._submission_queue.append((request_id, spec))
+            self._submission_queue.append((request_id, spec, qos_profile))
         self._submission_efd.notify()
         return request_id
 
@@ -815,9 +829,9 @@ class PrefetchController(StorageControllerInterface):
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, spec = self._pending_queue.pop(0)
+            request_id, spec, qos_profile = self._pending_queue.pop(0)
             self._status_pending_count -= 1
-            self._start_lookup_phase(request_id, spec)
+            self._start_lookup_phase(request_id, spec, qos_profile)
 
     # =========================================================================
     # Lookup phase
@@ -878,6 +892,7 @@ class PrefetchController(StorageControllerInterface):
         self,
         request_id: PrefetchRequestId,
         spec: PrefetchRequestSpec,
+        qos_profile: QosProfile = DEFAULT_QOS_PROFILE,
     ) -> None:
         """Read-lock L1-resident keys, then submit lookup_and_lock to all
         live (non-draining) adapters for a new request."""
@@ -888,6 +903,7 @@ class PrefetchController(StorageControllerInterface):
             request_id=request_id,
             keys=spec.keys,
             phase=PrefetchPhase.LOOKUP,
+            qos_profile=qos_profile,
             extra_count=spec.extra_count,
             policy=spec.policy,
             attn_desc=spec.attn_desc,
@@ -909,9 +925,10 @@ class PrefetchController(StorageControllerInterface):
             return
 
         for adapter_id, adapter in routing_adapters.items():
-            task_id = adapter.submit_lookup_and_lock_task(
-                spec.keys, spec.group_layout_descs
-            )
+            with qos_profile_context(qos_profile):
+                task_id = adapter.submit_lookup_and_lock_task(
+                    spec.keys, spec.group_layout_descs
+                )
             request.pending_lookup_tasks[adapter_id] = task_id
         self._in_flight_requests[request_id] = request
         self._status_in_flight_count += 1
@@ -1148,9 +1165,10 @@ class PrefetchController(StorageControllerInterface):
             per_adapter_objs = [
                 request.write_reserved_objs[key] for key in per_adapter_keys
             ]
-            task_id = self._l2_adapters[adapter_idx].submit_load_task(
-                per_adapter_keys, per_adapter_objs
-            )
+            with qos_profile_context(request.qos_profile):
+                task_id = self._l2_adapters[adapter_idx].submit_load_task(
+                    per_adapter_keys, per_adapter_objs
+                )
             request.pending_load_tasks[adapter_idx] = task_id
             plan_keys.extend(per_adapter_keys)
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput

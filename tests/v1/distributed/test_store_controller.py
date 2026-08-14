@@ -227,6 +227,17 @@ class TestStoreListener:
         assert listener.pending_count() == 0
         listener.close()
 
+    def test_deleted_keys_invoke_cleanup_callback(self):
+        """Deleted keys should be passed to the optional cleanup callback."""
+        deleted: list[list[ObjectKey]] = []
+        listener = StoreListener(deleted.append)
+        keys = [make_object_key(0), make_object_key(1)]
+
+        listener.on_l1_keys_deleted_by_manager(keys)
+
+        assert deleted == [keys]
+        listener.close()
+
 
 # =============================================================================
 # StoreController Integration Tests

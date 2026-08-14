@@ -34,6 +34,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigureError,
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
+from lmcache.v1.distributed.l2_qos_adapter import QosL2Adapter
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
@@ -59,6 +60,11 @@ from lmcache.v1.mp_observability.trace.decorator import (
     enable_tracing,
     is_tracing_enabled,
     publish_call_event,
+)
+from lmcache.v1.multiprocess.qos import (
+    L2QoSDispatcher,
+    QosProfile,
+    get_current_qos_profile,
 )
 from lmcache.v1.platform import HAS_EVENTFD
 
@@ -88,6 +94,13 @@ class StorageManager:
         # Guards the _l2_adapters and _adapter_descriptors dicts.
         self._adapters_lock = threading.Lock()
         self._registered_l2_listeners: list[L2AdapterListener] = []
+        self._l2_qos_dispatcher: L2QoSDispatcher | None = None
+        if config.l2_qos_config.enabled:
+            self._l2_qos_dispatcher = L2QoSDispatcher(
+                quantum_bytes=config.l2_qos_config.quantum_bytes,
+                max_inflight_tasks=config.l2_qos_config.max_inflight_tasks,
+                max_inflight_bytes=config.l2_qos_config.max_inflight_bytes,
+            )
         self._l2_adapters: dict[int, L2AdapterInterface] = {}
         self._adapter_descriptors: dict[int, AdapterDescriptor] = {}
         for ac in config.l2_adapter_config.adapters:
@@ -201,6 +214,8 @@ class StorageManager:
 
         result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
         successful_keys = list(result.keys())
+        if successful_keys:
+            self.register_store_qos_profiles(successful_keys, get_current_qos_profile())
         failed_keys = [k for k, (e, m) in reserve_result.items() if m is None]
         self._event_bus.publish(
             Event(
@@ -250,6 +265,14 @@ class StorageManager:
         )
 
         # TODO: global key states update
+
+    def register_store_qos_profiles(
+        self,
+        keys: list[ObjectKey],
+        qos_profile: QosProfile,
+    ) -> None:
+        """Remember the QoS profile for asynchronous L1-to-L2 stores."""
+        self._store_controller.register_qos_profiles(keys, qos_profile)
 
     @contextmanager
     def read_prefetched_results(
@@ -402,6 +425,7 @@ class StorageManager:
         spec: PrefetchRequestSpec,
         external_request_id: str = "",
         skip_l2: bool = False,
+        qos_profile: QosProfile | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -416,13 +440,15 @@ class StorageManager:
             PrefetchHandle to track the task.
         """
         keys = spec.keys
+        if qos_profile is None:
+            qos_profile = get_current_qos_profile()
 
         if spec.mode is PrefetchMode.WARM:
             # Warm path: load all keys, lock none. skip_l2 makes it a no-op.
             prefetch_request_id = -1
             if not skip_l2 and keys and self._l2_adapters:
                 prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                    spec
+                    spec, qos_profile
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -474,7 +500,7 @@ class StorageManager:
             prefetch_request_id = -1
             if not skip_l2 and remaining_keys and self._has_l2_adapters():
                 prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                    replace(spec, keys=remaining_keys)
+                    replace(spec, keys=remaining_keys), qos_profile
                 )
             return PrefetchHandle(
                 prefetch_request_id=prefetch_request_id,
@@ -498,6 +524,7 @@ class StorageManager:
                 l1_read_result,
                 external_request_id,
                 skip_l2,
+                qos_profile,
             )
 
         raise ValueError(f"Unsupported trim policy: {spec.policy}")
@@ -508,6 +535,7 @@ class StorageManager:
         l1_read_result: dict[ObjectKey, tuple[L1Error, "MemoryObj | None"]],
         external_request_id: str,
         skip_l2: bool,
+        qos_profile: QosProfile,
     ) -> PrefetchHandle:
         """PREFIX path: fold L1 presence, retain in-window keys, submit rest to L2.
 
@@ -571,7 +599,7 @@ class StorageManager:
 
         if not l1_only and remaining_keys:
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                replace(spec, keys=remaining_keys)
+                replace(spec, keys=remaining_keys), qos_profile
             )
             l2_orig_indices = tuple(range(l1_key_boundary, len(keys)))
 
@@ -1032,6 +1060,9 @@ class StorageManager:
 
         PeriodicEventNotifier.shutdown()
 
+        if self._l2_qos_dispatcher is not None:
+            self._l2_qos_dispatcher.close()
+
         for adapter in self._l2_adapters.values():
             adapter.close()
 
@@ -1125,6 +1156,8 @@ class StorageManager:
                 serde=create_serde_processor(config.serde_config),
                 l1_manager=self._l1_manager,
             )
+        if self._l2_qos_dispatcher is not None:
+            adapter = QosL2Adapter(adapter, self._l2_qos_dispatcher)
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
         # the observability bus carry their backend identity.
@@ -1163,13 +1196,15 @@ class StorageManager:
         self,
         adapter: L2AdapterInterface,
     ) -> Optional[L2ReconfigurableAdapter]:
-        if isinstance(adapter, L2ReconfigurableAdapter):
-            return adapter
-
-        inner = getattr(adapter, "inner_adapter", None)
-        if inner is not None and isinstance(inner, L2ReconfigurableAdapter):
-            return inner
-
+        current: object = adapter
+        visited: set[int] = set()
+        while id(current) not in visited:
+            visited.add(id(current))
+            if isinstance(current, L2ReconfigurableAdapter):
+                return current
+            current = getattr(current, "inner_adapter", None)
+            if current is None:
+                break
         return None
 
     def _list_reconfigurable_l2_adapters(

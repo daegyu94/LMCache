@@ -228,6 +228,31 @@ class EvictionConfig:
 
 
 @dataclass
+class L2QoSConfig:
+    """Configuration for shared L2 weighted scheduling."""
+
+    enabled: bool = True
+    """Whether shared L2 QoS admission is enabled."""
+
+    quantum_bytes: int = 1 << 20
+    """Base byte quantum granted to a weight-100 domain per round."""
+
+    max_inflight_tasks: int = 4
+    """Maximum number of concrete L2 submissions in flight; zero is unlimited."""
+
+    max_inflight_bytes: int = 0
+    """Maximum aggregate bytes in flight; zero is unlimited."""
+
+    def __post_init__(self) -> None:
+        if self.quantum_bytes <= 0:
+            raise ValueError("quantum_bytes must be positive")
+        if self.max_inflight_tasks < 0:
+            raise ValueError("max_inflight_tasks must be non-negative")
+        if self.max_inflight_bytes < 0:
+            raise ValueError("max_inflight_bytes must be non-negative")
+
+
+@dataclass
 class StorageManagerConfig:
     """
     The configuration for the distributed storage manager.
@@ -255,6 +280,9 @@ class StorageManagerConfig:
 
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
+
+    l2_qos_config: L2QoSConfig = field(default_factory=L2QoSConfig)
+    """Configuration for cross-workload L2 weighted scheduling."""
 
     def __post_init__(self) -> None:
         normalize_storage_manager_config(self)
@@ -520,6 +548,33 @@ def add_storage_manager_args(
         help="Interval in ms for the periodic event notifier heartbeat. Default is 5.",
     )
 
+    qos_group = parser.add_argument_group(
+        "L2 QoS", "Weighted scheduling for shared L2 adapters"
+    )
+    qos_group.add_argument(
+        "--l2-qos-disable",
+        action="store_true",
+        help="Disable automatic cgroup io.weight-based L2 scheduling.",
+    )
+    qos_group.add_argument(
+        "--l2-qos-quantum-bytes",
+        type=int,
+        default=1 << 20,
+        help="Base byte quantum for a weight-100 L2 domain. Default is 1 MiB.",
+    )
+    qos_group.add_argument(
+        "--l2-qos-max-inflight-tasks",
+        type=int,
+        default=4,
+        help="Global L2 task concurrency limit; 0 means unlimited.",
+    )
+    qos_group.add_argument(
+        "--l2-qos-max-inflight-bytes",
+        type=int,
+        default=0,
+        help="Global L2 byte concurrency limit; 0 means unlimited.",
+    )
+
     # Adapter config
     add_l2_adapters_args(parser)
     return parser
@@ -608,6 +663,12 @@ def parse_args_to_config(
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
+        l2_qos_config=L2QoSConfig(
+            enabled=not getattr(args, "l2_qos_disable", False),
+            quantum_bytes=getattr(args, "l2_qos_quantum_bytes", 1 << 20),
+            max_inflight_tasks=getattr(args, "l2_qos_max_inflight_tasks", 4),
+            max_inflight_bytes=getattr(args, "l2_qos_max_inflight_bytes", 0),
+        ),
     )
     return config
 
