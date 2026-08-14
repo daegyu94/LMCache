@@ -3,6 +3,7 @@
 
 # Standard
 from pathlib import Path
+import select
 import threading
 import time
 
@@ -201,3 +202,114 @@ def test_message_queue_propagates_qos_profile(monkeypatch: pytest.MonkeyPatch) -
     finally:
         client.close()
         server.close()
+
+
+def test_qos_l2_adapter_releases_dispatch_slot() -> None:
+    """The adapter wrapper maps concrete completions back to wrapper IDs."""
+    try:
+        # Standard
+        from unittest.mock import MagicMock
+
+        # First Party
+        from lmcache.v1.distributed.api import ObjectKey
+        from lmcache.v1.distributed.internal_api import L2StoreResult
+        from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+        from lmcache.v1.distributed.l2_qos_adapter import QosL2Adapter
+        from lmcache.v1.multiprocess.qos import qos_profile_context
+        from lmcache.v1.platform import create_event_notifier
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"L2 adapter dependencies unavailable: {exc}")
+
+    dispatcher = L2QoSDispatcher(max_inflight_tasks=1)
+    notifiers = [create_event_notifier() for _ in range(3)]
+    adapter = MagicMock(spec=L2AdapterInterface)
+    adapter.get_store_event_fd.return_value = notifiers[0].fileno()
+    adapter.get_lookup_and_lock_event_fd.return_value = notifiers[1].fileno()
+    adapter.get_load_event_fd.return_value = notifiers[2].fileno()
+    adapter.submit_store_task.return_value = 7
+    wrapper = QosL2Adapter(adapter, dispatcher)
+    key = ObjectKey(b"hash", "model", 0)
+    memory_obj = MagicMock()
+    memory_obj.get_size.return_value = 16
+    profile = QosProfile(domain_id="adapter-test", weight=200)
+
+    try:
+        with qos_profile_context(profile):
+            wrapped_task_id = wrapper.submit_store_task([key], [memory_obj])
+
+        deadline = time.monotonic() + 2
+        while not adapter.submit_store_task.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert adapter.submit_store_task.called
+
+        adapter.pop_completed_store_tasks.return_value = {7: L2StoreResult(True, 16)}
+        completed: dict[int, L2StoreResult] = {}
+        while not completed and time.monotonic() < deadline:
+            completed = wrapper.pop_completed_store_tasks()
+            if not completed:
+                time.sleep(0.001)
+
+        assert completed[wrapped_task_id].is_successful()
+        assert dispatcher.snapshot()["adapter-test"]["inflight_tasks"] == 0
+    finally:
+        wrapper.close()
+        dispatcher.close()
+        for notifier in notifiers:
+            notifier.close()
+
+
+def test_qos_l2_adapter_relays_pipe_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper relays adapter completion signals from pipe notifiers."""
+    try:
+        # Standard
+        from unittest.mock import MagicMock
+
+        # First Party
+        from lmcache.v1.distributed.api import ObjectKey
+        from lmcache.v1.distributed.internal_api import L2StoreResult
+        from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+        from lmcache.v1.multiprocess.qos import qos_profile_context
+        from lmcache.v1.platform import PipeNotifier, consume_fd
+        import lmcache.v1.distributed.l2_qos_adapter as qos_adapter_module
+        import lmcache.v1.platform.event_notifier as event_notifier
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"L2 adapter dependencies unavailable: {exc}")
+
+    monkeypatch.setattr(event_notifier, "HAS_EVENTFD", False)
+    monkeypatch.setattr(qos_adapter_module, "create_event_notifier", PipeNotifier)
+
+    dispatcher = L2QoSDispatcher(max_inflight_tasks=1)
+    notifiers = [PipeNotifier() for _ in range(3)]
+    adapter = MagicMock(spec=L2AdapterInterface)
+    adapter.get_store_event_fd.return_value = notifiers[0].fileno()
+    adapter.get_lookup_and_lock_event_fd.return_value = notifiers[1].fileno()
+    adapter.get_load_event_fd.return_value = notifiers[2].fileno()
+    adapter.submit_store_task.return_value = 7
+    wrapper = qos_adapter_module.QosL2Adapter(adapter, dispatcher)
+    wrapper_event_fd = wrapper.get_store_event_fd()
+    poller = select.poll()
+    poller.register(wrapper_event_fd, select.POLLIN)
+    key = ObjectKey(b"hash", "model", 0)
+    memory_obj = MagicMock()
+    memory_obj.get_size.return_value = 16
+
+    try:
+        with qos_profile_context(QosProfile(domain_id="pipe-test")):
+            wrapped_task_id = wrapper.submit_store_task([key], [memory_obj])
+
+        assert poller.poll(1000), "admission completion was not signaled"
+        consume_fd(wrapper_event_fd)
+        adapter.pop_completed_store_tasks.return_value = {7: L2StoreResult(True, 16)}
+        notifiers[0].notify()
+        assert poller.poll(1000), "adapter pipe notification was not relayed"
+        consume_fd(wrapper_event_fd)
+
+        completed = wrapper.pop_completed_store_tasks()
+        assert completed[wrapped_task_id].is_successful()
+    finally:
+        wrapper.close()
+        dispatcher.close()
+        for notifier in notifiers:
+            notifier.close()
