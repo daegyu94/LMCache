@@ -96,6 +96,9 @@ class RequestType(enum.Enum):
     # Experimental transfer intermediate tensor
     GET_EXPERIMENTAL = enum.auto()
 
+    # QoS operations
+    REGISTER_QOS_PROFILE = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

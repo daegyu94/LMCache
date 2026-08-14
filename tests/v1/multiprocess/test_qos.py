@@ -13,6 +13,7 @@ import pytest
 from lmcache.v1.multiprocess.qos import (
     L2QoSDispatcher,
     QosProfile,
+    get_current_qos_profile,
     read_cgroup_io_weight,
 )
 
@@ -163,3 +164,40 @@ def test_dispatcher_does_not_accumulate_quantum_while_blocked() -> None:
         dispatcher.close()
 
     assert admissions[1:3] == ["first", "second"]
+
+
+def test_message_queue_propagates_qos_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The MP handshake makes the client profile visible to handlers."""
+    monkeypatch.setenv("LMCACHE_QOS_DOMAIN", "handshake-a")
+    monkeypatch.setenv("LMCACHE_QOS_WEIGHT", "700")
+    try:
+        # Third Party
+        import zmq
+
+        # First Party
+        from lmcache.v1.multiprocess.mq import (
+            MessageQueueClient,
+            MessageQueueServer,
+        )
+        from lmcache.v1.multiprocess.protocol import HandlerType, RequestType
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"MP protocol dependencies unavailable: {exc}")
+
+    context = zmq.Context.instance()
+    server_url = f"inproc://qos-profile-{time.monotonic_ns()}"
+    server = MessageQueueServer(server_url, context)
+
+    def handler() -> str:
+        profile = get_current_qos_profile()
+        return f"{profile.domain_id}:{profile.weight}:{profile.source}"
+
+    server.add_handler(RequestType.NOOP, [], HandlerType.SYNC, handler)
+    server.start()
+    client = MessageQueueClient(server_url, context)
+    try:
+        assert client.submit_request(RequestType.NOOP, []).result(timeout=5) == (
+            "handshake-a:700:handshake"
+        )
+    finally:
+        client.close()
+        server.close()

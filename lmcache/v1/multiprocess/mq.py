@@ -31,6 +31,11 @@ from lmcache.v1.multiprocess.protocol import (
     get_payload_classes,
     get_response_class,
 )
+from lmcache.v1.multiprocess.qos import (
+    DEFAULT_QOS_PROFILE,
+    QosProfile,
+    qos_profile_context,
+)
 from lmcache.v1.platform import EventNotifier, create_event_notifier
 
 logger = init_logger(__name__)
@@ -285,6 +290,10 @@ class MessageQueueClient:
         self._polling_loop = ClientPollingLoop.get_instance()
         self._polling_loop.register(self)
 
+        # Register once per socket. ZMQ preserves this request ordering.
+        self.qos_profile = QosProfile.from_environment()
+        self._qos_registration_future = self.register_qos_profile(self.qos_profile)
+
     def process_outbound_task(self):
         try:
             while wrapped_request := self.input_queue.get_nowait():
@@ -386,6 +395,17 @@ class MessageQueueClient:
         self._polling_loop.notify()
         return future
 
+    def register_qos_profile(
+        self,
+        qos_profile: QosProfile,
+    ) -> MessagingFuture[None]:
+        """Register one client socket QoS profile with the server."""
+        return self.submit_request(
+            RequestType.REGISTER_QOS_PROFILE,
+            [qos_profile.domain_id, qos_profile.weight],
+            get_response_class(RequestType.REGISTER_QOS_PROFILE),
+        )
+
     def close(self) -> None:
         self._polling_loop.unregister(self)
         ClientPollingLoop.release_instance()
@@ -454,18 +474,24 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
         self.response_cls = response_cls
 
     def __call__(
-        self, payloads: list[bytes], affinity_key: int = 0
+        self,
+        payloads: list[bytes],
+        affinity_key: int = 0,
+        qos_profile: QosProfile = DEFAULT_QOS_PROFILE,
     ) -> Future[ResponseType]:
         assert self.executor is not None, (
             "BlockingRequestHandler has no executor assigned. "
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+
+        def run_handler() -> ResponseType:
+            with qos_profile_context(qos_profile):
+                return self.handler(*decoded_payloads)
+
         if isinstance(self.executor, AffinityThreadPool):
-            return self.executor.submit(
-                self.handler, *decoded_payloads, affinity_key=affinity_key
-            )
-        return self.executor.submit(self.handler, *decoded_payloads)
+            return self.executor.submit(run_handler, affinity_key=affinity_key)
+        return self.executor.submit(run_handler)
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -516,6 +542,7 @@ class MessageQueueServer:
 
         # Registered handlers: request_type -> (payload_cls, handler)
         self.handlers: dict[RequestType, RequestHandlerBase[Any]] = {}
+        self._qos_profiles: dict[bytes, QosProfile] = {}
 
         # Thread pools assigned via add_normal_thread_pool / add_affinity_thread_pool
         self.extra_pools: list[ThreadPoolExecutor | AffinityThreadPool] = []
@@ -525,6 +552,7 @@ class MessageQueueServer:
         handler_entry: SyncRequestHandler[Any],
         payloads: list[bytes],
         prefix_frames: list[bytes],
+        qos_profile: QosProfile,
     ) -> Any:
         """
         Call the sync handler and send the response back to the client.
@@ -534,7 +562,8 @@ class MessageQueueServer:
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
+        with qos_profile_context(qos_profile):
+            response = handler_entry(payloads)
         response_cls = handler_entry.get_response_class()
         b_response = msgspec_encode(response, cls=response_cls)
         if response is not None:
@@ -547,6 +576,7 @@ class MessageQueueServer:
         handler_entry: BlockingRequestHandler[Any],
         payloads: list[bytes],
         prefix_frames: list[bytes],
+        qos_profile: QosProfile,
     ) -> Any:
         """
         Call the blocking handler in a separate thread and send the response
@@ -559,7 +589,9 @@ class MessageQueueServer:
                 prefix_frames[0] is the zmq identity used as affinity key.
         """
         affinity_key = hash(prefix_frames[0])
-        future = handler_entry(payloads, affinity_key=affinity_key)
+        future = handler_entry(
+            payloads, affinity_key=affinity_key, qos_profile=qos_profile
+        )
 
         def _notify_response(fut: Future):
             try:
@@ -585,14 +617,19 @@ class MessageQueueServer:
         handler_entry: RequestHandlerBase[Any],
         payloads: list[bytes],
         prefix_frames: list[bytes],
+        qos_profile: QosProfile,
     ) -> Any:
         match handler_entry.get_handler_type():
             case HandlerType.SYNC:
                 assert isinstance(handler_entry, SyncRequestHandler)
-                self._call_sync_handler(handler_entry, payloads, prefix_frames)
+                self._call_sync_handler(
+                    handler_entry, payloads, prefix_frames, qos_profile
+                )
             case HandlerType.BLOCKING:
                 assert isinstance(handler_entry, BlockingRequestHandler)
-                self._call_blocking_handler(handler_entry, payloads, prefix_frames)
+                self._call_blocking_handler(
+                    handler_entry, payloads, prefix_frames, qos_profile
+                )
             case HandlerType.NON_BLOCKING:
                 raise NotImplementedError("Non-blocking handler is not supported yet")
             case _:
@@ -616,12 +653,35 @@ class MessageQueueServer:
                 identity, b_request_uid, b_request_type, *payloads = msg
                 request_type = msgspec_decode(b_request_type, cls=RequestType)
 
+                if request_type is RequestType.REGISTER_QOS_PROFILE:
+                    try:
+                        domain_id, weight = unwrap_request_payloads(
+                            payloads, [str, int]
+                        )
+                        self._qos_profiles[identity] = QosProfile(
+                            domain_id=domain_id,
+                            weight=weight,
+                            source="handshake",
+                        )
+                        self.socket.send_multipart(
+                            [identity, b_request_uid, b_request_type]
+                        )
+                    except Exception:
+                        logger.exception("Invalid QoS profile from client %r", identity)
+                        self.socket.send_multipart(
+                            [identity, b_request_uid, b_request_type]
+                        )
+                    continue
+
+                qos_profile = self._qos_profiles.get(identity, DEFAULT_QOS_PROFILE)
+
                 if handler_entry := self.handlers.get(request_type):
                     try:
                         self._call_handler(
                             handler_entry=handler_entry,
                             payloads=payloads,
                             prefix_frames=[identity, b_request_uid, b_request_type],
+                            qos_profile=qos_profile,
                         )
                     except Exception:
                         logger.exception("Error handling request %s", request_type)
