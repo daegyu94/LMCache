@@ -176,6 +176,11 @@ class L2AdapterConfigBase(ABC):
     #: several instances (e.g. one S3 bucket or shared filesystem).
     shared: bool = False
 
+    #: Optional local contention domain for weighted L2 request scheduling.
+    #: Adapters without a name use independent dispatchers. Adapters with the
+    #: same name share one dispatcher and its in-flight limits.
+    qos_resource_group: str | None = None
+
     #: Populated by ``_parse_persist_config`` after ``from_dict``.
     #: Defaults to ``PersistConfig()`` (persist enabled).
     persist_config: PersistConfig = PersistConfig()
@@ -225,6 +230,27 @@ class L2AdapterConfigBase(ABC):
         # Forward all keys except "type" as type-specific kwargs.
         kwargs = {k: v for k, v in serde_dict.items() if k != "type"}
         return SerdeConfig(type=serde_type, kwargs=kwargs)
+
+    @staticmethod
+    def _parse_qos_resource_group(d: dict[str, object]) -> str | None:
+        """Parse an optional weighted-scheduling resource group name.
+
+        Args:
+            d: One L2 adapter JSON specification.
+
+        Returns:
+            The configured non-empty group name, or ``None`` when the adapter
+            should use its own scheduling resource group.
+
+        Raises:
+            ValueError: If ``qos_resource_group`` is not a non-empty string.
+        """
+        group = d.get("qos_resource_group")
+        if group is None:
+            return None
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("'qos_resource_group' must be a non-empty string")
+        return group
 
     @staticmethod
     def _parse_eviction_config(d: dict) -> EvictionConfig | None:
@@ -493,6 +519,9 @@ def parse_args_to_l2_adapters_config(args: argparse.Namespace) -> L2AdaptersConf
         try:
             adapter_cfg = config_cls.from_dict(d)
             adapter_cfg.shared = bool(d.get("shared", False))
+            adapter_cfg.qos_resource_group = (
+                L2AdapterConfigBase._parse_qos_resource_group(d)
+            )
             adapter_cfg.eviction_config = L2AdapterConfigBase._parse_eviction_config(d)
             adapter_cfg.persist_config = L2AdapterConfigBase._parse_persist_config(d)
             adapter_cfg.serde_config = L2AdapterConfigBase._parse_serde_config(d)

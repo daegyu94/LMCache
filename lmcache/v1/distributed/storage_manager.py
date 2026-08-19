@@ -34,6 +34,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigureError,
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
+from lmcache.v1.distributed.l2_qos_adapter import QosL2Adapter
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
@@ -60,9 +61,27 @@ from lmcache.v1.mp_observability.trace.decorator import (
     is_tracing_enabled,
     publish_call_event,
 )
+from lmcache.v1.multiprocess.qos import (
+    CacheSaltQosManager,
+    L2QoSDispatcherPool,
+)
 from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
+
+
+def _resolve_qos_resource_group(
+    config: L2AdapterConfigBase,
+    adapter_id: int,
+) -> tuple[str, str]:
+    """Return the internal key and display name for an adapter QoS group."""
+    configured_group = config.qos_resource_group
+    if configured_group is None:
+        group = f"adapter:{adapter_id}"
+        return group, group
+    if not isinstance(configured_group, str) or not configured_group.strip():
+        raise ValueError("qos_resource_group must be a non-empty string")
+    return f"named:{configured_group}", configured_group
 
 
 class StorageManager:
@@ -88,6 +107,22 @@ class StorageManager:
         # Guards the _l2_adapters and _adapter_descriptors dicts.
         self._adapters_lock = threading.Lock()
         self._registered_l2_listeners: list[L2AdapterListener] = []
+
+        # cache_salt is already part of every ObjectKey, so all local
+        # resource groups can resolve the same scheduling-weight policy.
+        self._cache_salt_qos_manager = CacheSaltQosManager(
+            config.l2_qos_config.default_sched_weight
+        )
+        self._l2_qos_dispatcher_pool: L2QoSDispatcherPool | None = None
+        self._adapter_qos_resource_groups: dict[int, str] = {}
+        if config.l2_qos_config.enabled:
+            self._l2_qos_dispatcher_pool = L2QoSDispatcherPool(
+                qos_manager=self._cache_salt_qos_manager,
+                quantum_bytes=config.l2_qos_config.quantum_bytes,
+                max_inflight_tasks=config.l2_qos_config.max_inflight_tasks,
+                max_inflight_bytes=config.l2_qos_config.max_inflight_bytes,
+            )
+
         self._l2_adapters: dict[int, L2AdapterInterface] = {}
         self._adapter_descriptors: dict[int, AdapterDescriptor] = {}
         for ac in config.l2_adapter_config.adapters:
@@ -783,6 +818,16 @@ class StorageManager:
         return self._quota_manager
 
     @property
+    def cache_salt_qos_manager(self) -> CacheSaltQosManager:
+        """Return the dynamic cache-salt scheduling-weight registry."""
+        return self._cache_salt_qos_manager
+
+    @property
+    def l2_qos_enabled(self) -> bool:
+        """Return whether weighted L2 request scheduling is active."""
+        return self._l2_qos_dispatcher_pool is not None
+
+    @property
     def l1_memory_desc(self) -> L1MemoryDesc:
         """Descriptor of the L1 memory buffer backing this storage manager."""
         return self._l1_memory_desc
@@ -992,6 +1037,10 @@ class StorageManager:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
             adapter.close()
+            group_key = self._adapter_qos_resource_groups.pop(adapter_id, None)
+            if group_key is not None:
+                assert self._l2_qos_dispatcher_pool is not None
+                self._l2_qos_dispatcher_pool.release(group_key)
             logger.info("Deleted L2 adapter %d", adapter_id)
 
     def l2_adapters(self) -> list[tuple[AdapterDescriptor, L2AdapterInterface]]:
@@ -1031,6 +1080,9 @@ class StorageManager:
         self._l2_eviction_controller.stop()
 
         PeriodicEventNotifier.shutdown()
+
+        if self._l2_qos_dispatcher_pool is not None:
+            self._l2_qos_dispatcher_pool.close()
 
         for adapter in self._l2_adapters.values():
             adapter.close()
@@ -1125,6 +1177,21 @@ class StorageManager:
                 serde=create_serde_processor(config.serde_config),
                 l1_manager=self._l1_manager,
             )
+        if self._l2_qos_dispatcher_pool is not None:
+            group_key, group_name = _resolve_qos_resource_group(config, adapter_id)
+            dispatcher = self._l2_qos_dispatcher_pool.acquire(group_key)
+            try:
+                adapter = QosL2Adapter(
+                    adapter=adapter,
+                    dispatcher=dispatcher,
+                    qos_manager=self._cache_salt_qos_manager,
+                    resource_group=group_name,
+                )
+            except Exception:
+                self._l2_qos_dispatcher_pool.release(group_key)
+                adapter.close()
+                raise
+            self._adapter_qos_resource_groups[adapter_id] = group_key
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
         # the observability bus carry their backend identity.
@@ -1163,13 +1230,15 @@ class StorageManager:
         self,
         adapter: L2AdapterInterface,
     ) -> Optional[L2ReconfigurableAdapter]:
-        if isinstance(adapter, L2ReconfigurableAdapter):
-            return adapter
-
-        inner = getattr(adapter, "inner_adapter", None)
-        if inner is not None and isinstance(inner, L2ReconfigurableAdapter):
-            return inner
-
+        current: object = adapter
+        visited: set[int] = set()
+        while id(current) not in visited:
+            visited.add(id(current))
+            if isinstance(current, L2ReconfigurableAdapter):
+                return current
+            current = getattr(current, "inner_adapter", None)
+            if current is None:
+                break
         return None
 
     def _list_reconfigurable_l2_adapters(

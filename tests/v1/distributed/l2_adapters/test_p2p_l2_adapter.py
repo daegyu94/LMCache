@@ -4,6 +4,7 @@
 # Standard
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
+import threading
 import time
 
 # Third Party
@@ -11,16 +12,21 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter as p2p_mod
+from lmcache.v1.distributed.l2_adapters.base import L2TaskId
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     P2PL2Adapter,
     P2PL2AdapterConfig,
 )
+from lmcache.v1.distributed.l2_qos_adapter import QosL2Adapter
 from lmcache.v1.distributed.transfer_channel.api import (
     TransferChannelAddress,
     TransferChannelReadResult,
 )
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.qos import CacheSaltQosManager, L2QoSDispatcher
 
 _LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
@@ -363,6 +369,79 @@ def test_store_completes_immediately_without_leaking():
         assert completed[task_id].bytes_transferred() == 0
         # Draining clears the completed set.
         assert adapter.pop_completed_store_tasks() == {}
+
+
+def test_qos_wrapper_serializes_p2p_submit_and_pop() -> None:
+    """The QoS wrapper protects the lock-free P2P bookkeeping state."""
+    with _adapter() as (adapter, _mq, _tc_ctx, _tc, _notifier):
+        dispatcher = L2QoSDispatcher(max_inflight_tasks=1)
+        wrapper = QosL2Adapter(
+            adapter,
+            dispatcher,
+            CacheSaltQosManager(),
+        )
+        submit_started = threading.Event()
+        release_submit = threading.Event()
+        pop_entered = threading.Event()
+        original_submit = adapter.submit_store_task
+        original_pop = adapter.pop_completed_store_tasks
+
+        def blocked_submit(
+            keys: list[ObjectKey],
+            objects: list[MemoryObj],
+        ) -> L2TaskId:
+            submit_started.set()
+            if not release_submit.wait(timeout=2):
+                raise RuntimeError("test submit was not released")
+            return original_submit(keys, objects)
+
+        def observed_pop() -> dict[L2TaskId, L2StoreResult]:
+            pop_entered.set()
+            return original_pop()
+
+        try:
+            with (
+                patch.object(
+                    adapter,
+                    "submit_store_task",
+                    side_effect=blocked_submit,
+                ),
+                patch.object(
+                    adapter,
+                    "pop_completed_store_tasks",
+                    side_effect=observed_pop,
+                ),
+            ):
+                memory_obj = MagicMock()
+                memory_obj.get_size.return_value = 1
+                wrapped_task_id = wrapper.submit_store_task([_key(0)], [memory_obj])
+                assert submit_started.wait(timeout=1)
+
+                pop_results: list[dict[L2TaskId, L2StoreResult]] = []
+
+                def pop() -> None:
+                    pop_results.append(wrapper.pop_completed_store_tasks())
+
+                pop_thread = threading.Thread(target=pop)
+                pop_thread.start()
+                assert not pop_entered.wait(timeout=0.05)
+
+                release_submit.set()
+                pop_thread.join(timeout=1)
+                assert not pop_thread.is_alive()
+                assert pop_entered.is_set()
+
+                completed = pop_results[0] if pop_results else {}
+                deadline = time.monotonic() + 1
+                while not completed and time.monotonic() < deadline:
+                    completed = wrapper.pop_completed_store_tasks()
+                    if not completed:
+                        time.sleep(0.001)
+                assert completed[wrapped_task_id].is_successful()
+        finally:
+            release_submit.set()
+            wrapper.close()
+            dispatcher.close()
 
 
 def test_load_missing_address_is_failure_not_raise():

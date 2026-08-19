@@ -51,16 +51,15 @@ def _group_keys_by_shape(
 ) -> dict[tuple, list[ObjectKey]]:
     """Group ``keys`` by the fields that determine their KV cache shape.
 
-    Each bucket shares a single ``(shape, dtype)``, so each bucket can be
-    submitted as one ``submit_store_task`` call. Today the shape is pinned
-    by ``(model_name, kv_rank)`` — ``kv_rank`` packs ``world_size`` and
-    parallelism config, so different TP/PP setups land in different
-    buckets. Extend the grouping tuple when a new shape-affecting field is
-    added to ``ObjectKey``.
+    Each bucket shares a single ``(shape, dtype, cache_salt)``, so it can
+    be submitted as one ``submit_store_task`` call and charged to one weighted
+    L2 request scheduling domain. The shape is pinned by
+    ``(model_name, kv_rank)``; ``kv_rank`` packs ``world_size`` and parallelism
+    config.
     """
     groups: dict[tuple, list[ObjectKey]] = defaultdict(list)
     for key in keys:
-        groups[(key.model_name, key.kv_rank)].append(key)
+        groups[(key.model_name, key.kv_rank, key.cache_salt)].append(key)
     return groups
 
 
