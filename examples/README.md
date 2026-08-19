@@ -51,6 +51,7 @@ Focus: deploying, monitoring, and operating LMCache in production.
 | Example | What it does | Hardware |
 |---------|-------------|----------|
 | [`observability/`](observability/) | Full observability stack: OTel → Prometheus + Tempo → Grafana. Pre-provisioned dashboard shows cache hit rate, read/write throughput, and per-request trace waterfalls. Started with `docker compose up`. | 1 GPU + Docker |
+| [`l2_qos/`](l2_qos/) | Docker harness for cache-salt-based weighted L2 request scheduling. | Docker |
 | [`multi_process/`](multi_process/) | Kubernetes DaemonSet YAML for deploying the LMCache server as a per-node sidecar (60 GB L1, 4 workers). Includes resource `requests`/`limits` calibrated to the L1 size. | Kubernetes cluster with GPU nodes |
 | [`kubernetes/`](kubernetes/) | `health_probe.py`: readiness/liveness probe script for LMCache in Kubernetes. Complements the DaemonSet config in `multi_process/`. | None |
 | [`chunk_statistics/`](chunk_statistics/) | Track chunk reuse rate using a memory Bloom filter or an on-disk hash log. Query via REST (`/chunk_statistics/status`). Use this to answer "does my workload benefit from caching?" before committing to a full deployment. | 1+ GPUs |
