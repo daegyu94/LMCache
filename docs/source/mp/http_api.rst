@@ -163,6 +163,25 @@ compatibility with the vLLM-embedded API server.
      - Compute MD5 checksums over KV cache blocks (diagnostics / round-trip
        integrity checks).
 
+**Weighted L2 request scheduling management**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 35 55
+
+   * - Method
+     - Path
+     - Purpose
+   * - GET / PUT
+     - ``/qos/config``
+     - Read or update the default scheduling weight for unregistered salts.
+   * - GET
+     - ``/qos/cache-salt``
+     - List explicitly registered cache-salt scheduling weights.
+   * - GET / PUT / DELETE
+     - ``/qos/cache-salt/{cache_salt}``
+     - Read, register, or remove one cache-salt scheduling weight.
+
 **Quota management**
 
 .. list-table::
@@ -991,6 +1010,96 @@ transient temporary from another lookup, so claiming it as warmed could mislead.
 
     curl -s http://localhost:8080/cache/prefetches/abc123
     # -> {"status": "completed", "found_keys": 1, "total_keys": 1}
+
+.. _mp-http-qos-api:
+
+Weighted L2 request scheduling management
+-----------------------------------------
+
+These endpoints configure scheduling weights keyed by ``cache_salt`` for
+weighted L2 request scheduling. The registry applies the same weight to store, lookup, and load work across
+all L2 adapters in this MP server, while resource groups schedule that work
+independently. Unknown salts
+use the default weight, so traffic does not depend on prior provisioning.
+Weights must be integers in ``[1, 10000]``.
+
+The JSON field name is ``sched_weight``. It is a weighted L2 request
+scheduling value, not a direct disk or network bandwidth setting. For the
+scheduler's admission boundary and backend limitations, see the :ref:`weighted
+L2 request scheduling configuration <mp-weighted-l2-request-scheduling>`.
+
+The registry is in memory and node-local. Replay registrations after restart
+and apply them to every MP server that may receive the salt. The API remains
+writable when weighted L2 request scheduling is disabled, allowing policy to be
+staged before scheduling is enabled.
+
+As with the quota API, use ``_default`` in a path for the empty salt. This
+sentinel collides with a literal ``cache_salt="_default"``; use another salt
+value when the two must be distinguished.
+
+``GET /qos/config`` and ``PUT /qos/config``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Read or update the fallback scheduling weight. The PUT body is
+``{"sched_weight": <integer>}``.
+
+.. code-block:: bash
+
+    curl -s -X PUT http://localhost:8080/qos/config \
+        -H 'Content-Type: application/json' \
+        -d '{"sched_weight": 100}'
+
+A successful response reports ``enabled``, ``default_sched_weight``, and
+``status`` for PUT. Malformed or out-of-range values return ``400``.
+
+``PUT /qos/cache-salt/{cache_salt}``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Create or replace an explicit scheduling-weight entry using the same
+``{"sched_weight": <integer>}`` body.
+
+.. code-block:: bash
+
+    curl -s -X PUT http://localhost:8080/qos/cache-salt/premium \
+        -H 'Content-Type: application/json' \
+        -d '{"sched_weight": 500}'
+
+The response is
+``{"cache_salt":"premium","sched_weight":500,"status":"ok"}``. Registration may
+happen before or after the first request; queued work adopts the new weight.
+
+``GET /qos/cache-salt/{cache_salt}``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Return the effective scheduling weight as ``sched_weight``, its ``source``
+(``explicit`` or ``default``), and whether an explicit entry
+``exists``. Unknown salts return the default rather than ``404``.
+
+.. code-block:: bash
+
+    curl -s http://localhost:8080/qos/cache-salt/premium
+
+``DELETE /qos/cache-salt/{cache_salt}``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Remove an explicit entry. The response status is ``removed`` or
+``not_found``, and ``sched_weight`` reports the restored default scheduling
+weight.
+
+``GET /qos/cache-salt``
+~~~~~~~~~~~~~~~~~~~~~~~
+
+List the default and every explicit entry:
+
+.. code-block:: json
+
+    {
+      "enabled": true,
+      "default_sched_weight": 100,
+      "weights": {"premium": 500, "batch": 50}
+    }
+
+All endpoints return ``503`` before the MP engine is initialized.
 
 .. _mp-http-quota-api:
 

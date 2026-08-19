@@ -393,6 +393,204 @@ Source: ``lmcache/v1/distributed/config.py``
        controller poll loops for L2 adapters that lack native
        async completion callbacks.
 
+.. _mp-weighted-l2-request-scheduling:
+
+Weighted L2 request scheduling
+------------------------------
+
+LMCache MP applies weighted L2 request scheduling to store, lookup, and load
+tasks using the ``cache_salt`` already carried on each ``ObjectKey``. Each L2
+adapter uses an independent byte-weighted fair scheduler by default. Adapters
+configured with the same ``qos_resource_group`` share one scheduler because
+they are expected to contend for the same underlying resource.
+
+An unregistered salt uses ``--l2-qos-default-sched-weight`` immediately. An
+operator may register the salt before traffic or update it later through the
+:ref:`MP QoS HTTP API <mp-http-qos-api>`; queued work adopts the new weight.
+Weights are relative values in ``[1, 10000]``. The command-line and HTTP field
+names are ``sched_weight``; they name scheduling weights for weighted L2
+request scheduling, not direct disk or network QoS settings.
+Registrations are in memory and must be replayed after a server restart.
+
+The weight registry remains common to every resource group in the MP server,
+but DRR queues and in-flight limits are independent between groups. Set the
+optional ``qos_resource_group`` field in each ``--l2-adapter`` JSON
+object when multiple adapters share one contention domain. For example, these
+adapters share the ``nvme0`` scheduler:
+
+.. code-block:: text
+
+    --l2-adapter '{"type":"fs","path":"/mnt/nvme0/cache-a","qos_resource_group":"nvme0"}'
+    --l2-adapter '{"type":"fs","path":"/mnt/nvme0/cache-b","qos_resource_group":"nvme0"}'
+
+Omitting ``qos_resource_group`` gives each adapter its own scheduler.
+Group names are local to one MP server and do not coordinate other servers.
+
+Scheduling model
+~~~~~~~~~~~~~~~~
+
+Each resource-group scheduler uses a byte-cost variant of
+`Deficit Round Robin (DRR) <https://doi.org/10.1109/90.502236>`_,
+described by Shreedhar and Varghese
+in *Efficient Fair Queueing Using Deficit Round-Robin*. DRR fits L2 work
+because requests have different estimated sizes: a task-count round robin
+would give a large store and a small lookup the same service unit. Each
+cache-salt domain earns a weight-proportional byte quantum, and unused deficit
+carries to a later round when the next task is larger than the current quantum.
+Deficit accumulation advances through logical rounds immediately; it does not
+wait for wall-clock time to pass when a task costs more than one quantum.
+``quantum_bytes`` therefore controls scheduling granularity and burstiness.
+
+Each resource-group scheduler is work-conserving. Weights determine the
+relative byte share of
+admission only while multiple domains have queued work; they neither reserve
+idle capacity nor impose a per-domain rate limit. A lone active domain may use
+all available admission capacity.
+
+Admission boundary and guarantees
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This policy controls request admission and ordering at LMCache's L2 adapter
+boundary. Bounded in-flight limits keep excess work in the LMCache queue, where
+DRR can prevent one domain from flooding concrete adapter submissions and can
+reduce queueing interference for other domains. Once a task is submitted to a
+concrete adapter, however, LMCache neither preempts nor reorders it.
+
+Weights are not propagated into filesystem writeback, device queues, network
+queues, or a remote backend's scheduler. The policy therefore provides
+weighted admission under contention, not an exact device-bandwidth or latency
+guarantee. Its influence becomes weaker when the in-flight limits are unbounded
+or large relative to a backend's queue, because most work can leave the
+scheduler before DRR has a queue to arbitrate.
+
+In-flight limits and fairness
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In-flight task and byte limits apply independently to each resource group.
+The common deployment has multiple Docker workload instances sharing one L2
+adapter through one MP server:
+
+.. code-block:: text
+
+    Docker A (salt=A) --\
+                         +--> weighted DRR queue --> admission window --> one L2 adapter
+    Docker B (salt=B) --/                              | tasks <= T
+                                                      | bytes <= B
+
+Here ``T`` is ``max_inflight_tasks`` and ``B`` is
+``max_inflight_bytes``. A task is admitted only when it satisfies both
+enabled limits; zero disables that limit.
+
+A bounded admission window keeps work in the DRR queue. When one admitted task
+completes, the scheduler chooses the next domain according to its accumulated
+weighted deficit:
+
+.. code-block:: text
+
+    T = 2
+
+    DRR queue:       [B2] [B3] [A3] [B4] ...
+                           |
+                           | completion opens one slot
+                           v
+    admission:       [A1] [B1]              (at most 2 tasks)
+                           |
+                           v
+    L2 adapter:      [active work]
+
+Because the queued tasks remain before the adapter, the next open slot can go
+to B even if A filled an earlier slot. Smaller limits strengthen this response
+but can underutilize the adapter when the window is below its saturation
+concurrency.
+
+A window much larger than the adapter's effective concurrency moves the queue
+behind the scheduling boundary:
+
+.. code-block:: text
+
+    T = 64, adapter concurrency = 8
+
+    DRR queue:       [new B work]
+                           |
+    admission:       [A x 64 already admitted]
+                           |
+    L2 adapter:      [8 active A] [56 queued A]
+
+The scheduler cannot preempt or reorder those 56 adapter-queued A tasks, so a
+later B request receives weaker short-term fairness even if B has a larger
+weight. Setting both limits to zero has the same effect once the DRR queue is
+drained: weighted submission order still applies to work queued at the same
+time, but sustained fair admission is weak.
+
+The byte limit bounds the same window by estimated cost rather than task count.
+For example, with ``T=8``, eight 512 MiB tasks can be admitted when
+``B=0``; setting ``B=1 GiB`` leaves later large tasks in the DRR queue
+after two such admissions. This improves responsiveness when task sizes vary,
+but an arbitrary byte default can serialize valid requests because KV object
+sizes depend on the model, tensor parallelism, and batch size.
+
+The default ``T=8, B=0`` applies to each resource group and targets
+the common group containing one adapter. Eight matches the MP server's default prefetch concurrency and does not set the
+admission window below the common four-to-eight-worker L2 adapters. The
+unlimited byte default avoids imposing a model-dependent size threshold.
+Operators should override these values when the deployment differs:
+
+* Set ``max_inflight_tasks`` to the smallest queue depth that reaches the
+  full throughput of the resource group. Increase it when the group contains
+  an adapter with more than eight effective workers; when a named group
+  contains multiple adapters, account for their aggregate effective
+  concurrency.
+* Keep ``max_inflight_bytes=0`` unless large task-size variance causes too
+  much work to accumulate behind the adapter. When needed, start near
+  ``max_inflight_tasks * p95(task_bytes)`` and validate throughput and tail
+  latency on the target workload.
+
+The byte limit controls concrete submissions, not total LMCache memory.
+Store objects and load buffers may already be reserved while their tasks wait
+for admission.
+
+In-flight accounting also follows the concrete adapter's completion contract.
+If an adapter reports completion when buffered I/O or a remote request is
+accepted rather than when the physical operation finishes, downstream work may
+outlive the scheduler's accounting. With a local ``fs`` adapter, direct I/O
+makes completions track device work more closely than buffered I/O, but still
+does not enforce a physical device share. Store and load use estimated object
+bytes; lookup uses key count as a nonzero proxy because it has no data buffer.
+
+Each resource-group scheduler and the shared weight registry are local to
+one MP server. Multiple MP servers targeting the same L2 backend make independent admission decisions;
+this feature does not provide fleet-wide fairness unless traffic is partitioned
+or coordinated outside these node-local schedulers.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--l2-qos-disable``
+     - disabled
+     - Disable weighted L2 request scheduling based on ``cache_salt``.
+   * - ``--l2-qos-default-sched-weight``
+     - ``100``
+     - Scheduling weight used by salts without an explicit registration.
+   * - ``--l2-qos-quantum-bytes``
+     - ``1048576``
+     - Base byte quantum granted to a weight-100 salt per scheduling round.
+   * - ``--l2-qos-max-inflight-tasks``
+     - ``8``
+     - Number of concrete L2 submissions in flight per resource group. The
+       default targets a group with one adapter; ``0`` is unlimited.
+   * - ``--l2-qos-max-inflight-bytes``
+     - ``0``
+     - Estimated bytes in flight per resource group; ``0`` is
+       unlimited.
+
+The Docker harness in ``examples/l2_qos/`` runs two clients that send only
+their ``cache_salt`` and demonstrates the server-side weighted L2 request
+scheduling decision.
+
 L2 Adapters
 -----------
 

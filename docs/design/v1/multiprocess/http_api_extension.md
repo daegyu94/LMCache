@@ -40,6 +40,9 @@ modules:
 | `info_api.py` | `/status` | GET | Internal status report |
 | `config_api.py` | `/config` | GET | Server config dump |
 | `cache_api.py` | `/cache/clear` | POST | Force-clear L1 cache |
+| `qos_api.py` | `/qos/config` | GET, PUT | Read or update the default scheduling weight |
+| `qos_api.py` | `/qos/cache-salt` | GET | List explicit cache-salt weights |
+| `qos_api.py` | `/qos/cache-salt/{cache_salt}` | GET, PUT, DELETE | Manage one cache-salt weight |
 
 ### `http_server.py`
 
@@ -75,6 +78,7 @@ register_all_apis()
   │    ├─ config_api      → has router? ✓ → include
   │    ├─ cache_api       → has router? ✓ → include
   │    ├─ quota_api       → has router? ✓ → include
+  │    ├─ qos_api         → has router? ✓ → include
   │    └─ my_new_api      → has router? ✓ → include
   │
   └─ app.include_router(collected_router)
