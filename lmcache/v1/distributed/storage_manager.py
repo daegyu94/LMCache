@@ -208,6 +208,14 @@ class StorageManager:
         """
         self._l1_manager.free_transient(objects)
 
+    def get_l1_memory_usage(self) -> tuple[int, int]:
+        """Return the (used, total) byte usage of the registered L1 arena.
+
+        Returns:
+            A ``(used_bytes, total_bytes)`` tuple.
+        """
+        return self._l1_manager.get_memory_usage()
+
     @enable_tracing()
     def reserve_write(
         self,

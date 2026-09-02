@@ -311,11 +311,68 @@ class L2TracePlan:
 class ReplayBufferPool:
     """Transient L1-backed buffers registered with the target adapter."""
 
-    def __init__(self, storage_manager: StorageManager) -> None:
+    def __init__(
+        self,
+        storage_manager: StorageManager,
+        *,
+        capacity_fraction: float = 0.9,
+    ) -> None:
+        if not math.isfinite(capacity_fraction) or not 0 < capacity_fraction <= 1:
+            raise ValueError("capacity_fraction must be finite and in (0, 1]")
         self._storage_manager = storage_manager
+        _, total_bytes = storage_manager.get_l1_memory_usage()
+        # Leave headroom below the arena total for allocator alignment overhead.
+        self._capacity_bytes = max(1, int(total_bytes * capacity_fraction))
+        self._outstanding_bytes = 0
+        self._peak_outstanding_bytes = 0
+        self._rejections = 0
+
+    @property
+    def capacity_bytes(self) -> int:
+        """Total in-flight byte budget for replay buffers."""
+        return self._capacity_bytes
+
+    @property
+    def outstanding_bytes(self) -> int:
+        """Bytes currently held by in-flight replay buffers."""
+        return self._outstanding_bytes
+
+    @property
+    def peak_outstanding_bytes(self) -> int:
+        """Peak in-flight byte usage observed since construction."""
+        return self._peak_outstanding_bytes
+
+    @property
+    def rejections(self) -> int:
+        """Count of acquire calls refused due to budget or OOM."""
+        return self._rejections
 
     def acquire(self, sizes: list[int]) -> list[MemoryObj] | None:
-        """Acquire one replay buffer per byte size, or return ``None`` on OOM."""
+        """Acquire one replay buffer per byte size, or ``None`` on budget/oom.
+
+        Args:
+            sizes: Logical byte size of each buffer to acquire.
+
+        Returns:
+            The acquired buffers, or ``None`` when the in-flight byte budget
+                is exhausted or L1 allocation fails.
+
+        Raises:
+            RuntimeError: A single request already exceeds the byte budget.
+        """
+        need = sum(int(size) for size in sizes)
+        if need > self._capacity_bytes:
+            raise RuntimeError(
+                f"L2 replay buffer request of {need} bytes exceeds the "
+                f"in-flight byte budget of {self._capacity_bytes} bytes; "
+                f"increase `l1_size_gb` so the L1 arena can hold the largest "
+                f"individual store/load batch"
+            )
+        if self._outstanding_bytes + need > self._capacity_bytes:
+            # Budget exhausted: refuse before touching the allocator. This is
+            # what stops the per-pending-op allocator WARNING storm.
+            self._rejections += 1
+            return None
         acquired: list[MemoryObj] = []
         for size in sizes:
             layout = MemoryLayoutDesc(
@@ -324,13 +381,25 @@ class ReplayBufferPool:
             )
             objects = self._storage_manager.allocate_l1_transient(layout)
             if objects is None:
+                # Budget had room but the allocator still failed
+                # (e.g. fragmentation); roll back what we already took.
                 self.release(acquired)
+                self._rejections += 1
                 return None
             acquired.extend(objects)
+            for obj in objects:
+                self._outstanding_bytes += obj.get_size()
+            self._peak_outstanding_bytes = max(
+                self._peak_outstanding_bytes, self._outstanding_bytes
+            )
         return acquired
 
     def release(self, objects: list[MemoryObj]) -> None:
-        """Return completed-task buffers to the shared L1 arena."""
+        """Return acquired buffers to the shared L1 arena and free their budget."""
+        if not objects:
+            return
+        for obj in objects:
+            self._outstanding_bytes -= obj.get_size()
         self._storage_manager.free_l1_transient(objects)
 
 
@@ -397,7 +466,11 @@ class L2ReplayDriver:
             sizes = [size for _, size in batch]
             objects = self._buffers.acquire(sizes)
             if objects is None:
-                raise RuntimeError("L2 prepare exhausted the replay buffer pool")
+                raise RuntimeError(
+                    "L2 prepare exhausted the replay buffer pool: "
+                    f"budget_bytes={self._buffers.capacity_bytes} "
+                    f"outstanding_bytes={self._buffers.outstanding_bytes}"
+                )
             task_id = self._adapter.submit_store_task(keys, objects)
             tasks[task_id] = (objects, sum(sizes))
             submitted_bytes += sum(sizes)
@@ -442,6 +515,9 @@ class L2ReplayDriver:
         schedule_lags: list[float] = []
         dependency_waits: list[float] = []
         buffer_waits: list[float] = []
+        buffer_stall_seconds = 0.0
+        buffer_stall_events = 0
+        buffer_blocking_since: float | None = None
         outcome_comparisons: dict[str, int] = defaultdict(int)
         outcome_mismatch_counts: dict[str, int] = defaultdict(int)
         outcome_mismatch_count = 0
@@ -474,7 +550,7 @@ class L2ReplayDriver:
             logger.info(
                 "L2 replay progress: elapsed=%.1fs dispatched=%d/%d "
                 "completed=%d pending=%d in_flight(store=%d lookup=%d load=%d) "
-                "bytes_submitted=%d",
+                "bytes_submitted=%d buffer_bytes=%d/%d buffer_rejections=%d",
                 now - started,
                 dispatched,
                 len(self._plan.operations),
@@ -484,12 +560,16 @@ class L2ReplayDriver:
                 len(lookups),
                 len(loads),
                 sum(bytes_submitted.values()),
+                self._buffers.outstanding_bytes,
+                self._buffers.capacity_bytes,
+                self._buffers.rejections,
             )
             last_progress_log = now
 
         while pending or stores or lookups or loads:
             now = time.monotonic()
             progress = False
+            buffer_blocked = False
             for op in list(pending):
                 target = started + (op.t_mono - schedule_origin) / self._speedup
                 if now < target or not op.dependencies.issubset(completed):
@@ -499,7 +579,12 @@ class L2ReplayDriver:
                     sizes = [int(size) for size in op.args["object_sizes"]]
                     acquired = self._buffers.acquire(sizes)
                     if acquired is None:
-                        continue
+                        # Budget is full: stop dispatching this iteration instead
+                        # of continuing. Continuing would waste O(pending)
+                        # allocator attempts per iteration and let small ops
+                        # overtake larger earlier ops, distorting trace order.
+                        buffer_blocked = True
+                        break
                     objects = acquired
                     bytes_submitted[op.operation] += sum(sizes)
                 dispatched = time.monotonic()
@@ -607,13 +692,23 @@ class L2ReplayDriver:
             log_progress(time.monotonic())
             if progress:
                 last_progress = time.monotonic()
+                if buffer_blocking_since is not None:
+                    buffer_stall_seconds += time.monotonic() - buffer_blocking_since
+                    buffer_stall_events += 1
+                    buffer_blocking_since = None
                 continue
+
+            if buffer_blocked and buffer_blocking_since is None:
+                buffer_blocking_since = time.monotonic()
 
             if time.monotonic() - last_progress > self._drain_timeout:
                 raise RuntimeError(
                     "L2 replay made no progress before drain timeout: "
                     f"pending={len(pending)} "
-                    f"in_flight={len(stores) + len(lookups) + len(loads)}"
+                    f"in_flight={len(stores) + len(lookups) + len(loads)} "
+                    f"buffer_budget_bytes={self._buffers.capacity_bytes} "
+                    f"buffer_outstanding_bytes={self._buffers.outstanding_bytes} "
+                    f"buffer_rejections={self._buffers.rejections}"
                 )
             time.sleep(0.001)
 
@@ -633,6 +728,16 @@ class L2ReplayDriver:
         drain_seconds = (
             max(0.0, finished - max(dispatch_times)) if dispatch_times else 0.0
         )
+        # An open-loop replay degrades into a closed-loop one once the target
+        # cannot absorb the requested rate. Report how much of the requested
+        # schedule was actually realized so a saturated run is never read as a
+        # faithful measurement of the requested speedup.
+        schedule_fidelity = (
+            min(1.0, source_window / submission_window)
+            if submission_window > 0 and source_window > 0
+            else 1.0
+        )
+        buffer_limited = buffer_stall_seconds > 0.0 or self._buffers.rejections > 0
         return {
             **self._latency_stats.snapshot(),
             "speedup": self._speedup,
@@ -669,6 +774,14 @@ class L2ReplayDriver:
                 "unlock": counts.get("unlock", 0),
                 "delete": counts.get("delete", 0),
             },
+            "l1_replay_budget_bytes": self._buffers.capacity_bytes,
+            "peak_outstanding_buffer_bytes": self._buffers.peak_outstanding_bytes,
+            "buffer_acquire_rejections": self._buffers.rejections,
+            "buffer_stall_seconds": buffer_stall_seconds,
+            "buffer_stall_events": buffer_stall_events,
+            "schedule_fidelity": schedule_fidelity,
+            "achieved_speedup": self._speedup * schedule_fidelity,
+            "replay_buffer_limited": buffer_limited,
         }
 
 

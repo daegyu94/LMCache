@@ -581,3 +581,62 @@ def test_trace_percent_must_be_finite_and_in_range(tmp_path, trace_percent):
 
     with pytest.raises(ValueError, match="trace_percent"):
         L2TracePlan.from_file(str(trace), trace_percent=trace_percent)
+
+
+def test_replay_buffer_pool_rejects_beyond_budget_without_allocating():
+    storage_manager = l2_driver_module.StorageManager(
+        _config(), start_controllers=False
+    )
+    pool = ReplayBufferPool(storage_manager)
+    held: list = []
+    try:
+        with mock.patch.object(
+            storage_manager,
+            "allocate_l1_transient",
+            wraps=storage_manager.allocate_l1_transient,
+        ) as alloc:
+            while True:
+                objects = pool.acquire([8 * 1024 * 1024])
+                if objects is None:
+                    break
+                held.extend(objects)
+
+            assert pool.rejections >= 1
+            calls_before_failing_acquire = alloc.call_count
+            assert pool.acquire([8 * 1024 * 1024]) is None
+            assert alloc.call_count == calls_before_failing_acquire
+    finally:
+        pool.release(held)
+        storage_manager.close()
+
+
+def test_replay_buffer_pool_accounting_is_symmetric():
+    storage_manager = l2_driver_module.StorageManager(
+        _config(), start_controllers=False
+    )
+    pool = ReplayBufferPool(storage_manager)
+    sizes = [1024, 4096, 65536, 1024 * 1024]
+    try:
+        for _ in range(5):
+            objects = pool.acquire(sizes)
+            assert objects is not None
+            pool.release(objects)
+        assert pool.outstanding_bytes == 0
+        assert pool.peak_outstanding_bytes >= sum(sizes)
+        assert storage_manager.report_status()["l1_manager"]["memory_used_bytes"] == 0
+    finally:
+        storage_manager.close()
+
+
+def test_replay_buffer_pool_rejects_request_larger_than_budget():
+    storage_manager = l2_driver_module.StorageManager(
+        _config(), start_controllers=False
+    )
+    pool = ReplayBufferPool(storage_manager)
+    try:
+        with pytest.raises(RuntimeError, match="l1_size_gb"):
+            pool.acquire([pool.capacity_bytes + 1])
+        assert pool.outstanding_bytes == 0
+        assert pool.rejections == 0
+    finally:
+        storage_manager.close()
