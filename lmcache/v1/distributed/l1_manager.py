@@ -190,6 +190,7 @@ class L1Manager:
         self._lock = threading.Lock()
 
         self._objects: dict[ObjectKey, L1ObjectState] = {}
+        self._transient_objects: dict[int, MemoryObj] = {}
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
@@ -238,6 +239,54 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    @l1_mgr_synchronized
+    def allocate_transient(
+        self, layout_desc: MemoryLayoutDesc, count: int = 1
+    ) -> list[MemoryObj] | None:
+        """Allocate L1-backed buffers outside the KV object state machine.
+
+        Args:
+            layout_desc: Memory layout for each transient buffer.
+            count: Number of buffers to allocate.
+
+        Returns:
+            The allocated buffers, or ``None`` when L1 has insufficient space.
+
+        Raises:
+            ValueError: If ``count`` is not positive.
+
+        Notes:
+            Transient buffers share the registered L1 arena but are not cache
+            entries and cannot be evicted. Call :meth:`free_transient` only
+            after every asynchronous user of the buffers has completed.
+        """
+        if count <= 0:
+            raise ValueError("count must be positive")
+        error, objects = self._memory_manager.allocate(layout_desc, count)
+        if error != L1Error.SUCCESS:
+            return None
+        self._transient_objects.update((id(obj), obj) for obj in objects)
+        return objects
+
+    @l1_mgr_synchronized
+    def free_transient(self, objects: list[MemoryObj]) -> None:
+        """Return transient buffers to the shared L1 allocator.
+
+        Args:
+            objects: Buffers previously returned by :meth:`allocate_transient`.
+
+        Raises:
+            ValueError: If a buffer is foreign or has already been freed.
+        """
+        if not objects:
+            return
+        unknown = [obj for obj in objects if id(obj) not in self._transient_objects]
+        if unknown:
+            raise ValueError("cannot free an unknown transient L1 buffer")
+        self._memory_manager.free(objects)
+        for obj in objects:
+            del self._transient_objects[id(obj)]
 
     @l1_mgr_synchronized
     def reserve_read(
@@ -758,9 +807,13 @@ class L1Manager:
             )
             all_keys = list(self._objects.keys())
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            all_meta = [self._object_meta(obj) for obj in all_memory_objs]
+            all_memory_objs.extend(self._transient_objects.values())
+            all_meta = [
+                self._object_meta(entry.memory_obj) for entry in self._objects.values()
+            ]
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._transient_objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -847,8 +900,10 @@ class L1Manager:
         """Close the L1Manager and free all resources."""
         with self._lock:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            all_memory_objs.extend(self._transient_objects.values())
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._transient_objects.clear()
 
         self._memory_manager.close()
 

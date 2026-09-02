@@ -17,7 +17,11 @@ import torch
 # First Party
 from lmcache.cli.commands.trace import l2_driver as l2_driver_module
 from lmcache.cli.commands.trace import replay_command
-from lmcache.cli.commands.trace.l2_driver import L2ReplayDriver, L2TracePlan
+from lmcache.cli.commands.trace.l2_driver import (
+    L2ReplayDriver,
+    L2TracePlan,
+    ReplayBufferPool,
+)
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -152,6 +156,26 @@ def test_plan_derives_store_lookup_load_dependencies(tmp_path):
     assert load.dependencies == {lookup.task_key}
     assert unlock.dependencies == {load.task_key}
     assert plan.prepare_objects == {}
+
+
+def test_replay_buffer_pool_returns_completed_buffers_to_l1():
+    storage_manager = l2_driver_module.StorageManager(
+        _config(), start_controllers=False
+    )
+    pool = ReplayBufferPool(storage_manager)
+    sizes = [8 * 1024 * 1024, 9 * 1024 * 1024, 10 * 1024 * 1024]
+
+    try:
+        for size in sizes * 2:
+            objects = pool.acquire([size])
+            assert objects is not None
+            status = storage_manager.report_status()["l1_manager"]
+            assert status["memory_used_bytes"] >= size
+            pool.release(objects)
+            status = storage_manager.report_status()["l1_manager"]
+            assert status["memory_used_bytes"] == 0
+    finally:
+        storage_manager.close()
 
 
 def test_plan_preserves_overlapping_store_lookup_submission(tmp_path):

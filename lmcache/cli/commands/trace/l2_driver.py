@@ -309,42 +309,29 @@ class L2TracePlan:
 
 
 class ReplayBufferPool:
-    """Reusable, L1-backed buffers registered with the target adapter."""
+    """Transient L1-backed buffers registered with the target adapter."""
 
     def __init__(self, storage_manager: StorageManager) -> None:
         self._storage_manager = storage_manager
-        self._free: dict[int, list[MemoryObj]] = defaultdict(list)
-        self._counter = 0
 
     def acquire(self, sizes: list[int]) -> list[MemoryObj] | None:
         """Acquire one replay buffer per byte size, or return ``None`` on OOM."""
         acquired: list[MemoryObj] = []
         for size in sizes:
-            if self._free[size]:
-                acquired.append(self._free[size].pop())
-                continue
-            key = ObjectKey(
-                chunk_hash=self._counter.to_bytes(32, "big"),
-                model_name="__lmcache_l2_replay__",
-                kv_rank=0,
-            )
-            self._counter += 1
             layout = MemoryLayoutDesc(
                 shapes=[torch.Size([size])],
                 dtypes=[torch.uint8],
             )
-            reserved = self._storage_manager.reserve_write([key], layout, mode="new")
-            obj = reserved.get(key)
-            if obj is None:
+            objects = self._storage_manager.allocate_l1_transient(layout)
+            if objects is None:
                 self.release(acquired)
                 return None
-            acquired.append(obj)
+            acquired.extend(objects)
         return acquired
 
     def release(self, objects: list[MemoryObj]) -> None:
-        """Return completed-task buffers to the pool."""
-        for obj in objects:
-            self._free[obj.get_size()].append(obj)
+        """Return completed-task buffers to the shared L1 arena."""
+        self._storage_manager.free_l1_transient(objects)
 
 
 class L2ReplayDriver:

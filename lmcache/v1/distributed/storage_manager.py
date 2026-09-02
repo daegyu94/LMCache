@@ -186,6 +186,28 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+    def allocate_l1_transient(
+        self, layout_desc: MemoryLayoutDesc, count: int = 1
+    ) -> list[MemoryObj] | None:
+        """Allocate transient buffers from the registered L1 memory arena.
+
+        Args:
+            layout_desc: Memory layout for each transient buffer.
+            count: Number of buffers to allocate.
+
+        Returns:
+            The allocated buffers, or ``None`` when L1 has insufficient space.
+        """
+        return self._l1_manager.allocate_transient(layout_desc, count)
+
+    def free_l1_transient(self, objects: list[MemoryObj]) -> None:
+        """Return transient buffers to the registered L1 memory arena.
+
+        Args:
+            objects: Buffers returned by :meth:`allocate_l1_transient`.
+        """
+        self._l1_manager.free_transient(objects)
+
     @enable_tracing()
     def reserve_write(
         self,
