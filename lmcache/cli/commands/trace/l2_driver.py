@@ -414,6 +414,7 @@ class L2ReplayDriver:
         speedup: float = 1.0,
         trace_percent: float = 100.0,
         drain_timeout: float = 60.0,
+        max_pressure: bool = False,
     ) -> None:
         if not math.isfinite(speedup) or speedup <= 0:
             raise ValueError("speedup must be a finite positive number")
@@ -434,6 +435,7 @@ class L2ReplayDriver:
         self._buffers = ReplayBufferPool(self._storage_manager)
         self._speedup = speedup
         self._drain_timeout = drain_timeout
+        self._max_pressure = max_pressure
         self._closed = False
 
     def __enter__(self) -> "L2ReplayDriver":
@@ -572,7 +574,9 @@ class L2ReplayDriver:
             buffer_blocked = False
             for op in list(pending):
                 target = started + (op.t_mono - schedule_origin) / self._speedup
-                if now < target or not op.dependencies.issubset(completed):
+                if (
+                    not self._max_pressure and now < target
+                ) or not op.dependencies.issubset(completed):
                     continue
                 objects: list[MemoryObj] = []
                 if op.operation in {"store", "load_task"}:
@@ -741,6 +745,7 @@ class L2ReplayDriver:
         return {
             **self._latency_stats.snapshot(),
             "speedup": self._speedup,
+            "max_pressure": self._max_pressure,
             "trace_percent": self._plan.trace_percent,
             "source_operations_total": self._plan.source_operations_total,
             "operations_selected": len(self._plan.operations),

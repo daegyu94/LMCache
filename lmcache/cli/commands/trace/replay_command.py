@@ -18,6 +18,21 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+
+def _speedup_value(value: str) -> float | str:
+    """Parse a positive speedup factor or the literal ``max``."""
+    if value.strip().lower() == "max":
+        return "max"
+    return float(value)
+
+
+def _speedup_and_max_pressure(value: float | str) -> tuple[float, bool]:
+    """Split a parsed ``--speedup`` into a numeric factor and a max-pressure flag."""
+    if isinstance(value, str) and value == "max":
+        return 1.0, True
+    return float(value), False
+
+
 if TYPE_CHECKING:
     # First Party
     from lmcache.cli.commands.trace._driver import ReplayResult
@@ -97,11 +112,13 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--speedup",
-        type=float,
+        type=_speedup_value,
         default=1.0,
         help=(
-            "Scale recorded timestamp offsets for scaled-open replay "
-            "(default: 1.0; 2.0 replays the schedule twice as fast)."
+            "Scale recorded timestamp offsets for scaled-open replay, or "
+            "'max' to ignore the schedule and dispatch as fast as the "
+            "replay buffer allows (L2 traces only; default: 1.0; 2.0 "
+            "replays the schedule twice as fast)."
         ),
     )
     parser.add_argument(
@@ -182,6 +199,10 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     sm_config: StorageManagerConfig = parse_args_to_config(args)
 
+    speedup, max_pressure = _speedup_and_max_pressure(args.speedup)
+    args.speedup = speedup
+    args.max_pressure = max_pressure
+
     # ``--trace-level`` / ``--trace-output`` belong to the recording
     # surface.  They are still registered on the parser so the flag set
     # stays in lock-step with ``lmcache server``, but they have no
@@ -207,9 +228,15 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     if trace_level == "l2":
         _run_l2_trace_replay(args, sm_config)
         return
-    if args.prepare_l2 or args.prepare_only or args.trace_percent != 100.0:
+    if (
+        args.prepare_l2
+        or args.prepare_only
+        or args.trace_percent != 100.0
+        or args.max_pressure
+    ):
         raise ValueError(
-            "--prepare-l2/--prepare-only/--trace-percent require an L2 trace"
+            "--prepare-l2/--prepare-only/--trace-percent/speedup=max "
+            "require an L2 trace"
         )
 
     # ANSI: bold + yellow for the banner text, reset at the end.
@@ -338,6 +365,7 @@ def _run_l2_trace_replay(
         speedup=args.speedup,
         trace_percent=args.trace_percent,
         drain_timeout=args.drain_timeout,
+        max_pressure=args.max_pressure,
     ) as driver:
         if args.prepare_l2 or args.prepare_only:
             prepare_result = driver.prepare()
