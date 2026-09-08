@@ -50,6 +50,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.instrumentation import L2AdapterInstrumentation
 from lmcache.v1.distributed.l2_adapters.nixl_store_l2_adapter import (
     NixlStoreObj,
 )
@@ -102,11 +103,14 @@ class DynamicNixlStorageAgent:
         self.device = device
         self.backend_params = backend_params
         self.l1_align_bytes = l1_memory_desc.align_bytes
+        self.l1_memory_base = l1_memory_desc.ptr
+        self.l1_memory_size = l1_memory_desc.size
         self.file_path = backend_params["file_path"]
         os.makedirs(self.file_path, exist_ok=True)
         self.use_direct_io = (
             str(backend_params.get("use_direct_io", "false")).lower() == "true"
         )
+        self._instrumentation: L2AdapterInstrumentation | None = None
 
         self.agent_name = "DynNixlAgent_" + str(uuid.uuid4())
         nixl_conf = NixlAgentConfig(backends=[])
@@ -121,6 +125,21 @@ class DynamicNixlStorageAgent:
             l1_memory_desc.align_bytes,
             device_id=0,
         )
+
+    def set_instrumentation(
+        self, instrumentation: L2AdapterInstrumentation | None
+    ) -> None:
+        """Enable per-instance NIXL spans, or disable with None."""
+        self._instrumentation = instrumentation
+
+    def _start_span(self) -> float | None:
+        collector = self._instrumentation
+        return collector.start() if collector is not None else None
+
+    def _finish_span(self, name: str, started_at: float | None) -> None:
+        collector = self._instrumentation
+        if collector is not None and started_at is not None:
+            collector.finish(name, started_at)
 
     # ---- L1 memory registration (one-time) ----
 
@@ -183,23 +202,21 @@ class DynamicNixlStorageAgent:
         file_path: str,
         page_size: int,
     ) -> None:
-        """Write-to-temp-then-rename to publish the final file atomically.
-
-        The DMA write goes to ``<file_path>.tmp.<uuid>`` in the same
-        directory. Only after the transfer completes successfully is the
-        temp file atomically renamed to the final path, ensuring that
-        concurrent readers (including other processes sharing the same
-        directory) never observe a partially-written file.
-        """
+        """Write a temporary file and atomically publish it at the final path."""
         file_size = len(mem_indices) * page_size
         tmp_path = f"{file_path}.tmp.{uuid.uuid4().hex}"
+        opened_at = self._start_span()
         fd = os.open(tmp_path, self._open_flags(create=True))
+        self._finish_span("nixl.store.open", opened_at)
         try:
+            registered_at = self._start_span()
             reg_descs, xfer_handler = self._register_single_file(
                 fd, file_size, page_size
             )
+            self._finish_span("nixl.store.register", registered_at)
             try:
                 storage_indices = list(range(len(mem_indices)))
+                prepared_at = self._start_span()
                 handle = self.nixl_agent.make_prepped_xfer(
                     "WRITE",
                     self.mem_xfer_handler,
@@ -207,12 +224,14 @@ class DynamicNixlStorageAgent:
                     xfer_handler,
                     storage_indices,
                 )
+                self._finish_span("nixl.store.prepare", prepared_at)
                 await self._post_non_blocking(handle)
                 self.nixl_agent.release_xfer_handle(handle)
             finally:
+                deregistered_at = self._start_span()
                 self._deregister_file(reg_descs, xfer_handler)
+                self._finish_span("nixl.store.deregister", deregistered_at)
         except BaseException:
-            # Best-effort cleanup of the temp file on failure.
             try:
                 os.unlink(tmp_path)
             except FileNotFoundError:
@@ -220,10 +239,9 @@ class DynamicNixlStorageAgent:
             raise
         finally:
             os.close(fd)
-
-        # Atomic publish: readers only ever see a complete file at file_path.
-        # TODO(Jiayi): Only guaranteed to be atomic within the local posix filesystems.
+        published_at = self._start_span()
         os.rename(tmp_path, file_path)
+        self._finish_span("nixl.store.publish", published_at)
 
     async def dynamic_load_file(
         self,
@@ -231,15 +249,20 @@ class DynamicNixlStorageAgent:
         file_path: str,
         page_size: int,
     ) -> None:
-        """Open an existing file, DMA read into L1 memory, then clean up."""
+        """Open an existing file, DMA-read it into L1, and release its handle."""
         file_size = len(mem_indices) * page_size
+        opened_at = self._start_span()
         fd = os.open(file_path, self._open_flags(create=False))
+        self._finish_span("nixl.load.open", opened_at)
         try:
+            registered_at = self._start_span()
             reg_descs, xfer_handler = self._register_single_file(
                 fd, file_size, page_size
             )
+            self._finish_span("nixl.load.register", registered_at)
             try:
                 storage_indices = list(range(len(mem_indices)))
+                prepared_at = self._start_span()
                 handle = self.nixl_agent.make_prepped_xfer(
                     "READ",
                     self.mem_xfer_handler,
@@ -247,10 +270,13 @@ class DynamicNixlStorageAgent:
                     xfer_handler,
                     storage_indices,
                 )
+                self._finish_span("nixl.load.prepare", prepared_at)
                 await self._post_non_blocking(handle)
                 self.nixl_agent.release_xfer_handle(handle)
             finally:
+                deregistered_at = self._start_span()
                 self._deregister_file(reg_descs, xfer_handler)
+                self._finish_span("nixl.load.deregister", deregistered_at)
         finally:
             os.close(fd)
 
@@ -264,35 +290,43 @@ class DynamicNixlStorageAgent:
     # ---- Shared helpers ----
 
     def get_memory_indices(self, raw_addr: int, mem_size: int) -> list[int]:
-        """Get L1 memory page indices for the given address and size."""
+        """Return zero-based registered-L1 page indices for an object range."""
         if raw_addr % self.l1_align_bytes != 0:
             raise ValueError(
                 f"Raw address {raw_addr} is not aligned to "
                 f"page size {self.l1_align_bytes}"
             )
-        if mem_size % self.l1_align_bytes != 0:
+        if mem_size <= 0 or mem_size % self.l1_align_bytes != 0:
             raise ValueError(
-                f"Memory size {mem_size} is not a multiple of "
+                f"Memory size {mem_size} must be a positive multiple of "
                 f"page size {self.l1_align_bytes}"
             )
+        relative_start = raw_addr - self.l1_memory_base
+        if relative_start < 0 or relative_start + mem_size > self.l1_memory_size:
+            raise ValueError("Memory range is outside the registered L1 arena")
+        first_page = relative_start // self.l1_align_bytes
         num_pages = mem_size // self.l1_align_bytes
-        return [(raw_addr // self.l1_align_bytes + i) for i in range(num_pages)]
+        return list(range(first_page, first_page + num_pages))
 
     def get_file_path_for_key(self, key: ObjectKey) -> str:
         """Return the full file path for a given ObjectKey."""
         return os.path.join(self.file_path, _object_key_to_filename(key))
 
     async def _post_non_blocking(self, handle):
-        """Await a nixl transfer until done."""
-        state = self.nixl_agent.transfer(handle)
-        while state != "DONE" and state != "ERR":
-            try:
-                state = self.nixl_agent.check_xfer_state(handle)
-            except nixlBind.nixlBackendError:
-                raise
-            await asyncio.sleep(0.01)
-        if state == "ERR":
-            raise RuntimeError("NIXL transfer failed")
+        """Await a NIXL transfer, including the adapter's polling interval."""
+        waited_at = self._start_span()
+        try:
+            state = self.nixl_agent.transfer(handle)
+            while state != "DONE" and state != "ERR":
+                try:
+                    state = self.nixl_agent.check_xfer_state(handle)
+                except nixlBind.nixlBackendError:
+                    raise
+                await asyncio.sleep(0.01)
+            if state == "ERR":
+                raise RuntimeError("NIXL transfer failed")
+        finally:
+            self._finish_span("nixl.transfer_wait", waited_at)
 
     def cleanup_temp_files(self) -> None:
         """Remove leftover ``*.tmp.*`` files in the storage directory.
@@ -393,6 +427,12 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
 
     def get_load_event_fd(self) -> int:
         return self._load_efd.fileno()
+
+    def set_instrumentation(
+        self, instrumentation: L2AdapterInstrumentation | None
+    ) -> None:
+        """Enable per-instance NIXL spans without process-global monkeypatches."""
+        self.nixl_agent.set_instrumentation(instrumentation)
 
     #####################
     # Store Interface

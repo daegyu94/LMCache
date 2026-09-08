@@ -35,6 +35,7 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
 )
+from lmcache.v1.distributed.l2_adapters.instrumentation import L2AdapterInstrumentation
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
@@ -153,6 +154,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+        self._pending_instrumentation: dict[int, tuple[str, float]] = {}
+        self._instrumentation: L2AdapterInstrumentation | None = None
 
         # Task ID counter
         self._next_task_id: L2TaskId = 0
@@ -182,6 +185,21 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     def get_load_event_fd(self) -> int:
         return self._load_efd.fileno()
 
+    def set_instrumentation(
+        self, instrumentation: L2AdapterInstrumentation | None
+    ) -> None:
+        """Enable per-instance benchmark spans, or disable with None."""
+        self._instrumentation = instrumentation
+
+    def _start_span(self) -> float | None:
+        collector = self._instrumentation
+        return collector.start() if collector is not None else None
+
+    def _finish_span(self, name: str, started_at: float | None) -> None:
+        collector = self._instrumentation
+        if collector is not None and started_at is not None:
+            collector.finish(name, started_at)
+
     # ---------------------------------------------------------------
     # Store Interface
     # ---------------------------------------------------------------
@@ -191,16 +209,25 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
+        converted_at = self._start_span()
         key_strings = [_object_key_to_string(k) for k in keys]
         memviews = [_obj_to_memoryview(obj) for obj in objects]
         per_key_sizes = [obj.get_size() for obj in objects]
+        self._finish_span("native.store.convert", converted_at)
 
         # Register pending op BEFORE submit to avoid race
         # with demux thread. The native submit is
         # non-blocking so holding the lock is brief.
         with self._lock:
             task_id = self._get_next_task_id()
+            submitted_at = self._start_span()
             future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            self._finish_span("native.store.submit", submitted_at)
+            if submitted_at is not None:
+                self._pending_instrumentation[future_id] = (
+                    self._OP_STORE,
+                    submitted_at,
+                )
             self._pending_ops[future_id] = (
                 self._OP_STORE,
                 task_id,
@@ -228,11 +255,20 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         group_layout_descs: dict[int, MemoryLayoutDesc],
     ) -> L2TaskId:
+        converted_at = self._start_span()
         key_strings = [_object_key_to_string(k) for k in keys]
+        self._finish_span("native.lookup.convert", converted_at)
 
         with self._lock:
             task_id = self._get_next_task_id()
+            submitted_at = self._start_span()
             future_id = int(self._client.submit_batch_exists(key_strings))
+            self._finish_span("native.lookup.submit", submitted_at)
+            if submitted_at is not None:
+                self._pending_instrumentation[future_id] = (
+                    self._OP_LOOKUP,
+                    submitted_at,
+                )
             self._pending_ops[future_id] = (
                 self._OP_LOOKUP,
                 task_id,
@@ -265,12 +301,18 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
+        converted_at = self._start_span()
         key_strings = [_object_key_to_string(k) for k in keys]
         memviews = [_obj_to_memoryview(obj) for obj in objects]
+        self._finish_span("native.load.convert", converted_at)
 
         with self._lock:
             task_id = self._get_next_task_id()
+            submitted_at = self._start_span()
             future_id = int(self._client.submit_batch_get(key_strings, memviews))
+            self._finish_span("native.load.submit", submitted_at)
+            if submitted_at is not None:
+                self._pending_instrumentation[future_id] = (self._OP_LOAD, submitted_at)
             self._pending_ops[future_id] = (
                 self._OP_LOAD,
                 task_id,
@@ -435,6 +477,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 ) in completions:
                     fid = int(future_id)
                     entry = self._pending_ops.pop(fid, None)
+                    submitted = self._pending_instrumentation.pop(fid, None)
                     if entry is None:
                         logger.warning(
                             "Received completion for unknown future_id=%d",
@@ -448,6 +491,10 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         num_keys,
                         lookup_keys,
                     ) = entry
+                    if submitted is not None:
+                        self._finish_span(
+                            f"native.{submitted[0]}.queue_io_completion", submitted[1]
+                        )
 
                     if op_type == self._OP_STORE:
                         store_info = self._pending_store_sizes.pop(fid, None)
