@@ -47,6 +47,10 @@ from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
     RemoveAdapterOp,
 )
+from lmcache.v1.distributed.storage_controllers.prefetch_flights import (
+    FlightMode,
+    PrefetchFlights,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     PrefetchPolicy,
 )
@@ -429,6 +433,8 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan and retention decisions.
         max_in_flight: Maximum number of concurrent prefetch requests.
+        flight_mode: Optional partial-overlap rendezvous and pin handoff.
+        flight_max_waiters: Bounded number of pending rendezvous readers.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -446,6 +452,8 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        flight_mode: FlightMode = "off",
+        flight_max_waiters: int = 64,
     ) -> None:
         self._l1_managers: dict[int, L1Manager] = {
             desc.index: mgr
@@ -463,6 +471,9 @@ class PrefetchController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
+        if flight_mode != "off" and len(l1_managers) != 1:
+            raise ValueError("Prefetch flights require exactly one L1 manager")
+        self._flights = PrefetchFlights(l1_managers[0], flight_mode, flight_max_waiters)
 
         # TODO: remove max_in_flight and make it dynamic
         self._max_in_flight = max_in_flight
@@ -668,6 +679,7 @@ class PrefetchController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
             "num_draining_adapters": len(self._draining),
+            "branch_flights": self._flights.report_status(),
         }
 
     def get_adapter_state_observations(
@@ -995,11 +1007,22 @@ class PrefetchController(StorageControllerInterface):
 
     def _start_pending_requests(self) -> None:
         """Start pending requests up to the max in-flight limit."""
-        # TODO: implement the dynamic in flight request admission
-        while (
-            self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
-        ):
+        if not self._flights.enabled:
+            while (
+                self._pending_queue
+                and len(self._in_flight_requests) < self._max_in_flight
+            ):
+                request_id, spec = self._pending_queue.popleft()
+                self._start_lookup_phase(request_id, spec)
+            return
+        # Register waiters even when all slots are occupied, before a leader
+        # can publish temporary data. Independent requests may pass waiters.
+        for _ in range(len(self._pending_queue)):
             request_id, spec = self._pending_queue.popleft()
+            deferred = self._flights.defer(request_id, spec)
+            if deferred or len(self._in_flight_requests) >= self._max_in_flight:
+                self._pending_queue.append((request_id, spec))
+                continue
             self._start_lookup_phase(request_id, spec)
 
     # =========================================================================
@@ -1015,6 +1038,17 @@ class PrefetchController(StorageControllerInterface):
         request = _build_request(request_id, spec)
         flattened_keys = request.get_flattened_keys()
         self._lock_l1_keys(request)
+        if self._flights.enabled:
+            resident = request.key_states.l1_locked_keys.merge()
+            resident_keys = (
+                set(_gather_keys(request.key_groups, resident))
+                if len(resident)
+                else set()
+            )
+            self._flights.started(request_id, spec, resident_keys)
+        # Register before adapter submission so the existing abort path also
+        # returns acquired locks and flight ownership if submission fails.
+        self._in_flight_requests[request_id] = request
 
         # Submit lookup requests to L2 adapters that are not draining.
         active_adapters = {
@@ -1030,20 +1064,24 @@ class PrefetchController(StorageControllerInterface):
         # support unequal length of key groups. We left this as future refactor
         # TODOs.
         for adapter_idx, adapter in active_adapters.items():
-            task_id = adapter.submit_lookup_and_lock_task(
-                flattened_keys, spec.group_layout_descs
-            )
+            try:
+                task_id = adapter.submit_lookup_and_lock_task(
+                    flattened_keys, spec.group_layout_descs
+                )
+            except (RuntimeError, ValueError):
+                logger.exception("Adapter rejected prefetch lookup submission")
+                self._abort_request(request)
+                return
             request.inflight_lookup_tasks[adapter_idx] = task_id
 
         # No live L2 adapter: serve from L1 alone, on this thread.
         if not active_adapters:
             self._plan_load(request, {})
             self._finish_request(request)
+            self._retire_request(request)
             return
 
-        # Add the inflight request to the tracking dict and publish the events
-        self._in_flight_requests[request_id] = request
-
+        # Publish the submitted lookup events.
         self._event_bus.publish(
             Event(
                 event_type=EventType.L2_PREFETCH_LOOKUP_SUBMITTED,
@@ -1488,9 +1526,13 @@ class PrefetchController(StorageControllerInterface):
                 map hold nothing at this point.
 
         Note:
-            Reads and writes only ``request.key_states`` and the result
-            store.
+            Settles ``request.key_states`` and the result store. When branch
+            handoff is enabled, first acquires extra L1 read pins for bounded
+            waiters before any temporary data may lose its last reader.
         """
+        # Waiter ownership must exist before any caller can consume the
+        # leader's final read lock on temporary L1 data.
+        self._flights.handoff(request.request_id)
         states = request.key_states
         found = states.l1_locked_keys.merge()
         if len(found) == 0:
@@ -1581,6 +1623,7 @@ class PrefetchController(StorageControllerInterface):
     def _retire_request(self, request: InFlightPrefetchRequest) -> None:
         """Remove a finished request from the in-flight table."""
         self._in_flight_requests.pop(request.request_id, None)
+        self._flights.retire(request.request_id)
 
     def _release_all_locks(self, request: InFlightPrefetchRequest) -> None:
         """Return every lock and buffer the request's key states record.
@@ -1616,3 +1659,4 @@ class PrefetchController(StorageControllerInterface):
             )
             self._release_all_locks(request)
             self._retire_request(request)
+        self._flights.close()

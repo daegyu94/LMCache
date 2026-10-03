@@ -998,3 +998,25 @@ environment/configuration snapshot at startup and interval counters
 data, model names, or ``--instance-id`` are ever sent, and reporting can
 never affect serving. Opt out with ``LMCACHE_TRACK_USAGE=false`` or
 ``DO_NOT_TRACK=1``; see :ref:`usage-stats-collection` for details.
+
+Experimental branch prefetch handoff
+------------------------------------
+
+``--l2-prefetch-flight-mode`` accepts ``off`` (default), ``overlap``, and
+``handoff``. Overlap mode delays requests sharing cells with an admitted L2
+prefetch. Handoff additionally pins temporary L1 objects until each waiting
+request has acquired its own read locks. This allows concurrent branching
+histories to share a load without switching the prefetch retention policy.
+
+.. code-block:: bash
+
+   python -m lmcache.v1.multiprocess.server \
+       --l2-prefetch-flight-mode handoff \
+       --l2-prefetch-flight-max-waiters 64
+
+``--l2-prefetch-flight-max-waiters`` bounds pending rendezvous requests;
+overflow follows ordinary independent loading. The controller status includes
+``branch_flights`` wait, bypass and pin counters. Entire follower requests wait,
+so low-overlap workloads may regress in latency. L2 metadata lookups remain
+unchanged. The existing L1 read-lock TTL and active-I/O shutdown limitations
+still apply; this option does not introduce an adapter quiescence protocol.

@@ -385,6 +385,12 @@ class StorageManagerConfig:
     prefetch_policy: str = "default"
     """ The L2 prefetch policy name. """
 
+    prefetch_flight_mode: Literal["off", "overlap", "handoff"] = "off"
+    """ Partial-overlap rendezvous: off, overlap, or handoff. """
+
+    prefetch_flight_max_waiters: int = 64
+    """ Maximum pending rendezvous requests, including handoff pin holders. """
+
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
 
@@ -666,6 +672,18 @@ def add_storage_manager_args(
         "Default is 'default' (pick the first adapter by index).",
     )
     policy_group.add_argument(
+        "--l2-prefetch-flight-mode",
+        choices=["off", "overlap", "handoff"],
+        default="off",
+        help="Partial-overlap load coordination; handoff pins temporary L1 data.",
+    )
+    policy_group.add_argument(
+        "--l2-prefetch-flight-max-waiters",
+        type=int,
+        default=64,
+        help="Maximum pending flight waiters; overflow loads independently.",
+    )
+    policy_group.add_argument(
         "--l2-prefetch-max-in-flight",
         type=int,
         default=8,
@@ -784,6 +802,8 @@ def parse_args_to_config(
         l2_adapter_config=l2_adapter_config,
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
+        prefetch_flight_mode=args.l2_prefetch_flight_mode,
+        prefetch_flight_max_waiters=args.l2_prefetch_flight_max_waiters,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
