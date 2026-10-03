@@ -998,3 +998,23 @@ environment/configuration snapshot at startup and interval counters
 data, model names, or ``--instance-id`` are ever sent, and reporting can
 never affect serving. Opt out with ``LMCACHE_TRACK_USAGE=false`` or
 ``DO_NOT_TRACK=1``; see :ref:`usage-stats-collection` for details.
+
+Experimental trajectory prefix utility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--eviction-policy PrefixUtility`` enables bounded trajectory-prefix advice
+for single-group full-attention STORE requests. ``PrefixLRU`` and
+``SessionRefcount`` use the same metadata as comparison policies.
+
+Pass ``lmcache.agentrl.trajectory_id`` (a stable string up to 128 characters)
+and ``lmcache.agentrl.reuse_class`` (``soon`` or ``terminal``) in request
+configs. Advice is qualified by model, KV rank, object group and cache salt.
+Terminal withdraws one trajectory's interest, not shared object validity.
+Missing advice uses ordinary LRU ordering. Hybrid and multi-group STORE skip
+this experimental hook. The existing cache salt remains the authority boundary.
+
+The policy keeps at most 256 manifests and 32,768 key references. Counters
+appear in ``l1_eviction_controller.prefix_stats``. Container bytes exclude
+referenced key payloads. The exact greedy prototype rescans manifests per
+victim and can cost more CPU than LRU; evaluate usable prefix hits rather
+than independent object hit rate before enabling it.

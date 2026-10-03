@@ -1222,6 +1222,23 @@ class StorageManager:
         for manager in self._l1_managers_by_id.values():
             manager.close()
 
+    @property
+    def prefix_advice_enabled(self) -> bool:
+        """Whether STORE should resolve a complete advisory prefix."""
+        return self._eviction_controller.prefix_advice_enabled
+
+    def advise_prefix(
+        self, trajectory_id: str, keys: list[ObjectKey], state: str
+    ) -> None:
+        """Forward trajectory interest without changing cache ownership.
+
+        Args:
+            trajectory_id: Stable advisory identity.
+            keys: Complete full-attention prefix in one namespace.
+            state: soon or terminal.
+        """
+        self._eviction_controller.advise_prefix(trajectory_id, keys, state)
+
     def report_status(self) -> dict:
         """Return the single-L1 service's sub-component status snapshot.
 

@@ -113,9 +113,27 @@ class L1EvictionController(EvictionController):
             "is_healthy": self._thread.is_alive(),
             "thread_alive": self._thread.is_alive(),
             "eviction_policy": self._eviction_config.eviction_policy,
+            "prefix_stats": self._eviction_policy.get_prefix_stats(),
             "trigger_watermark": self._eviction_config.trigger_watermark,
             "eviction_ratio": self._eviction_config.eviction_ratio,
         }
+
+    @property
+    def prefix_advice_enabled(self) -> bool:
+        """Whether the configured policy uses complete prefix advice."""
+        return self._eviction_policy.prefix_advice_enabled
+
+    def advise_prefix(
+        self, trajectory_id: str, keys: list[ObjectKey], state: str
+    ) -> None:
+        """Forward bounded advisory interest to the existing policy.
+
+        Args:
+            trajectory_id: Stable trajectory identity.
+            keys: Complete prefix in one namespace, starting at chunk zero.
+            state: soon or terminal; never changes key validity.
+        """
+        self._eviction_policy.advise_prefix(trajectory_id, keys, state)
 
     def _publish_skipped(self, usage: float, watermark: float) -> None:
         """Publish a below-watermark loop tick (no eviction this cycle)."""

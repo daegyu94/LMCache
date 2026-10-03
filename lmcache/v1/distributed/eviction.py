@@ -29,6 +29,26 @@ class EvictionPolicy:
     """
 
     @property
+    def prefix_advice_enabled(self) -> bool:
+        """Whether full-prefix resolution is useful for this policy."""
+        return False
+
+    def advise_prefix(
+        self, trajectory_id: str, keys: list[ObjectKey], state: str
+    ) -> None:
+        """Accept optional trajectory interest; default policies ignore advice.
+
+        Args:
+            trajectory_id: Stable advisory identity, not an authorization token.
+            keys: Complete prefix from chunk zero in one object namespace.
+            state: soon or terminal. Never changes cache validity.
+        """
+
+    def get_prefix_stats(self) -> dict[str, int]:
+        """Return prefix-advice counters; policies without advice return empty."""
+        return {}
+
+    @property
     def support_isolation(self) -> bool:
         """Whether this policy supports isolation eviction (e.g., per user isolation).
 

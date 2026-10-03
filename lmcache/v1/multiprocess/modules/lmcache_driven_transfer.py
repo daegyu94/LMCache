@@ -2,7 +2,7 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 import threading
 import time
@@ -18,6 +18,7 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.distributed.eviction_policy.prefix_utility import read_prefix_advice
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
@@ -684,6 +685,27 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 num_chunks,
                 null_block_id,
             )
+
+            # A suffix-only STORE must not become a fictitious prefix root.
+            # Hybrid/grouped reconstruction has a different utility function.
+            advice = (
+                read_prefix_advice(key.request_configs)
+                if self._ctx.storage_manager.prefix_advice_enabled is True
+                else None
+            )
+            groups = cache_context.kv_layer_groups_manager.object_groups
+            if (
+                self._ctx.storage_manager.prefix_advice_enabled is True
+                and advice is not None
+                and len(groups) == 1
+                and groups[0].sw_size_chunks == -1
+                and not groups[0].recurrent
+                and not groups[0].aux
+            ):
+                full_prefix = self._ctx.resolve_obj_keys(replace(key, start=0), [0])[0]
+                self._ctx.storage_manager.advise_prefix(
+                    advice[0], full_prefix, advice[1]
+                )
 
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
                 cache_context, gpu_block_ids

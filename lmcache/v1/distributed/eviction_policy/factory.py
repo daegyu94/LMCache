@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from typing import cast
+
 # First Party
 from lmcache.v1.distributed.config import EvictionConfig
 from lmcache.v1.distributed.eviction import EvictionPolicy
@@ -9,6 +12,10 @@ from lmcache.v1.distributed.eviction_policy.isolated_lru import (
 )
 from lmcache.v1.distributed.eviction_policy.lru import LRUEvictionPolicy
 from lmcache.v1.distributed.eviction_policy.noop import NoOpEvictionPolicy
+from lmcache.v1.distributed.eviction_policy.prefix_utility import (
+    PrefixMode,
+    PrefixUtilityPolicy,
+)
 
 
 def CreateEvictionPolicy(eviction_config: EvictionConfig) -> EvictionPolicy:
@@ -21,6 +28,12 @@ def CreateEvictionPolicy(eviction_config: EvictionConfig) -> EvictionPolicy:
     Returns:
         An instance of the specified eviction policy.
     """
+    if eviction_config.eviction_policy in (
+        "PrefixLRU",
+        "SessionRefcount",
+        "PrefixUtility",
+    ):
+        return PrefixUtilityPolicy(cast(PrefixMode, eviction_config.eviction_policy))
     if eviction_config.eviction_policy == "LRU":
         return LRUEvictionPolicy()
     elif eviction_config.eviction_policy == "ARC":
