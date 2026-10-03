@@ -137,3 +137,23 @@ def test_concurrent_advice_respects_hard_limits() -> None:
         list(pool.map(advise, range(100)))
     assert p.get_prefix_stats()["manifests"] <= 8
     assert p.get_prefix_stats()["key_references"] <= 16
+
+
+def test_no_advice_repeated_reservations_match_lru() -> None:
+    p = PrefixUtilityPolicy()
+    lru = LRUEvictionPolicy()
+    keys = [key(i) for i in range(8)]
+    for policy in (p, lru):
+        policy.on_keys_created(keys)
+        policy.on_keys_reserved(keys[2:5])
+        policy.on_keys_reserved(keys[3:6])
+    assert p.get_eviction_actions(1)[0].keys == lru.get_eviction_actions(1)[0].keys
+
+
+def test_late_and_oversized_advice_remain_performance_hints() -> None:
+    p = PrefixUtilityPolicy(max_references=2)
+    p.advise_prefix("a", [key(1)], "terminal")
+    p.advise_prefix("a", [key(1)], "soon")
+    p.advise_prefix("a", [key(1), key(2), key(3)], "terminal")
+    assert p.get_prefix_stats()["active_manifests"] == 1
+    assert p.get_prefix_stats()["advice_calls"] == 2

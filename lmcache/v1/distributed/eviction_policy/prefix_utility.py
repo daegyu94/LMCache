@@ -97,7 +97,8 @@ class PrefixUtilityPolicy(EvictionPolicy):
         """Track staging keys without treating them as readable prefix data."""
         with self._lock:
             for key in reversed(keys):
-                self._order.setdefault(key, None)
+                self._order[key] = None
+                self._order.move_to_end(key)
 
     def on_keys_created(self, keys: list[ObjectKey]) -> None:
         """Track admitted keys with the same reverse-batch ordering as LRU."""

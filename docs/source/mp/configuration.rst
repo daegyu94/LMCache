@@ -1010,7 +1010,8 @@ Pass ``lmcache.agentrl.trajectory_id`` (a stable string up to 128 characters)
 and ``lmcache.agentrl.reuse_class`` (``soon`` or ``terminal``) in request
 configs. Advice is qualified by model, KV rank, object group and cache salt.
 Terminal withdraws one trajectory's interest, not shared object validity.
-Missing advice uses ordinary LRU ordering. Hybrid and multi-group STORE skip
+An empty manifest table uses ordinary LRU ordering. Missing advice does not
+withdraw existing interests. Hybrid and multi-group STORE skip
 this experimental hook. The existing cache salt remains the authority boundary.
 
 The policy keeps at most 256 manifests and 32,768 key references. Counters
@@ -1018,3 +1019,10 @@ appear in ``l1_eviction_controller.prefix_stats``. Container bytes exclude
 referenced key payloads. The exact greedy prototype rescans manifests per
 victim and can cost more CPU than LRU; evaluate usable prefix hits rather
 than independent object hit rate before enabling it.
+
+Advice is last-arrival-wins and has no sequence or expiry. A late ``soon``
+can reactivate an interest; oversized advice (including terminal) is ignored.
+The STORE-only hook cannot withdraw interest when a terminal call issues no
+STORE. These are performance limitations, not cache-validity guarantees.
+Replays that advise every call evaluate a stronger delivery contract than
+this minimal engine hook.
