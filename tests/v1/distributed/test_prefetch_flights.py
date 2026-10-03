@@ -62,6 +62,22 @@ class CountedAdapter(MockL2Adapter):
         return super().submit_load_task(keys, objects)
 
 
+class RejectingLookupAdapter(MockL2Adapter):
+    """Reject lookup before accepting ownership of any asynchronous task."""
+
+    def __init__(self) -> None:
+        """Create an empty optional cache tier with a failed submit path."""
+        super().__init__(MockL2AdapterConfig(max_size_gb=0.1, mock_bandwidth_gb=1.0))
+        self.lookup_attempts = 0
+
+    def submit_lookup_and_lock_task(
+        self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
+    ) -> L2TaskId:
+        """Raise a synchronous error without creating a task or taking locks."""
+        self.lookup_attempts += 1
+        raise RuntimeError("injected lookup submission rejection")
+
+
 def make_flight_controller(
     l1: L1Manager, adapter: MockL2Adapter, mode: FlightMode, max_in_flight: int = 8
 ) -> PrefetchController:
@@ -324,3 +340,90 @@ def test_disjoint_waiter_passes_without_dependency(l1: L1Manager) -> None:
     flights.retire(2)
     assert flights.defer(1, single_row_spec([a, b]))
     flights.close()
+
+
+@pytest.mark.parametrize("mode", ["off", "handoff"])
+def test_accepted_lookup_drains_when_later_adapter_rejects(
+    l1: L1Manager, mode: FlightMode
+) -> None:
+    """A rejected optional tier cannot orphan an earlier accepted lookup."""
+    accepted = CountedAdapter()
+    rejected = RejectingLookupAdapter()
+    keys = [make_object_key(i) for i in (1, 2, 3)]
+    make_temporary(l1, keys)
+    objects = []
+    for error, obj in l1.unsafe_read(keys).values():
+        assert error == L1Error.SUCCESS and obj is not None
+        objects.append(obj)
+    store_task = accepted.submit_store_task(keys, objects)
+    assert wait_for_condition(
+        lambda: store_task in accepted.pop_completed_store_tasks()
+    )
+    l1.finish_read(keys)
+    assert all(l1.get_object_state(k) is None for k in keys)
+    ctrl = PrefetchController(
+        [l1],
+        [L1ManagerDescriptor(0, make_l1_config())],
+        [accepted, rejected],
+        [make_descriptor(0), make_descriptor(1)],
+        DefaultPrefetchPolicy(),
+        flight_mode=mode,
+    )
+    try:
+        task = ctrl.submit_prefetch_request(single_row_spec(keys))
+        ctrl.start()
+        assert ctrl.wait_prefetch_result(task, 10)
+        result = ctrl.query_prefetch_result(task)
+        assert result is not None and result.hit_cells[0].popcount() == len(keys)
+        assert rejected.lookup_attempts == 1
+        assert len(accepted.loads) == 1
+        for key, (error, obj) in l1.unsafe_read(keys).items():
+            assert error == L1Error.SUCCESS and obj is not None
+            assert obj.tensor is not None
+            assert torch.all(obj.tensor == ObjectKey.Bytes2IntHash(key.chunk_hash))
+        l1.finish_read(keys)
+        assert wait_for_condition(lambda: accepted.debug_get_locked_key_count() == 0)
+        assert rejected.debug_get_locked_key_count() == 0
+        assert wait_for_condition(
+            lambda: ctrl.report_status()["in_flight_request_count"] == 0
+        )
+        assert l1.report_status()["staging_object_count"] == 0
+        assert l1.report_status()["read_locked_count"] == 0
+        assert ctrl.report_status()["branch_flights"]["current_pins"] == 0
+    finally:
+        ctrl.stop()
+        accepted.close()
+        rejected.close()
+
+
+@pytest.mark.parametrize("mode", ["off", "handoff"])
+def test_all_rejected_lookups_fall_back_to_resident_l1(
+    l1: L1Manager, mode: FlightMode
+) -> None:
+    """All rejected submissions complete with fresh L1 hits and missing suffix."""
+    adapter = RejectingLookupAdapter()
+    keys = [make_object_key(i) for i in (1, 2)]
+    make_temporary(l1, keys)
+    missing = make_object_key(3)
+    ctrl = make_flight_controller(l1, adapter, mode)
+    try:
+        task = ctrl.submit_prefetch_request(single_row_spec(keys + [missing]))
+        ctrl.start()
+        assert ctrl.wait_prefetch_result(task, 10)
+        result = ctrl.query_prefetch_result(task)
+        assert result is not None
+        assert result.hit_cells[0].get_indices_list() == [0, 1]
+        assert result.l1_hit_cells[0].get_indices_list() == [0, 1]
+        assert result.l2_hit_cells[0].popcount() == 0
+        l1.finish_read(keys, 2)
+        assert all(l1.get_object_state(k) is None for k in keys)
+        assert wait_for_condition(
+            lambda: ctrl.report_status()["in_flight_request_count"] == 0
+        )
+        assert ctrl.report_status()["branch_flights"]["indexed_cells"] == 0
+        assert l1.report_status()["staging_object_count"] == 0
+        assert l1.report_status()["read_locked_count"] == 0
+        assert adapter.debug_get_locked_key_count() == 0
+    finally:
+        ctrl.stop()
+        adapter.close()

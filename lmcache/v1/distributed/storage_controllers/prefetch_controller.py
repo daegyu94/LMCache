@@ -1034,7 +1034,12 @@ class PrefetchController(StorageControllerInterface):
         request_id: PrefetchRequestId,
         spec: PrefetchTaskSpec,
     ) -> None:
-        """Create the in-flight prefetch request and start the lookup phase"""
+        """Start lookups, preserving accepted tasks when an optional tier rejects.
+
+        Synchronous rejection skips only that adapter. Accepted tasks remain
+        tracked until their normal completion and lock release. If every
+        adapter rejects, complete from the fresh L1 lock pass instead.
+        """
         request = _build_request(request_id, spec)
         flattened_keys = request.get_flattened_keys()
         self._lock_l1_keys(request)
@@ -1046,8 +1051,8 @@ class PrefetchController(StorageControllerInterface):
                 else set()
             )
             self._flights.started(request_id, spec, resident_keys)
-        # Register before adapter submission so the existing abort path also
-        # returns acquired locks and flight ownership if submission fails.
+        # Accepted lookup tasks must stay tracked until their completion even
+        # when a later optional adapter rejects its own submission.
         self._in_flight_requests[request_id] = request
 
         # Submit lookup requests to L2 adapters that are not draining.
@@ -1069,13 +1074,15 @@ class PrefetchController(StorageControllerInterface):
                     flattened_keys, spec.group_layout_descs
                 )
             except (RuntimeError, ValueError):
-                logger.exception("Adapter rejected prefetch lookup submission")
-                self._abort_request(request)
-                return
+                logger.exception(
+                    "Adapter %d rejected prefetch lookup submission; skipping it",
+                    adapter_idx,
+                )
+                continue
             request.inflight_lookup_tasks[adapter_idx] = task_id
 
-        # No live L2 adapter: serve from L1 alone, on this thread.
-        if not active_adapters:
+        # No accepted L2 lookup: serve from L1 alone, on this thread.
+        if not request.inflight_lookup_tasks:
             self._plan_load(request, {})
             self._finish_request(request)
             self._retire_request(request)

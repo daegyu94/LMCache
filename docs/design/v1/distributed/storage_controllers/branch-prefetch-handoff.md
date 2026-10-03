@@ -47,3 +47,11 @@ Shutdown tests use completed payloads and no outstanding adapter writes.
 
 A helper test deterministically consumes the leader before follower admission, checks the exact payload and independent reader counts, and shows the difference between overlap-only and handoff.
 Controller tests cover partially overlapping branches, single-slot admission, failure fallback, bounded waiters and namespace/layout/window separation.
+
+## Optional adapter submission failure
+
+A synchronous lookup submission rejection (`RuntimeError` or `ValueError`) skips only that adapter.
+Previously accepted lookups remain tracked and finish through the ordinary load/unlock path; aborting the entire request here could orphan a late lookup result and its L2 locks.
+If no adapter accepts a lookup, the controller finishes from its fresh L1 read-lock set, including any missing suffix.
+This rule assumes a rejected submission has not accepted asynchronous work, as the caller received no task identifier.
+Two-adapter and all-rejected regression tests check independent L1/L2 ownership and completed flight cleanup in both disabled and handoff modes.
