@@ -749,6 +749,109 @@ class TestQueryResult:
         adapter.close()
 
 
+class TestGroupedResultPositions:
+    @pytest.mark.parametrize("num_cols", [1, 65])
+    @pytest.mark.parametrize("source", ["l1", "l2", "mixed", "missing"])
+    def test_grouped_positions_and_lock_ownership(
+        self, l1_manager: L1Manager, num_cols: int, source: str
+    ) -> None:
+        """Preserve requested positions across group/rank and byte boundaries."""
+        layout = MemoryLayoutDesc(shapes=[torch.Size([16])], dtypes=[torch.float32])
+        rows = [
+            GroupedObjectKeys(
+                keys=[
+                    make_object_key(1000 - col * 7, gid=gid, kv_rank=rank)
+                    for col in range(num_cols)
+                ],
+                object_group_id=gid,
+                layout_desc=layout,
+                sliding_window_size=FULL,
+            )
+            for gid, rank in [(1, 3), (0, 1), (1, 0), (0, 2)]
+        ]
+        original_keys = [list(row.keys) for row in rows]
+        present_cols = [col for col in range(num_cols) if col % 3 != 1]
+        if source == "l1":
+            l1_cols = present_cols
+        elif source == "mixed":
+            l1_cols = [col for col in present_cols if col % 2 == 0]
+        else:
+            l1_cols = []
+        l2_cols = [
+            col
+            for col in present_cols
+            if source in ("l2", "mixed") and col not in l1_cols
+        ]
+        resident = [row.keys[col] for row in rows for col in l1_cols]
+        stored = [row.keys[col] for row in rows for col in l2_cols]
+        write_keys_to_l1(l1_manager, resident, layout)
+        adapter = make_adapter()
+        store_keys_in_l2(adapter, stored, layout)
+        ctrl = make_controller(l1_manager, [] if source == "l1" else [adapter])
+        ctrl.start()
+        try:
+            request_id = ctrl.submit_prefetch_request(
+                make_spec(rows, fetching_policy="full")
+            )
+            result = wait_for_result(ctrl, request_id)
+            expected = [] if source == "missing" else present_cols
+            assert result is not None
+            assert len(result.hit_cells) == len(rows)
+            assert all(len(row) == num_cols for row in result.hit_cells)
+            assert [row_bits(result, i) for i in range(len(rows))] == [
+                expected for _ in rows
+            ]
+            assert hit_counts(result) == (len(resident), len(stored))
+            assert [row.keys for row in rows] == original_keys
+            held = [row.keys[col] for row in rows for col in expected]
+            assert_read_locked(l1_manager, held)
+            assert set(result.l1_owners) == set(held)
+            assert l1_manager.get_staging_memory_usage() == 0
+            assert_l2_unlocked(adapter)
+            l1_manager.finish_read(held)
+        finally:
+            ctrl.stop()
+            adapter.close()
+
+    def test_partial_load_across_group_boundary(self, l1_manager: L1Manager) -> None:
+        """A failed boundary cell drops its column and releases other rows."""
+        layout = MemoryLayoutDesc(shapes=[torch.Size([16])], dtypes=[torch.float32])
+        rows = [
+            GroupedObjectKeys(
+                keys=[make_object_key(col, gid=gid, kv_rank=rank) for col in range(65)],
+                object_group_id=gid,
+                layout_desc=layout,
+                sliding_window_size=FULL,
+            )
+            for gid, rank in [(1, 2), (0, 3)]
+        ]
+        keys = [key for row in rows for key in row.keys]
+        inner = make_adapter()
+        store_keys_in_l2(inner, keys, layout)
+        fault = FaultInjectL2Adapter(inner, rate=0.0, seed=0, gap_indices=(64, 65))
+        ctrl = make_controller(l1_manager, [fault])
+        ctrl.start()
+        try:
+            request_id = ctrl.submit_prefetch_request(
+                make_spec(rows, fetching_policy="full")
+            )
+            result = wait_for_result(ctrl, request_id)
+            assert row_bits(result, 0) == list(range(1, 64))
+            assert row_bits(result, 1) == list(range(1, 64))
+            assert hit_counts(result) == (0, 126)
+            held = [row.keys[col] for row in rows for col in range(1, 64)]
+            assert_read_locked(l1_manager, held)
+            assert_absent(
+                l1_manager, [row.keys[col] for row in rows for col in (0, 64)]
+            )
+            assert l1_manager.get_staging_memory_usage() == 0
+            assert_l2_unlocked(inner)
+            l1_manager.finish_read(held)
+        finally:
+            ctrl.stop()
+            fault.close()
+
+
 class TestWaitPrefetchResult:
     def test_wait_blocks_until_ready_without_consuming(self, l1_manager):
         """wait returns True once published and leaves the result in place."""

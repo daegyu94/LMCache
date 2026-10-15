@@ -145,7 +145,8 @@ def _scatter_bitmaps(
         local_bitmap: The local bitmap result to scatter.
 
     Returns:
-        The global bitmap after scattering the 1s from the local bitmap.
+        The independent global bitmap after scattering the local 1s, with
+        selected columns set in one native batch per nonempty row.
 
     Raises:
         ValueError: If the length of local_bitmap does not match the total
@@ -174,10 +175,15 @@ def _scatter_bitmaps(
     indices_to_scatter = local_bitmap.gather(selected_indices)
 
     ret = Bitmap2D.zeros(rows, cols)
+    row_indices: list[list[int]] = [[] for _ in range(rows)]
     for idx in indices_to_scatter:
         row = idx // cols
         col = idx % cols
-        ret[row].set(col)
+        row_indices[row].append(col)
+
+    for bitmap, indices in zip(ret, row_indices, strict=True):
+        if indices:
+            bitmap.batched_set(indices)
 
     return ret
 
@@ -196,7 +202,8 @@ def _scatter_bitmaps_full_global(
         num_cols: The number of columns in the global bitmap.
 
     Returns:
-        The global bitmaps after scattering the 1s from the local bitmap.
+        Independent global bitmaps after scattering the local 1s, with
+        selected columns set in one native batch per nonempty row.
 
     Raises:
         ValueError: If the length of local_bitmap does not match the total
@@ -209,10 +216,15 @@ def _scatter_bitmaps_full_global(
         )
 
     ret = Bitmap2D.zeros(num_rows, num_cols)
+    row_indices: list[list[int]] = [[] for _ in range(num_rows)]
     for idx in local_bitmap.get_indices_list():
         row = idx // num_cols
         col = idx % num_cols
-        ret[row].set(col)
+        row_indices[row].append(col)
+
+    for bitmap, indices in zip(ret, row_indices, strict=True):
+        if indices:
+            bitmap.batched_set(indices)
 
     return ret
 
