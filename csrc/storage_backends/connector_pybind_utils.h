@@ -23,27 +23,31 @@ example usage (see `redis/pybind.cpp`):
       LMCACHE_BIND_CONNECTOR_METHODS(MyConnector);
 */
 
-#define LMCACHE_BIND_CONNECTOR_METHODS(ConnectorType)                  \
-  .def("event_fd", &ConnectorType::event_fd)                           \
-      .def("submit_batch_get",                                         \
-           lmcache::connector::pybind_utils::bind_submit_batch_get<    \
-               ConnectorType>(),                                       \
-           py::arg("keys"), py::arg("memoryviews"))                    \
-      .def("submit_batch_set",                                         \
-           lmcache::connector::pybind_utils::bind_submit_batch_set<    \
-               ConnectorType>(),                                       \
-           py::arg("keys"), py::arg("memoryviews"))                    \
-      .def("submit_batch_exists",                                      \
-           lmcache::connector::pybind_utils::bind_submit_batch_exists< \
-               ConnectorType>(),                                       \
-           py::arg("keys"))                                            \
-      .def("submit_batch_delete",                                      \
-           lmcache::connector::pybind_utils::bind_submit_batch_delete< \
-               ConnectorType>(),                                       \
-           py::arg("keys"))                                            \
-      .def("drain_completions",                                        \
-           lmcache::connector::pybind_utils::bind_drain_completions<   \
-               ConnectorType>())                                       \
+#define LMCACHE_BIND_CONNECTOR_METHODS(ConnectorType)                      \
+  .def("event_fd", &ConnectorType::event_fd)                               \
+      .def("submit_batch_get",                                             \
+           lmcache::connector::pybind_utils::bind_submit_batch_get<        \
+               ConnectorType>(),                                           \
+           "Load into writable C-contiguous memoryviews. Keep buffers "    \
+           "alive until completion.",                                      \
+           py::arg("keys"), py::arg("memoryviews"))                        \
+      .def("submit_batch_set",                                             \
+           lmcache::connector::pybind_utils::bind_submit_batch_set<        \
+               ConnectorType>(),                                           \
+           "Store C-contiguous memoryviews, including read-only sources. " \
+           "Keep buffers alive until completion.",                         \
+           py::arg("keys"), py::arg("memoryviews"))                        \
+      .def("submit_batch_exists",                                          \
+           lmcache::connector::pybind_utils::bind_submit_batch_exists<     \
+               ConnectorType>(),                                           \
+           py::arg("keys"))                                                \
+      .def("submit_batch_delete",                                          \
+           lmcache::connector::pybind_utils::bind_submit_batch_delete<     \
+               ConnectorType>(),                                           \
+           py::arg("keys"))                                                \
+      .def("drain_completions",                                            \
+           lmcache::connector::pybind_utils::bind_drain_completions<       \
+               ConnectorType>())                                           \
       .def("close", &ConnectorType::close)
 
 template <typename ConnectorType>
@@ -65,9 +69,12 @@ auto bind_submit_batch_get() {
 
     for (size_t i = 0; i < keys.size(); ++i) {
       py::memoryview mv = memviews[i].cast<py::memoryview>();
-      py::buffer_info info = py::buffer(mv).request();
+      if (!PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(mv.ptr()), 'C')) {
+        throw py::value_error("memoryviews must be C-contiguous");
+      }
+      py::buffer_info info = py::buffer(mv).request(true);
       bufs.push_back(info.ptr);
-      lens.push_back(static_cast<size_t>(info.size));
+      lens.push_back(static_cast<size_t>(info.size * info.itemsize));
     }
 
     // use the first buffer's size as batch_chunk_num_bytes (all must match)
@@ -97,9 +104,12 @@ auto bind_submit_batch_set() {
 
     for (size_t i = 0; i < keys.size(); ++i) {
       py::memoryview mv = memviews[i].cast<py::memoryview>();
+      if (!PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(mv.ptr()), 'C')) {
+        throw py::value_error("memoryviews must be C-contiguous");
+      }
       py::buffer_info info = py::buffer(mv).request();
       bufs.push_back(info.ptr);
-      lens.push_back(static_cast<size_t>(info.size));
+      lens.push_back(static_cast<size_t>(info.size * info.itemsize));
     }
 
     // use the first buffer's size as batch_chunk_num_bytes (all must match)
