@@ -425,7 +425,14 @@ class CacheEngineKey:
     tags: Optional[tuple] = field(init=False, default=None)
     _dtype_str: str = field(init=False, default="")
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Initialize dtype and tags independently of request dictionary order.
+
+        Tags are sorted by name without modifying ``request_configs``.
+
+        Raises:
+            ValueError: If the cache dtype is unsupported.
+        """
         tag_list = None
         if self.request_configs is not None:
             for k, v in self.request_configs.items():
@@ -437,7 +444,11 @@ class CacheEngineKey:
             raise ValueError(f"Unsupported dtype in CacheEngineKey: {self.dtype}")
         self._dtype_str = TORCH_DTYPE_TO_STR_DTYPE[self.dtype]
         # use tuple to save tags
-        self.tags = None if tag_list is None else tuple(tag_list)
+        self.tags = (
+            None
+            if tag_list is None
+            else tuple(sorted(tag_list, key=lambda tag: tag[0]))
+        )
 
     def __hash__(self):
         return hash(

@@ -406,6 +406,83 @@ class TestCacheEngineKey:
         assert key.tags is None
 
 
+@pytest.mark.parametrize("key_type", [CacheEngineKey, LayerCacheEngineKey])
+def test_cache_key_tag_order_does_not_change_identity(
+    key_type: type[CacheEngineKey],
+) -> None:
+    """Equivalent tag mappings address the same entry in every storage tier."""
+    configs = {"lmcache.tag.tenant": "alice", "lmcache.tag.session": "rollout"}
+    reversed_configs = dict(reversed(list(configs.items())))
+    original_items = list(configs.items())
+    first = key_type("model", 1, 0, 123, torch.float16, configs)
+    second = key_type("model", 1, 0, 123, torch.float16, reversed_configs)
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert {first: "cached"}[second] == "cached"
+    assert first.to_string() == second.to_string()
+    assert first.request_configs is configs
+    assert list(configs.items()) == original_items
+    assert list(reversed_configs.items()) == list(reversed(original_items))
+
+
+@pytest.mark.parametrize("key_type", [CacheEngineKey, LayerCacheEngineKey])
+@pytest.mark.parametrize("tag", ["tenant", "session"])
+def test_canonical_tags_preserve_namespace_isolation(
+    key_type: type[CacheEngineKey], tag: str
+) -> None:
+    """Canonical ordering must preserve each tag's name and value."""
+    configs = {"lmcache.tag.tenant": "alice", "lmcache.tag.session": "rollout"}
+    changed_configs = dict(reversed(list(configs.items())))
+    changed_configs[f"lmcache.tag.{tag}"] = "different"
+    first = key_type("model", 1, 0, 123, torch.float16, configs)
+    second = key_type("model", 1, 0, 123, torch.float16, changed_configs)
+
+    assert first != second
+    assert second not in {first: "cached"}
+    assert first.to_string() != second.to_string()
+
+
+@pytest.mark.parametrize("key_type", [CacheEngineKey, LayerCacheEngineKey])
+def test_legacy_unsorted_tag_strings_are_canonicalized(
+    key_type: type[CacheEngineKey],
+) -> None:
+    """Previously serialized tag orders remain parseable."""
+    layer = "@0" if key_type is LayerCacheEngineKey else ""
+    legacy = f"model@1@0@7b@half{layer}@tenant%alice@session%rollout"
+    canonical = f"model@1@0@7b@half{layer}@session%rollout@tenant%alice"
+
+    assert key_type.from_string(legacy) == key_type.from_string(canonical)
+    assert key_type.from_string(legacy).to_string() == canonical
+
+
+def test_legacy_unsorted_tag_dicts_and_derived_keys_are_canonicalized() -> None:
+    """Wire dictionaries and derived worker/layer keys share tag identity."""
+    serialized_configs = [
+        "lmcache.tag.tenant%alice",
+        "lmcache.tag.session%rollout",
+        "lmcache.ttl%60",
+    ]
+    wire = {
+        "model_name": "model",
+        "world_size": 1,
+        "worker_id": 0,
+        "chunk_hash": 123,
+        "dtype": "half",
+        "request_configs": serialized_configs,
+    }
+    key = CacheEngineKey.from_dict(wire)
+    canonical_tags = (("session", "rollout"), ("tenant", "alice"))
+
+    assert key.tags == canonical_tags
+    assert CacheEngineKey.from_dict(key.to_dict()) == key
+    assert key.with_new_worker_id(1).tags == canonical_tags
+    assert key.get_first_layer().tags == canonical_tags
+    assert all(layer.tags == canonical_tags for layer in key.split_layers(2))
+    assert key.request_configs["lmcache.ttl"] == "60"
+    assert serialized_configs[0] == "lmcache.tag.tenant%alice"
+
+
 # ============================================================
 # LayerCacheEngineKey
 # ============================================================
