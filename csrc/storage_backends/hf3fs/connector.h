@@ -145,7 +145,7 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
                  int time_out = 200, bool enable_key_buffer = true,
                  WorkerPoolConfig worker_pool_config = {});
 
-  ~Hf3fsConnector() override = default;
+  ~Hf3fsConnector() override { close(); }
 
  protected:
   WorkerHf3fsConn create_connection() override;

@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any
 import os
 import shutil
+import subprocess
+import sys
+import textwrap
 import time
 import uuid
 
@@ -722,6 +725,83 @@ class TestHf3fsNativeConnector:
         assert client is not None
         # Verify the client can be closed without error
         client.close()
+
+    @pytest.mark.parametrize("explicit_close", [False, True])
+    def test_destruction_with_pending_stores(
+        self,
+        hf3fs_test_mount_point: Path,
+        hf3fs_test_base_path: Path,
+        explicit_close: bool,
+    ) -> None:
+        """Destroying a client safely finishes successful pending writes."""
+        script = textwrap.dedent(
+            """
+            import gc
+            import select
+            import sys
+            import time
+
+            from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+            mount_point, base_path, explicit_close = sys.argv[1:]
+
+            def create_client():
+                return LMCacheHf3fsClient(
+                    mount_point, base_path, num_workers=1,
+                    ior_entries=128, iov_size=104857600,
+                    enable_key_buffer=True,
+                )
+
+            keys = [f"destructor@00000000@0@{i:016x}" for i in range(32)]
+            sources = [bytearray([i]) * 4096 for i in range(len(keys))]
+            writer = create_client()
+            writer.submit_batch_set(keys, [memoryview(buf) for buf in sources])
+            if explicit_close == "True":
+                writer.close()
+            del writer
+            gc.collect()
+
+            destinations = [bytearray(len(buf)) for buf in sources]
+            reader = create_client()
+            try:
+                task_id = reader.submit_batch_get(
+                    keys, [memoryview(buf) for buf in destinations]
+                )
+                deadline = time.monotonic() + 10
+                while True:
+                    results = reader.drain_completions()
+                    if results:
+                        assert len(results) == 1
+                        completed_id, ok, error, per_key = results[0]
+                        assert completed_id == task_id
+                        assert ok, error
+                        assert all(per_key), per_key
+                        break
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0, "load did not complete after destruction"
+                    select.select([reader.event_fd()], [], [], remaining)
+                assert destinations == sources
+            finally:
+                reader.close()
+            """
+        )
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(hf3fs_test_mount_point),
+                    str(hf3fs_test_base_path),
+                    str(explicit_close),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+        finally:
+            shutil.rmtree(hf3fs_test_base_path)
 
     def test_single_put_get_roundtrip(self, hf3fs_native_client):
         """Test single key write-read cycle with data verification."""
