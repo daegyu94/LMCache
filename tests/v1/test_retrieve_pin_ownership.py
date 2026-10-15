@@ -353,19 +353,24 @@ def test_middle_get_miss_releases_unused_refs_not_lookup_pins(
     engine = cache_case.engine
     for request_id in ("A", "B"):
         assert engine.lookup(cache_case.tokens, lookup_id=request_id, pin=True) == 12
-    get_blocking = cache_case.backend.get_blocking
+    batched_get_blocking = cache_case.backend.batched_get_blocking
 
-    def fail_middle_get(key: CacheEngineKey) -> MemoryObj | None:
+    def fail_middle_get(keys: list[CacheEngineKey]) -> list[MemoryObj | None]:
         """Leave the cached middle chunk pinned but fail to read it once."""
-        return None if key == cache_case.keys[1] else get_blocking(key)
+        memory_objs = batched_get_blocking(keys)
+        middle = memory_objs[1]
+        assert middle is not None
+        middle.ref_count_down()
+        memory_objs[1] = None
+        return memory_objs
 
     get_spy = MagicMock(side_effect=fail_middle_get)
-    monkeypatch.setattr(cache_case.backend, "get_blocking", get_spy)
+    monkeypatch.setattr(cache_case.backend, "batched_get_blocking", get_spy)
 
     retrieved = engine.retrieve(cache_case.tokens, req_id="A")
 
     assert retrieved.tolist() == [True] * 4 + [False] * 8
-    assert get_spy.call_args_list == [call(key) for key in cache_case.keys]
+    get_spy.assert_called_once_with(cache_case.keys)
     cache_case.connector.batched_to_gpu.assert_called_once_with(
         cache_case.memory_objs[:1], [0], [4], req_id="A"
     )
@@ -628,9 +633,13 @@ def test_remove_after_retrieve_preserves_pd_ref_cleanup(
     engine.config.enable_pd = True
     engine.config.pd_backend_mode = pd_mode
     engine.remove_after_retrieve = True
-    # PD's blocking get returns its existing buffer without a new reference.
-    get_spy = MagicMock(side_effect=cache_case.backend.hot_cache.get)
-    monkeypatch.setattr(cache_case.backend, "get_blocking", get_spy)
+
+    def get_buffers(keys: list[CacheEngineKey]) -> list[MemoryObj | None]:
+        """Return PD's existing buffers without acquiring new references."""
+        return [cache_case.backend.hot_cache.get(key) for key in keys]
+
+    get_spy = MagicMock(side_effect=get_buffers)
+    monkeypatch.setattr(cache_case.backend, "batched_get_blocking", get_spy)
 
     def remove_buffer(key: CacheEngineKey) -> bool:
         """Model PD buffer deletion, including async removal's reference release."""
@@ -644,6 +653,7 @@ def test_remove_after_retrieve_preserves_pd_ref_cleanup(
 
     assert engine.retrieve(cache_case.tokens, req_id="pd").all()
 
+    get_spy.assert_called_once_with(cache_case.keys)
     assert remove_spy.call_args_list == [call(key) for key in cache_case.keys]
     _assert_counts(cache_case.memory_objs, [0, 0, 0], refs=0)
     assert not engine.lookup_pins

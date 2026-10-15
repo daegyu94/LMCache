@@ -222,6 +222,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
             memory_obj.ref_count_up()
             return memory_obj
 
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """Get objects in input order under one cache lock.
+
+        Args:
+            keys: Cache keys to retrieve, including duplicates.
+
+        Returns:
+            One object or ``None`` per key. Each returned occurrence owns
+            a caller reference acquired before concurrent removal can run.
+        """
+        if not keys:
+            return []
+        memory_objs: List[Optional[MemoryObj]] = []
+        with self.cpu_lock:
+            for key in keys:
+                memory_obj = self.hot_cache.get(key)
+                if memory_obj is not None:
+                    memory_obj.ref_count_up()
+                memory_objs.append(memory_obj)
+        return memory_objs
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
