@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections.abc import Callable
+from types import ModuleType, SimpleNamespace
 import hashlib
 import os
+import sys
 
 # Third Party
 import pytest
@@ -10,9 +13,153 @@ import torch
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
+import lmcache.v1.token_database as token_database
 
 # Local
 from .utils import dumb_metadata, dumb_metadata_with_model_name, generate_tokens
+
+
+@pytest.fixture
+def isolated_vllm_hashes(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Provide deterministic vLLM hash initialization without importing vLLM."""
+    modules = {}
+    for name in (
+        "vllm",
+        "vllm.utils",
+        "vllm.utils.hashing",
+        "vllm.v1",
+        "vllm.v1.core",
+        "vllm.v1.core.kv_cache_utils",
+    ):
+        module = ModuleType(name)
+        module.__path__ = []
+        modules[name] = module
+        monkeypatch.setitem(sys.modules, name, module)
+
+    kv_utils = modules["vllm.v1.core.kv_cache_utils"]
+
+    def sha256_hash(value: object) -> bytes:
+        return hashlib.sha256(repr(value).encode()).digest()
+
+    def get_hash_fn_by_name(name: str) -> Callable[[object], int | bytes]:
+        if name == "builtin":
+            return hash
+        if name == "sha256":
+            return sha256_hash
+        raise ValueError(name)
+
+    def init_none_hash(hash_func: Callable[[object], int | bytes]) -> None:
+        monkeypatch.setattr(
+            kv_utils, "NONE_HASH", hash_func("initial seed"), raising=False
+        )
+
+    monkeypatch.setattr(
+        modules["vllm.utils.hashing"],
+        "get_hash_fn_by_name",
+        get_hash_fn_by_name,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        modules["vllm.v1.core"], "kv_cache_utils", kv_utils, raising=False
+    )
+    monkeypatch.setattr(kv_utils, "init_none_hash", init_none_hash, raising=False)
+    return kv_utils
+
+
+@pytest.mark.parametrize("first_algorithm", ["sha256", "builtin"])
+@pytest.mark.parametrize("tensor_input", [False, True])
+def test_chunk_hashes_survive_another_database_initialization(
+    isolated_vllm_hashes: ModuleType,
+    first_algorithm: str,
+    tensor_input: bool,
+) -> None:
+    """Constructing another hasher must not change an existing DB's keys."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=4, pre_caching_hash_algorithm=first_algorithm
+    )
+    first = ChunkedTokenDatabase(config, dumb_metadata())
+    tokens = torch.arange(8) if tensor_input else list(range(8))
+    before = list(first.process_tokens(tokens=tokens))
+    other_algorithm = "builtin" if first_algorithm == "sha256" else "sha256"
+    other_config = LMCacheEngineConfig.from_defaults(
+        chunk_size=4, pre_caching_hash_algorithm=other_algorithm
+    )
+
+    ChunkedTokenDatabase(other_config, dumb_metadata())
+
+    assert list(first.process_tokens(tokens=tokens)) == before
+    assert len(before) == 2
+
+
+@pytest.mark.parametrize("first_algorithm", ["sha256", "builtin"])
+def test_lazy_chunk_hashing_uses_the_database_seed(
+    isolated_vllm_hashes: ModuleType, first_algorithm: str
+) -> None:
+    """A lazy iterator keeps its owning database's initialization seed."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=4, pre_caching_hash_algorithm=first_algorithm
+    )
+    first = ChunkedTokenDatabase(config)
+    before = list(first.process_tokens(tokens=list(range(8)), make_key=False))
+    pending = first.process_tokens(tokens=list(range(8)), make_key=False)
+    other_algorithm = "builtin" if first_algorithm == "sha256" else "sha256"
+    other_config = LMCacheEngineConfig.from_defaults(
+        chunk_size=4, pre_caching_hash_algorithm=other_algorithm
+    )
+
+    ChunkedTokenDatabase(other_config)
+
+    assert list(pending) == before
+
+
+@pytest.mark.parametrize("vllm_available", [False, True])
+def test_fallback_initialization_does_not_reset_existing_hashes(
+    isolated_vllm_hashes: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_available: bool,
+) -> None:
+    """The no-vLLM and old-vLLM fallbacks must not reset another DB's seed."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=4, pre_caching_hash_algorithm="sha256"
+    )
+    first = ChunkedTokenDatabase(config)
+    before = list(first.process_tokens(tokens=list(range(8)), make_key=False))
+    if vllm_available:
+        monkeypatch.delattr(isolated_vllm_hashes, "init_none_hash")
+    else:
+        monkeypatch.setitem(sys.modules, "vllm.v1.core", None)
+
+    ChunkedTokenDatabase()
+
+    assert list(first.process_tokens(tokens=list(range(8)), make_key=False)) == before
+
+
+@pytest.mark.parametrize("first_algorithm", ["sha256", "builtin"])
+def test_segment_hashes_survive_another_database_initialization(
+    isolated_vllm_hashes: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    first_algorithm: str,
+) -> None:
+    """Independent segment hashes also retain their database's seed."""
+    tokenizer = SimpleNamespace(encode=lambda text: [0, 99])
+    monkeypatch.setattr(
+        token_database.AutoTokenizer, "from_pretrained", lambda model: tokenizer
+    )
+    config = LMCacheEngineConfig.from_defaults(
+        pre_caching_hash_algorithm=first_algorithm
+    )
+    first = SegmentTokenDatabase(config, dumb_metadata())
+    tokens = [1, 2, 99, 3, 4]
+    before = list(first.process_tokens(tokens=tokens))
+    other_algorithm = "builtin" if first_algorithm == "sha256" else "sha256"
+    other_config = LMCacheEngineConfig.from_defaults(
+        pre_caching_hash_algorithm=other_algorithm
+    )
+
+    ChunkedTokenDatabase(other_config)
+
+    assert list(first.process_tokens(tokens=tokens)) == before
+    assert len(before) == 2
 
 
 def hf_credentials_available() -> bool:

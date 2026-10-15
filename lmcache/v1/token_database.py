@@ -77,8 +77,15 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         self,
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
-    ):
-        global NONE_HASH
+    ) -> None:
+        """Initialize a hash function and seed owned by this database.
+
+        Creating other token databases does not change this instance's seed.
+
+        Args:
+            config: Engine configuration, or defaults when omitted.
+            metadata: Model and worker metadata used to construct cache keys.
+        """
 
         hash_algorithm: str = (
             config.pre_caching_hash_algorithm if config is not None else "builtin"
@@ -96,15 +103,15 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
             if hasattr(kv_cache_utils, "init_none_hash"):
                 kv_cache_utils.init_none_hash(self.hash_func)
-                NONE_HASH = _normalize_hash_to_int(kv_cache_utils.NONE_HASH)
+                self.none_hash = _normalize_hash_to_int(kv_cache_utils.NONE_HASH)
                 logger.info(
-                    "Initialized NONE_HASH=%s from vLLM (>= PR#20511)", NONE_HASH
+                    "Initialized NONE_HASH=%s from vLLM (>= PR#20511)", self.none_hash
                 )
             else:
-                NONE_HASH = 0
+                self.none_hash = NONE_HASH
                 logger.info("Using default NONE_HASH=0 (vLLM < PR#20511)")
         except (ImportError, AttributeError):
-            NONE_HASH = 0
+            self.none_hash = NONE_HASH
             logger.info("Using default NONE_HASH=0 (vLLM not available)")
 
         logger.info("Using hash algorithm: %s", hash_algorithm)
@@ -256,12 +263,12 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         """
         Canonicalize hash inputs so that semantically identical requests
         produce structurally identical hash inputs across instances.
-        - prefix_hash: int or NONE_HASH if None
+        - prefix_hash: int or this database's initial seed if None
         - tokens_tuple: tuple of token IDs
         - extra_keys: tuple of additional keys, empty if None
         """
         return (
-            prefix_hash if prefix_hash is not None else NONE_HASH,
+            prefix_hash if prefix_hash is not None else self.none_hash,
             tokens_tuple,
             tuple(extra_keys) if extra_keys is not None else (),
         )
@@ -329,7 +336,8 @@ class ChunkedTokenDatabase(TokenDatabase):
             self.chunk_size = 256
 
     def _get_init_hash(self) -> int:
-        return NONE_HASH
+        """Return this database's initial prefix hash."""
+        return self.none_hash
 
     def _chunk_tokens(
         self,
