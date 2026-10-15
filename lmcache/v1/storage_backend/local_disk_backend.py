@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import hashlib
 import os
 import threading
 import time
@@ -221,7 +222,9 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> str:
-        return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
+        """Hash the full serialized key to preserve isolation and bound filenames."""
+        filename = hashlib.sha256(key.to_string().encode("utf-8")).hexdigest() + ".pt"
+        return os.path.join(self.path, filename)
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:

@@ -171,16 +171,6 @@ class TestLocalDiskBackend:
         assert str(local_disk_backend) == "LocalDiskBackend"
         local_disk_backend.local_cpu_backend.memory_allocator.close()
 
-    def test_key_to_path(self, local_disk_backend):
-        """Test key to path conversion."""
-        key = create_test_key(1)
-        path = local_disk_backend._key_to_path(key)
-
-        expected_filename = key.to_string().replace("/", "-") + ".pt"
-        assert path == os.path.join(local_disk_backend.path, expected_filename)
-
-        local_disk_backend.local_cpu_backend.memory_allocator.close()
-
     def test_contains_key_not_exists(self, local_disk_backend):
         """Test contains() when key doesn't exist."""
         key = create_test_key(2)

@@ -163,9 +163,7 @@ The following diagram shows the overall architecture of the Local Disk Backend:
         end
 
         subgraph Disk["<b>Local Filesystem</b>"]
-            Files["/cache/vllm@model@...@abc.pt
-            /cache/vllm@model@...@def.pt
-            /cache/vllm@model@...@ghi.pt"]
+            Files["/cache/SHA256(key).pt"]
         end
 
         E --> Dict
@@ -182,7 +180,7 @@ The following diagram shows the overall architecture of the Local Disk Backend:
 - **Metadata Dictionary**: Maps each ``CacheEngineKey`` to its disk metadata (file path, size, shape, dtype, pin status)
 - **Cache Policy**: Configurable eviction policy (LRU, LFU, FIFO, or MRU) that tracks access patterns and decides which entries to evict when space is needed
 - **LocalDiskWorker**: Async task executor with priority queue - prefetch tasks run first (priority 0), then deletes (priority 1), then saves (priority 2). The number of I/O worker threads is configurable via ``extra_config.disk_io_threads`` (default: 4).
-- **Local Disk**: Filesystem where KV cache chunks are stored as individual ``.pt`` files
+- **Local Disk**: Filesystem where KV cache chunks are stored as individual ``.pt`` files. Each filename is the SHA-256 digest of the full serialized cache key, preserving model and request-tag isolation while keeping filenames within filesystem limits. The backend starts with an empty metadata dictionary and does not recover files from previous processes.
 
 
 Save Flow (PUT)
