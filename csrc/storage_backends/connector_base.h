@@ -186,29 +186,25 @@ class ConnectorBase : public IStorageConnector {
     return batch_future_id;
   }
 
+  // Return a queue snapshot; later completions remain available for the next
+  // drain without waiting for this snapshot's conversion to finish.
   std::vector<Completion> drain_completions() override {
     // Drain the eventfd that triggered this drain_completions callback
     drain_eventfd_();
 
+    std::queue<Completion> ready;
+    {
+      std::lock_guard<std::mutex> lk(comp_mu_);
+      ready.swap(completions_);
+      // A later enqueue must signal even while this snapshot is processed.
+      signaled_.store(false, std::memory_order_release);
+    }
+
     std::vector<Completion> completions_list;
-
-    for (;;) {
-      Completion c;
-      {
-        std::lock_guard<std::mutex> lk(comp_mu_);
-        if (completions_.empty()) {
-          signaled_.store(false, std::memory_order_release);
-          if (!completions_.empty() &&
-              !signaled_.exchange(true, std::memory_order_acq_rel)) {
-            notifier_->notify();
-          }
-          break;
-        }
-
-        c = std::move(completions_.front());
-        completions_.pop();
-      }
-      completions_list.push_back(std::move(c));
+    completions_list.reserve(ready.size());
+    while (!ready.empty()) {
+      completions_list.push_back(std::move(ready.front()));
+      ready.pop();
     }
 
     return completions_list;
