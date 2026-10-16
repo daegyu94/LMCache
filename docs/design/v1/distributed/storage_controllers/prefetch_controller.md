@@ -93,10 +93,15 @@ afterwards.
    `reserve_write` staging buffers in its affinity L1 manager under a
    per-request write tag, with retention decided per key by
    `policy.plan_l1_retention` (every key is retained under `NO_LOCK`).
-   Reservation failure is **per cell**: `L2_PREFETCH_FAILED` is published with
-   reason `l1_oom` or `l1_contended`, the affected L2 locks are returned, and
-   the request is re-planned on what was reserved. Staging buffers the replan
-   drops are deleted (`finish_write_and_delete`).
+   On a write conflict, try `reserve_read` once in the affinity L1 with the
+   request's reader count. A newly resident object joins `l1_locked_keys`
+   without changing its retention flag and is counted as an L1 hit. Still
+   staging or evicted keys remain misses. `L2_PREFETCH_FAILED` is published
+   with reason `l1_oom` or unresolved `l1_contended`. Return L2 locks without
+   staging buffers and re-plan even if all conflicts recovered. Under `full`,
+   whole-column availability includes resident hits as well as staging.
+   Staging buffers the replan drops are deleted (`finish_write_and_delete`);
+   dropped resident hits only release their read locks.
 5. **Load** (`_submit_load_tasks`). One load task per adapter in the plan,
    carrying the reserved buffers.
 6. **Admit** (`_poll_load_results`), per adapter as its result arrives. Loaded
@@ -178,9 +183,9 @@ Gauges: `lmcache_mp.num_inflight_l2_loads`,
   a function of L1 memory committed to in-flight loads.
 - **Full key list to L2.** Lookups are submitted with every key, not only the
   L1 misses, because the adapter interface carries a flat key list.
-- **Write conflicts are misses.** A key that becomes resident between the
-  lookup and the reserve step fails reservation (`l1_contended`) and is
-  reported as a miss; the engine recomputes and re-stores it.
+- **No waiting for writers.** A write conflict is recovered only if the key
+  is already readable when rechecked. Still-staging or evicted keys remain
+  misses; in-flight loads are not coalesced across requests.
 - **Uniform rows.** Every key group has the same number of keys.
 
 ## Contract-anchoring tests
@@ -190,9 +195,9 @@ with a real `L1Manager` and `MockL2Adapter`:
 
 - `TestL1AndL2` — an L1 suffix extends an L2 prefix into one hit; resident
   keys are not reloaded; L1 hits outside the prefix are released.
-- `TestReservationFailures` — an out-of-memory or contended cell drops its L2
-  lock and the request replans (`"prefix"` shortens the hit, `"full"` keeps
-  the other cells); an L1 hit survives a racing evictor.
+- `TestReservationFailures` — out-of-memory cells drop their L2 locks and
+  replan; newly resident contended cells recover as L1 hits; an L1 hit
+  survives a racing evictor.
 - `TestLockModeAndRetention` — `NO_LOCK` releases every L1 lock at finish and
   leaves loaded objects permanent; `"default"` deletes loaded keys after the
   retrieve, `"retain"` keeps them.
@@ -203,3 +208,8 @@ with a real `L1Manager` and `MockL2Adapter`:
 
 `tests/v1/distributed/test_prefetch_policy.py` tests the policies black-box
 against their docstrings.
+
+`tests/v1/distributed/test_prefetch_admission_recovery.py` uses real L1 state
+and native FS I/O with CPU allocation hooks to cover recovered/resident/staged
+columns across object groups and KV ranks, reader counts, `NO_LOCK`, custom
+policy drops, unresolved conflicts, and abort cleanup.

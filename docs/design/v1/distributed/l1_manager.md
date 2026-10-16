@@ -86,13 +86,16 @@ and the gauge `lmcache_mp.l1_staging_bytes` is registered next to the L1
 usage gauges. It is meant for observability and for future in-flight
 prefetch planning (how much L1 is committed to loads that have not landed).
 
-## Residual race
+## Admission during prefetch lookup
 
-A prefetch request still aborts its L2 load when a key becomes resident
-between its L1 lock pass and its `reserve_write`
-(`KEY_NOT_WRITABLE`, reported as `L2_PREFETCH_FAILED{reason="l1_contended"}`).
-That window is the L2 lookup latency, not the L2 load time as before; see
-`storage_controllers/prefetch_controller.md`.
+A key may become resident between a prefetch request's L1 lock pass and its
+`reserve_write`. On `KEY_NOT_WRITABLE`, the controller tries `reserve_read`
+once in the affinity manager with the request's reader count. A successful
+read becomes an L1 hit, preserving the object's existing retention flag;
+the redundant L2 lock is returned before replanning. A key that was evicted
+again or is still staging remains a reservation failure
+(`L2_PREFETCH_FAILED{reason="l1_contended"}`). The controller never waits for
+another writer; see `storage_controllers/prefetch_controller.md`.
 
 ## Contract-anchoring tests
 

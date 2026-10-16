@@ -223,7 +223,7 @@ def _reserve_l1_cells(
     cells: Bitmap2D,
     retain: dict[ObjectKey, bool],
     tag: str,
-) -> tuple[Bitmap2D, dict[ObjectKey, "MemoryObj"], int]:
+) -> tuple[Bitmap2D, dict[ObjectKey, "MemoryObj"], Bitmap2D]:
     """Reserve a staging buffer in one L1 manager for every cell in ``cells``.
 
     Each row is reserved with its own key group's layout.
@@ -238,15 +238,14 @@ def _reserve_l1_cells(
         tag: The writer tag for the reservations.
 
     Returns:
-        The tuple of (L1 reserve result, reserved objects, failed count).
-        The failed count is the number of cells that were not reserved for
-        any reason.
+        The tuple of (L1 reserve result, reserved objects, contended cells).
+        Contended cells may have become resident since the initial L1 lock
+        pass; the caller must try to read-lock them before reporting a miss.
     """
     success = cells.zeros_like()
     objs: dict[ObjectKey, "MemoryObj"] = {}
-    failed_count = 0
+    contended = cells.zeros_like()
     oom_keys: list[ObjectKey] = []
-    contended_keys: list[ObjectKey] = []
     for row_id, (group, row) in enumerate(zip(key_groups, cells, strict=True)):
         cols = row.get_indices_list()
         if not cols:
@@ -261,11 +260,10 @@ def _reserve_l1_cells(
         for col, key in zip(cols, keys, strict=True):
             error, mem_obj = results[key]
             if error != L1Error.SUCCESS or mem_obj is None:
-                failed_count += 1
                 if error == L1Error.OUT_OF_MEMORY:
                     oom_keys.append(key)
                 elif error == L1Error.KEY_NOT_WRITABLE:
-                    contended_keys.append(key)
+                    contended[row_id].set(col)
                 logger.debug(
                     "reserve_write failed for %s in row %d: %s", key, row_id, error
                 )
@@ -287,16 +285,7 @@ def _reserve_l1_cells(
                 metadata={"reason": "l1_oom", "keys": oom_keys},
             )
         )
-    if contended_keys:
-        # The key became resident in L1 after the lock pass; the caller
-        # falls back to the L1-only hit.
-        event_bus.publish(
-            Event(
-                event_type=EventType.L2_PREFETCH_FAILED,
-                metadata={"reason": "l1_contended", "keys": contended_keys},
-            )
-        )
-    return success, objs, failed_count
+    return success, objs, contended
 
 
 def _build_request(
@@ -1199,6 +1188,8 @@ class PrefetchController(StorageControllerInterface):
         """Plan the loads, reserve their L1 buffers, and submit the load
         tasks.
 
+        A write conflict gets one read-lock attempt in the affinity L1,
+        recovering keys admitted since lookup without waiting for writers.
         On return the locked maps equal the plan, the reserved map equals the
         L2 plan, and one load task is in flight per adapter in it. With an
         empty L2 plan no task is submitted and the request is ready to
@@ -1218,23 +1209,51 @@ class PrefetchController(StorageControllerInterface):
         # Step 3: reserve L1 write buffers for the planned L2 keys
         # with L1-L2 affinity.
         tag = _get_prefetch_write_tag(request.request_id)
-        l1_reserved_keys = MapState()
+        l1_reserved_keys = states.l1_reserved_keys
         reserved_objs: dict[ObjectKey, "MemoryObj"] = {}
         num_failed_reservations = 0
 
         cells_by_l1, retain = self._build_l1_allocation_plans(request)
         for l1_idx, cells in cells_by_l1.items():
-            success, objs, l1_failed_count = _reserve_l1_cells(
+            success, objs, contended = _reserve_l1_cells(
                 self._l1_managers[l1_idx], request.key_groups, cells, retain, tag
             )
             l1_reserved_keys[l1_idx] = success
             reserved_objs.update(objs)
-            num_failed_reservations += l1_failed_count
+            num_failed_reservations += (cells - success).popcount()
+
+            contended_keys = _gather_keys(request.key_groups, contended)
+            if not contended_keys:
+                continue
+            l1_manager = self._l1_managers[l1_idx]
+            if l1_idx not in states.l1_locked_keys:
+                states.l1_locked_keys[l1_idx] = cells.zeros_like()
+            read_results = l1_manager.reserve_read(
+                contended_keys, read_locks=request.num_kv_readers
+            )
+            unresolved: list[ObjectKey] = []
+            for row_id, row in enumerate(contended):
+                for col in row.get_indices_list():
+                    key = request.key_groups[row_id].keys[col]
+                    if read_results[key][0] == L1Error.SUCCESS:
+                        states.l1_locked_keys[l1_idx][row_id].set(col)
+                    else:
+                        unresolved.append(key)
+            if unresolved:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L2_PREFETCH_FAILED,
+                        metadata={"reason": "l1_contended", "keys": unresolved},
+                    )
+                )
 
         # Step 3.5: a whole-columns request can use a column only if every
-        # row reserved; trim to whole columns and release the rest.
+        # row is resident or reserved; trim staging to those whole columns.
         if request.fetching_policy == "full" and num_failed_reservations > 0:
             merged = l1_reserved_keys.merge()
+            resident = states.l1_locked_keys.merge()
+            if len(resident) > 0:
+                merged += resident
             if len(merged) > 0:
                 kept = Bitmap2D(all_grouped(merged.to_list()))
                 for l1_idx, grid in l1_reserved_keys.items():
@@ -1248,8 +1267,8 @@ class PrefetchController(StorageControllerInterface):
                         l1_reserved_keys[l1_idx] = grid & kept
         states.l1_reserved_keys = l1_reserved_keys
 
-        # Steps 4 and 5 only matter when some reservation failed; otherwise the
-        # L2 plan is fully reserved and the replan would return the same plan.
+        # Replan every write shortfall, including recovered L1 hits: those
+        # cells now own read locks instead of staging buffers and L2 locks.
         if num_failed_reservations > 0:
             # Step 4: drop the L2 locks whose L1 reservation failed.
             l2_locked_keys_new = MapState()

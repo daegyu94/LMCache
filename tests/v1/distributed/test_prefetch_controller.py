@@ -1348,9 +1348,8 @@ class TestReservationFailures:
             adapter.close()
             l1_manager.close()
 
-    def test_contended_key_is_dropped_under_prefix(self, l1_manager):
-        """A key admitted by another writer after the lock pass fails to
-        reserve; under "prefix" the hit stops before it."""
+    def test_contended_key_is_recovered_under_prefix(self, l1_manager):
+        """A key admitted after the lock pass preserves the whole prefix."""
         adapter = make_adapter()
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
@@ -1369,15 +1368,15 @@ class TestReservationFailures:
         adapter.close()
 
         assert racing_l1.admitted, "the racing writer never interleaved"
-        assert row_bits(result) == [0]
-        assert_read_locked(l1_manager, keys[:1])
-        assert_absent(l1_manager, keys[2:])
+        assert row_bits(result) == [0, 1, 2]
+        assert hit_counts(result) == (1, 2)
+        assert_read_locked(l1_manager, keys)
         assert l1_manager.get_staging_memory_usage() == 0
-        l1_manager.finish_read(keys[:1])
+        l1_manager.finish_read(keys)
         l1_manager.delete([keys[1]])
 
-    def test_contended_key_is_dropped_under_full(self, l1_manager):
-        """Under "full" only the contended key is dropped."""
+    def test_contended_key_is_recovered_under_full(self, l1_manager):
+        """A newly resident key is an L1 hit under full fetching too."""
         adapter = make_adapter()
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
@@ -1398,10 +1397,11 @@ class TestReservationFailures:
         adapter.close()
 
         assert racing_l1.admitted
-        assert row_bits(result) == [1, 2]
-        assert_read_locked(l1_manager, keys[1:])
+        assert row_bits(result) == [0, 1, 2]
+        assert hit_counts(result) == (1, 2)
+        assert_read_locked(l1_manager, keys)
         assert l1_manager.get_staging_memory_usage() == 0
-        l1_manager.finish_read(keys[1:])
+        l1_manager.finish_read(keys)
         l1_manager.delete([keys[0]])
 
     def test_l1_hit_survives_racing_evictor(self, l1_manager):
