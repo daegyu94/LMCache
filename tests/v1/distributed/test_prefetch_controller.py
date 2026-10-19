@@ -1261,6 +1261,57 @@ class EvictionRacingL1Manager:
         return wrapped
 
 
+class ClearingL1Manager:
+    """L1Manager wrapper that runs ``clear()`` right before the controller
+    admits its first L2 load, and records every ``finish_read`` call."""
+
+    def __init__(self, inner: L1Manager) -> None:
+        self._inner = inner
+        self._cleared = False
+        self.finish_read_keys: list[ObjectKey] = []
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            if name == "finish_write_and_reserve_read" and not self._cleared:
+                self._cleared = True
+                self._inner.clear()
+            if name == "finish_read":
+                self.finish_read_keys.extend(args[0])
+            return attr(*args, **kwargs)
+
+        return wrapped
+
+
+class TestClearDuringL2Load:
+    def test_load_landing_after_clear_is_not_a_hit(self, l1_manager):
+        """A load admitted after clear() is dropped: no hit, no read lock
+        claimed, and no finish_read reaches keys the prefetch never locked."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        racing = ClearingL1Manager(l1_manager)
+        ctrl = make_controller(racing, [adapter])  # type: ignore[arg-type]
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+        result = wait_for_result(ctrl, req_id)
+
+        assert row_bits(result) == []
+        assert hit_counts(result) == (0, 0)
+        assert racing.finish_read_keys == []
+        assert_absent(l1_manager, keys)
+        assert l1_manager.get_memory_usage()[0] == 0
+        assert l1_manager.get_staging_memory_usage() == 0
+        assert_l2_unlocked(adapter)
+        ctrl.stop()
+        adapter.close()
+
+
 class TestReservationFailures:
     @pytest.mark.parametrize(
         ("fetching_policy", "expected_rows"),

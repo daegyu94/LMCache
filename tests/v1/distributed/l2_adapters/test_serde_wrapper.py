@@ -267,6 +267,7 @@ class FakeSerde(SerdeProcessor):
         self.fail_submit_deserialize = False
 
         self.serialize_calls: list[list[ObjectKey]] = []
+        self.pending_serialize: list[SerdeTaskId] = []
         self.deserialize_calls: list[list[ObjectKey]] = []
         self.deserialize_submitted = threading.Event()
 
@@ -297,7 +298,17 @@ class FakeSerde(SerdeProcessor):
             with self._task_lock:
                 self._serialize_done[task_id] = self.serialize_result
             self._serialize_notifier.notify()
+        else:
+            self.pending_serialize.append(task_id)
         return task_id
+
+    def finish_pending_serialize(self, result: bool) -> None:
+        """Complete every serialize task that was left pending."""
+        with self._task_lock:
+            for task_id in self.pending_serialize:
+                self._serialize_done[task_id] = result
+            self.pending_serialize.clear()
+        self._serialize_notifier.notify()
 
     def query_serialize_result(self, task_id: SerdeTaskId) -> bool | None:
         with self._task_lock:
@@ -429,6 +440,27 @@ def test_store_failure_at_any_stage_fails_task_and_releases_temps(
 
     assert not wait_for_store_result(wrapper, task_id).is_successful()
     assert inner.store_calls == ([keys] if reaches_inner_store else [])
+    assert l1_usage(l1) == baseline
+
+
+def test_store_dropped_when_cache_clear_discards_temps(
+    l1: L1Manager,
+    inner: FakeInnerAdapter,
+    serde: FakeSerde,
+    wrapper: SerdeL2AdapterWrapper,
+) -> None:
+    serde.serialize_result = None
+    keys, objs = commit_objects(l1, 2)
+    task_id = wrapper.submit_store_task(keys, objs)
+    # Source objects are unlocked, so clear() drops them; the temps are live
+    # write reservations that survive it but predate it.
+    l1.clear()
+    baseline = (0, 0)
+
+    serde.finish_pending_serialize(True)
+
+    assert not wait_for_store_result(wrapper, task_id).is_successful()
+    assert inner.store_calls == []
     assert l1_usage(l1) == baseline
 
 

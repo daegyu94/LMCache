@@ -2270,7 +2270,8 @@ class TestStagingEviction:
 
         status = manager.report_status()
         assert status["staging_object_count"] == 1
-        assert manager.finish_write([live])[live] == L1Error.SUCCESS
+        # The reservation survives the clear but predates it: not admitted.
+        assert manager.finish_write([live])[live] == L1Error.RESERVATION_CLEARED
         assert manager.finish_write([stale])[stale] == L1Error.KEY_NOT_EXIST
 
         manager.close()
@@ -2455,4 +2456,214 @@ class TestStagingAccounting:
         one_copy = manager.get_object_state(keys[0]).memory_obj.get_size()
         assert used == one_copy * len(keys)
 
+        manager.close()
+
+
+# =============================================================================
+# Tests for the clear generation fence
+# =============================================================================
+
+
+class TestClearFence:
+    """Work in flight across ``clear()`` must not become visible afterwards."""
+
+    def test_finish_write_after_clear_is_discarded(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        baseline, _ = manager.get_memory_usage()
+        policy = LRUEvictionPolicy()
+        manager.register_listener(L1EvictionPolicy(policy))
+        manager.reserve_write([key], [False], basic_layout)
+
+        manager.clear()
+        assert manager.finish_write([key])[key] == L1Error.RESERVATION_CLEARED
+
+        assert manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_EXIST
+        assert manager.get_object_state(key) is None
+        assert manager.get_staging_memory_usage() == 0
+        assert manager.get_memory_usage()[0] == baseline
+        # The eviction policy no longer tracks the key.
+        assert policy.get_eviction_actions(1 << 30) == []
+        manager.close()
+
+    def test_finish_write_and_reserve_read_after_clear_is_discarded(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        baseline, _ = manager.get_memory_usage()
+        manager.reserve_write([key], [True], basic_layout, tag="prefetch:1")
+
+        manager.clear()
+        res = manager.finish_write_and_reserve_read([key], tag="prefetch:1")
+
+        assert res[key] == (L1Error.RESERVATION_CLEARED, None)
+        assert manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_EXIST
+        assert manager.get_memory_usage()[0] == baseline
+        manager.close()
+
+    def test_write_finished_event_not_published_for_cleared_write(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        notified: list[list[ObjectKey]] = []
+
+        class _Recorder(L1EvictionPolicy):
+            def on_l1_keys_write_finished(self, keys):
+                notified.append(keys)
+
+        manager.register_listener(_Recorder(LRUEvictionPolicy()))
+        manager.reserve_write([key], [False], basic_layout)
+        manager.clear()
+        manager.finish_write([key])
+
+        assert notified == []
+        manager.close()
+
+    def test_reservation_after_clear_commits(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.clear()
+        assert manager.finish_write([key])[key] == L1Error.RESERVATION_CLEARED
+        manager.reserve_write([key], [False], basic_layout)
+
+        assert manager.finish_write([key])[key] == L1Error.SUCCESS
+        assert manager.reserve_read([key])[key][0] == L1Error.SUCCESS
+        manager.close()
+
+    def test_read_locked_key_is_stale_after_clear(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        baseline_with_obj, _ = manager.get_memory_usage()
+        assert manager.reserve_read([key])[key][0] == L1Error.SUCCESS
+
+        manager.clear()
+
+        # Held memory stays valid for the holder but nobody new can see it.
+        assert manager.get_memory_usage()[0] == baseline_with_obj
+        assert manager.reserve_read([key])[key][0] == L1Error.KEY_NOT_EXIST
+        assert manager.unsafe_read([key])[key][0] == L1Error.KEY_CLEARED
+        # Freed on the last read lock release.
+        assert manager.finish_read([key])[key] == L1Error.SUCCESS
+        assert manager.get_object_state(key) is None
+        assert manager.get_memory_usage()[0] == 0
+        # The key is writable again with the new generation.
+        manager.reserve_write([key], [False], basic_layout)
+        assert manager.finish_write([key])[key] == L1Error.SUCCESS
+        manager.close()
+
+    def test_stale_key_freed_only_after_all_read_locks_released(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key])
+        manager.reserve_read([key])
+
+        manager.clear()
+        manager.finish_read([key])
+        assert manager.get_memory_usage()[0] > 0
+        manager.finish_read([key])
+        assert manager.get_memory_usage()[0] == 0
+        manager.close()
+
+    def test_force_clear_then_finish_write_reports_missing(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.clear(force=True)
+
+        assert manager.finish_write([key])[key] == L1Error.KEY_NOT_EXIST
+        assert manager.get_memory_usage()[0] == 0
+        manager.close()
+
+    def test_stale_key_with_expired_read_lock_is_reclaimed(
+        self, basic_memory_config, basic_layout
+    ):
+        config = L1ManagerConfig(
+            memory_config=basic_memory_config,
+            write_ttl_seconds=600,
+            read_ttl_seconds=1,
+        )
+        manager = L1Manager(config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key])
+        manager.clear()
+        time.sleep(1.2)
+
+        # The lapsed holder cannot pin the key forever: a new writer reclaims.
+        assert manager.reserve_write([key], [False], basic_layout)[key][0] == (
+            L1Error.SUCCESS
+        )
+        assert manager.finish_write([key])[key] == L1Error.SUCCESS
+        assert manager.reserve_read([key])[key][0] == L1Error.SUCCESS
+        manager.finish_read([key])
+
+        # finish_read on a lapsed stale lock also reclaims it.
+        other = make_object_key(2)
+        manager.reserve_write([other], [False], basic_layout)
+        manager.finish_write([other])
+        manager.reserve_read([other])
+        manager.clear()
+        time.sleep(1.2)
+        assert manager.finish_read([other])[other] == L1Error.KEY_IN_WRONG_STATE
+        assert manager.get_object_state(other) is None
+        manager.close()
+
+    def test_concurrent_clear_never_leaks_memory(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        errors: list[Exception] = []
+        stop = threading.Event()
+
+        def writer(wid: int) -> None:
+            try:
+                i = 0
+                while not stop.is_set():
+                    key = make_object_key(wid * 1_000_000 + i)
+                    i += 1
+                    tag = f"w{wid}"
+                    if (
+                        manager.reserve_write([key], [False], basic_layout, tag)[key][0]
+                        != L1Error.SUCCESS
+                    ):
+                        continue
+                    if i % 2:
+                        err = manager.finish_write([key], tag)[key]
+                        if err == L1Error.SUCCESS:
+                            read = manager.reserve_read([key])[key][0]
+                            if read == L1Error.SUCCESS:
+                                manager.finish_read([key])
+                        elif err != L1Error.RESERVATION_CLEARED:
+                            raise AssertionError(f"unexpected {err}")
+                    else:
+                        manager.finish_write_and_delete([key], tag)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for _ in range(50):
+            manager.clear()
+            time.sleep(0.005)
+        stop.set()
+        for t in threads:
+            t.join()
+        assert errors == []
+
+        manager.clear()
+        status = manager.report_status()
+        assert status["staging_object_count"] == 0
+        assert status["total_object_count"] == 0
+        assert manager.get_memory_usage()[0] == 0
         manager.close()

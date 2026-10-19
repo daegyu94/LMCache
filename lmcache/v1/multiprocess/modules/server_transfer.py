@@ -466,6 +466,7 @@ class ShmTransferStrategy(TransferStrategy):
         ):
             if shm_prefetched_keys:
                 self._storage_manager.finish_read_prefetched(shm_prefetched_keys)
+            self._storage_manager.finish_read_cleared(obj_keys)
             return PrepareRetrieveResponse(success=False, data=b"", context={})
         slots: list[dict[str, Any]] = []
         for memory_obj in shm_memory_objs:

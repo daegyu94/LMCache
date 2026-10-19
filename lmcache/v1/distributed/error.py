@@ -47,6 +47,13 @@ class L1Error(enum.Enum):
     OUT_OF_MEMORY = enum.auto()
     """ Not enough memory to complete the operation. """
 
+    KEY_CLEARED = enum.auto()
+    """ The key was read-locked when the cache was cleared; it is no longer
+    served and the caller still owns (and must release) its read lock. """
+
+    RESERVATION_CLEARED = enum.auto()
+    """ The write reservation predates a cache clear and was discarded. """
+
 
 ErrorType = L1Error
 
@@ -75,5 +82,9 @@ def strerror(error: ErrorType) -> str:
             return "The specified key is locked and cannot perform the operation."
         elif error == L1Error.OUT_OF_MEMORY:
             return "Not enough memory to complete the operation."
+        elif error == L1Error.KEY_CLEARED:
+            return "The key was cleared while read-locked and is no longer served."
+        elif error == L1Error.RESERVATION_CLEARED:
+            return "The write reservation predates a cache clear and was discarded."
 
     return "Unknown error."

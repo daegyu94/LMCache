@@ -480,19 +480,25 @@ class StorageManager:
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         bad_keys: list[ObjectKey] = []
+        cleared_keys: list[ObjectKey] = []
         not_found_keys: list[ObjectKey] = []
         write_locked_keys: list[ObjectKey] = []
         all_good = True
         for k, (e, o) in read_results.items():
             if o is None:
-                logger.error(
+                # A key dropped by a cache clear is an expected miss.
+                log = logger.debug if e == L1Error.KEY_CLEARED else logger.error
+                log(
                     "Failed to read prefetched object %s from L1 storage: %s",
                     k,
                     strerror(e),
                 )
                 bad_keys.append(k)
                 all_good = False
-                if e == L1Error.KEY_NOT_EXIST:
+                if e == L1Error.KEY_CLEARED:
+                    # Still read-locked by the caller's reservation.
+                    cleared_keys.append(k)
+                elif e == L1Error.KEY_NOT_EXIST:
                     not_found_keys.append(k)
                 elif e == L1Error.KEY_NOT_READABLE:
                     write_locked_keys.append(k)
@@ -541,7 +547,7 @@ class StorageManager:
             # Decrease the read lock for all successfully read memory objects
             # if None is yielded or exception occurs during caller's processing
             if not all_good or not successfully_yielded:
-                self._finish_read_objects(good_keys, 1, l1_owners)
+                self._finish_read_objects(good_keys + cleared_keys, 1, l1_owners)
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.SM_READ_PREFETCHED_FINISHED,
@@ -747,6 +753,25 @@ class StorageManager:
             good_keys.append(key)
             good_objs.append(obj)
         return good_keys, good_objs
+
+    def finish_read_cleared(
+        self,
+        keys: list[ObjectKey],
+        l1_owners: dict[ObjectKey, int] | None = None,
+    ) -> None:
+        """Release the caller's read lock on keys cleared while read-locked.
+
+        Only keys that report ``KEY_CLEARED`` are released, so locks the
+        caller does not hold are never touched.
+
+        Args:
+            keys: Keys of a reservation whose retrieve failed.
+            l1_owners: Optional key to L1 owner map, as for ``unsafe_read``.
+        """
+        read_results = self._read_objects(keys, l1_owners)
+        cleared = [k for k, (e, _) in read_results.items() if e == L1Error.KEY_CLEARED]
+        if cleared:
+            self._finish_read_objects(cleared, 1, l1_owners)
 
     @property
     def quota_manager(self) -> QuotaManager:
@@ -1253,8 +1278,13 @@ class StorageManager:
         Args:
             force: If True, clear ALL objects including locked ones.
                 This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+                If False (default), clear every unlocked L1 object and fence
+                the work in flight: writes reserved before the clear are
+                discarded when they finish (they never become visible), and
+                objects read-locked at clear time are hidden from new reads
+                and freed on their last release, so a retrieve that follows
+                a lookup made before the clear fails (a cache miss for the
+                caller). L2 contents are not cleared.
         """
         for manager in self._l1_managers_by_id.values():
             manager.clear(force=force)

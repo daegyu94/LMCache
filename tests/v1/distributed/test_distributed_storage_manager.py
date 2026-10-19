@@ -418,6 +418,62 @@ class TestStorageManagerBasic:
         storage_manager.close()
 
 
+class TestStorageManagerClearFence:
+    def test_write_in_flight_across_clear_is_dropped(
+        self, basic_storage_manager_config, basic_layout
+    ):
+        """A store reserved before clear() fails at finish_write and never
+        becomes readable; a store reserved after it commits."""
+        bus = init_event_bus(EventBusConfig(enabled=True, max_queue_size=10_000))
+        finished: list[Event] = []
+        bus.subscribe(EventType.SM_WRITE_FINISHED, finished.append)
+        bus.start()
+        sm = StorageManager(basic_storage_manager_config)
+        try:
+            key = make_object_key(1)
+            assert key in sm.reserve_write([key], basic_layout)
+
+            sm.clear()
+            sm.finish_write([key])
+
+            assert wait_for_condition(lambda: len(finished) == 1, timeout=2.0)
+            assert finished[0].metadata["succeeded_keys"] == []
+            assert finished[0].metadata["failed_keys"] == [key]
+            handle = sm.submit_prefetch_task(single_row_spec([key], basic_layout))
+            hits = sm.query_prefetch_status(handle).hit_cells[0].count_leading_ones()
+            assert hits == 0
+
+            assert key in sm.reserve_write([key], basic_layout)
+            sm.finish_write([key])
+            handle = sm.submit_prefetch_task(single_row_spec([key], basic_layout))
+            hits = sm.query_prefetch_status(handle).hit_cells[0].count_leading_ones()
+            assert hits == 1
+            sm.finish_read_prefetched([key])
+        finally:
+            sm.close()
+            bus.stop()
+            init_event_bus(EventBusConfig(enabled=False))
+
+    def test_retrieve_after_clear_fails_and_releases_locks(
+        self, basic_storage_manager_config, basic_layout
+    ):
+        """A lookup that precedes clear() cannot be retrieved after it, and
+        the failed retrieve leaves no pinned key behind."""
+        sm = StorageManager(basic_storage_manager_config)
+        keys = [make_object_key(i) for i in range(3)]
+        sm.finish_write(list(sm.reserve_write(keys, basic_layout)))
+        handle = sm.submit_prefetch_task(single_row_spec(keys, basic_layout))
+        assert sm.query_prefetch_status(handle).hit_cells[0].count_leading_ones() == 3
+
+        sm.clear()
+
+        with sm.read_prefetched_results(keys) as objs:
+            assert objs is None
+        # Every key is gone, so a fresh store of the same keys is accepted.
+        assert set(sm.reserve_write(keys, basic_layout)) == set(keys)
+        sm.close()
+
+
 # =============================================================================
 # Tests for multi-reader (count / num_readers) support
 # =============================================================================

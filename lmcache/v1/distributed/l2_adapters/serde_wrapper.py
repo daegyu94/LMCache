@@ -469,9 +469,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
             # Serialize succeeded — transition temps write → read so inner
             # can safely read them during the store.
-            self._l1_manager.finish_write_and_reserve_read(
+            admitted = self._l1_manager.finish_write_and_reserve_read(
                 state.temp_keys, tag=_L1_WRITE_TAG
             )
+            if any(err != L1Error.SUCCESS for err, _ in admitted.values()):
+                # A cache clear discarded (part of) the temps; the data
+                # predates the clear, so drop the store instead of writing it.
+                self._l1_manager.finish_read(
+                    [k for k, (err, _) in admitted.items() if err == L1Error.SUCCESS]
+                )
+                self._finalize_store(wrapped_id, success=False)
+                continue
             try:
                 inner_id = self._inner.submit_store_task(state.keys, state.temp_objs)
             except Exception:

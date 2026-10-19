@@ -1432,10 +1432,24 @@ class PrefetchController(StorageControllerInterface):
             failed_keys = _gather_keys(request.key_groups, failed)
 
             # Update L1 key status
+            num_cleared = 0
             if loaded_keys:
-                l1_manager.finish_write_and_reserve_read(
+                admitted = l1_manager.finish_write_and_reserve_read(
                     loaded_keys, read_locks=request.num_kv_readers, tag=tag
                 )
+                # Only keys that took read locks may be released later; a
+                # reservation discarded by a cache clear holds nothing.
+                landed = loaded.zeros_like()
+                for row_id, (group, row) in enumerate(
+                    zip(request.key_groups, loaded, strict=True)
+                ):
+                    for col in row.get_indices_list():
+                        if admitted[group.keys[col]][0] == L1Error.SUCCESS:
+                            landed[row_id].set(col)
+                loaded = landed
+                num_cleared = len(loaded_keys)
+                loaded_keys = _gather_keys(request.key_groups, loaded)
+                num_cleared -= len(loaded_keys)
             if failed_keys:
                 l1_manager.finish_write_and_delete(failed_keys, tag=tag)
 
@@ -1475,7 +1489,7 @@ class PrefetchController(StorageControllerInterface):
                     metadata={
                         "request_id": request.request_id,
                         "loaded_count": len(loaded_keys),
-                        "failed_count": len(failed_keys),
+                        "failed_count": len(failed_keys) + num_cleared,
                         "key_count_per_salt": Counter(
                             k.cache_salt for k in loaded_keys
                         ),

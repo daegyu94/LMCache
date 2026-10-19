@@ -105,6 +105,13 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    generation: int
+    """ The clear generation current when the object was reserved. """
+
+    is_stale: bool = False
+    """ Set by a non-forced clear on a read-locked object: it is invisible to
+    new readers and deleted when its last read lock is released. """
+
 
 def l1_mgr_synchronized(func):
     """
@@ -208,6 +215,9 @@ class L1Manager(L1ManagerInterface):
         self._staging: dict[ObjectKey, dict[str, L1ObjectState]] = {}
         # Bytes held by staging objects (kept in sync with ``_staging``).
         self._staging_bytes: int = 0
+        # Bumped by every ``clear()``. Reservations stamped with an older value
+        # were made before the clear and are discarded instead of admitted.
+        self._clear_generation: int = 0
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
@@ -319,7 +329,9 @@ class L1Manager(L1ManagerInterface):
         successful_keys: list[ObjectKey] = []
         for key in keys:
             entry = self._objects.get(key, None)
-            if entry is None:
+            if entry is not None and self._reclaim_stale(key, entry):
+                entry = None
+            if entry is None or entry.is_stale:
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
                 continue
 
@@ -354,6 +366,8 @@ class L1Manager(L1ManagerInterface):
 
         Errors:
             KEY_NOT_EXIST: The key does not exist.
+            KEY_CLEARED: The key was cleared while read-locked. It is not
+                served, and the caller still holds a read lock to release.
             KEY_NOT_READABLE: The key is not readable (in this case, not read-locked).
         """
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -362,6 +376,12 @@ class L1Manager(L1ManagerInterface):
             entry = self._objects.get(key, None)
             if entry is None:
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
+                continue
+
+            if entry.is_stale:
+                # Distinct from KEY_NOT_EXIST: the caller's lock is still
+                # held on this object and must be released.
+                ret[key] = (L1Error.KEY_CLEARED, None)
                 continue
 
             if not entry.read_lock.is_locked():
@@ -380,8 +400,8 @@ class L1Manager(L1ManagerInterface):
     ) -> dict[ObjectKey, L1Error]:
         """Finish read access for the given keys.
 
-        Will delete the object if it is temporary and read
-        count reaches zero.
+        Will delete the object if it is temporary (or was made stale by
+        :meth:`clear`) and read count reaches zero.
 
         Args:
             keys: The list of object keys to finish read
@@ -424,6 +444,7 @@ class L1Manager(L1ManagerInterface):
                     "potential inconsistent data might be read",
                     key,
                 )
+                self._reclaim_stale(key, entry)
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
@@ -432,7 +453,9 @@ class L1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary or entry.is_stale
+            ) and not entry.read_lock.is_locked():
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
@@ -512,7 +535,8 @@ class L1Manager(L1ManagerInterface):
         successful_keys: list[ObjectKey] = []
 
         for key, is_temp in zip(keys, is_temporary, strict=True):
-            if key in self._objects:
+            resident = self._objects.get(key, None)
+            if resident is not None and not self._reclaim_stale(key, resident):
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                 continue
 
@@ -530,6 +554,7 @@ class L1Manager(L1ManagerInterface):
                 )
                 staged.write_lock.lock()
                 staged.is_temporary = is_temp
+                staged.generation = self._clear_generation
                 ret[key] = (L1Error.SUCCESS, staged.memory_obj)
                 successful_keys.append(key)
                 continue
@@ -562,6 +587,7 @@ class L1Manager(L1ManagerInterface):
                     write_lock=TTLLock(self._write_ttl_seconds),
                     read_lock=TTLLock(self._read_ttl_seconds),
                     is_temporary=is_temp,
+                    generation=self._clear_generation,
                 )
                 entry.write_lock.lock()
                 self._put_staging(key, tag, entry)
@@ -609,6 +635,9 @@ class L1Manager(L1ManagerInterface):
             KEY_IN_WRONG_STATE: The staging object is not write-locked (its
                 reservation expired), which means the writer may have
                 caused inconsistent data.
+            RESERVATION_CLEARED: :meth:`clear` ran after the reservation was
+                made. The staging object is discarded and freed, never
+                admitted, and no write-finished notification is emitted.
 
         Note:
             If the key became resident before admission, the staging object
@@ -619,11 +648,18 @@ class L1Manager(L1ManagerInterface):
         notification_keys: list[ObjectKey] = []
         notification_keys_meta: list[L1ObjectMeta] = []
         discarded: list[MemoryObj] = []
+        gone_keys: list[ObjectKey] = []
 
         for key in keys:
             err, entry = self._take_staging(key, tag, "finish write")
             ret[key] = err
             if err != L1Error.SUCCESS or entry is None:
+                continue
+            if entry.generation != self._clear_generation:
+                ret[key] = L1Error.RESERVATION_CLEARED
+                discarded.append(entry.memory_obj)
+                if key not in self._objects and key not in self._staging:
+                    gone_keys.append(key)
                 continue
             if key in self._objects:
                 logger.debug(
@@ -640,6 +676,7 @@ class L1Manager(L1ManagerInterface):
                 notification_keys_meta.append(self._object_meta(entry.memory_obj))
 
         self._memory_manager.free(discarded)
+        self._report_staging_gone(gone_keys)
 
         if notification_keys:
             for listener in self._registered_listeners:
@@ -686,6 +723,9 @@ class L1Manager(L1ManagerInterface):
             KEY_NOT_EXIST: ``tag`` stages nothing for the key.
             KEY_IN_WRONG_STATE: The staging object is not write-locked (its
                 reservation expired).
+            RESERVATION_CLEARED: :meth:`clear` ran after the reservation was
+                made; the staging object is discarded and no read lock is
+                taken, so the caller holds nothing for the key.
 
         Note:
             Admission follows :meth:`finish_write`. If the key became
@@ -699,11 +739,18 @@ class L1Manager(L1ManagerInterface):
         successful_keys_meta: list[L1ObjectMeta] = []
         resident_keys: list[ObjectKey] = []
         discarded: list[MemoryObj] = []
+        gone_keys: list[ObjectKey] = []
 
         for key in keys:
             err, entry = self._take_staging(key, tag, "finish_write_and_reserve_read")
             if err != L1Error.SUCCESS or entry is None:
                 ret[key] = (err, None)
+                continue
+            if entry.generation != self._clear_generation:
+                ret[key] = (L1Error.RESERVATION_CLEARED, None)
+                discarded.append(entry.memory_obj)
+                if key not in self._objects and key not in self._staging:
+                    gone_keys.append(key)
                 continue
             resident = self._objects.get(key, None)
             if resident is None:
@@ -725,6 +772,7 @@ class L1Manager(L1ManagerInterface):
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
         self._memory_manager.free(discarded)
+        self._report_staging_gone(gone_keys)
         if resident_keys:
             self._report_read_reserved(resident_keys)
 
@@ -877,9 +925,13 @@ class L1Manager(L1ManagerInterface):
                 every staging object. This may corrupt in-flight
                 store/prefetch operations. If False (default), only clear
                 unlocked resident objects and staging objects whose write
-                lock expired, keeping read-locked objects and live staging
-                objects intact.
+                lock expired. Read-locked objects stay in memory for their
+                holders but become stale (invisible to new readers, freed on
+                the last ``finish_read``), and live staging objects stay
+                until their writer finishes, which then discards them
+                (``RESERVATION_CLEARED``) instead of admitting them.
         """
+        self._clear_generation += 1
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
             logger.warning(
@@ -925,6 +977,7 @@ class L1Manager(L1ManagerInterface):
         for key, entry in list(self._objects.items()):
             if entry.read_lock.is_locked():
                 locked_count += 1
+                entry.is_stale = True
                 continue
             keys_to_clear.append(key)
             objs_to_free.append(entry.memory_obj)
@@ -1334,6 +1387,21 @@ class L1Manager(L1ManagerInterface):
             freed.append(self._pop_staging(key, tag).memory_obj)
         self._memory_manager.free(freed)
         return len(freed)
+
+    def _reclaim_stale(self, key: ObjectKey, entry: L1ObjectState) -> bool:
+        """Free ``entry`` if it is stale and its read locks all expired.
+
+        A stale object is normally freed by the last ``finish_read``; this
+        covers holders that never released before the read TTL ran out.
+
+        Returns:
+            True if the object was freed and removed from L1.
+        """
+        if not entry.is_stale or entry.read_lock.is_locked():
+            return False
+        del self._objects[key]
+        self._free_and_report_deleted([key], [entry.memory_obj])
+        return True
 
     def _report_read_reserved(self, keys: list[ObjectKey]) -> None:
         """Notify listeners and the event bus that ``keys`` got read locks."""
