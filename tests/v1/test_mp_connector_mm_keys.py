@@ -225,6 +225,7 @@ def test_lookup_hint_carries_vllm_prefix_hit() -> None:
     )
     scheduler_adapter = MagicMock()
     scheduler_adapter.lmcache_tokens_per_chunk = 64
+    scheduler_adapter.has_pending_lookup.return_value = False
     scheduler_adapter.check_lookup_result.return_value = None
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
@@ -244,6 +245,7 @@ def test_recurrent_lookup_reserves_final_prompt_token() -> None:
     request = _FakeRequest(list(range(128)))
     scheduler_adapter = MagicMock()
     scheduler_adapter.lmcache_tokens_per_chunk = 64
+    scheduler_adapter.has_pending_lookup.return_value = False
     scheduler_adapter.check_lookup_result.return_value = 64
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {}

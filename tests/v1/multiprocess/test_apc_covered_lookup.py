@@ -158,6 +158,59 @@ def test_submit_sends_key_start_and_reports_whether_it_sent():
 
 
 @requires_vllm
+def test_pending_lookup_poll_does_not_build_submit_arguments():
+    """Polling a request with a pending lookup must not rebuild its arguments.
+
+    vLLM re-polls a waiting request every scheduler step; the submit is a
+    no-op while the lookup is pending, so building the O(prompt) token list
+    and config dict would be wasted work on the scheduler thread.
+    """
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    adapter = MagicMock()
+    adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
+    adapter.has_pending_lookup.return_value = False
+    adapter.maybe_submit_lookup_request.return_value = True
+    adapter.check_lookup_result.return_value = None
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {}
+    connector.scheduler_adapter = adapter
+    connector._reserve_last_token_for_lookup = False
+    connector._hit_alignment_tokens = CHUNK_SIZE
+    connector._connector_stats = MagicMock()
+    connector.lazy_offload = False
+
+    request = _FakeRequest(list(range(8 * CHUNK_SIZE)))
+    tracker = connector._get_or_create_request_tracker(request)
+    real_get_token_ids = tracker.get_token_ids
+    tracker.get_token_ids = MagicMock(side_effect=real_get_token_ids)  # type: ignore[method-assign]
+
+    # First poll submits and freezes the covered boundary.
+    assert connector.get_num_new_matched_tokens(request, 4 * CHUNK_SIZE) == (
+        None,
+        True,
+    )
+    assert adapter.maybe_submit_lookup_request.call_count == 1
+    assert tracker.get_token_ids.call_count == 1
+    assert tracker.apc_covered_tokens == 4 * CHUNK_SIZE
+
+    # Later polls: the lookup is now pending.
+    adapter.has_pending_lookup.return_value = True
+    for _ in range(3):
+        assert connector.get_num_new_matched_tokens(request, 4 * CHUNK_SIZE) == (
+            None,
+            True,
+        )
+
+    assert adapter.maybe_submit_lookup_request.call_count == 1
+    assert tracker.get_token_ids.call_count == 1
+    assert tracker.apc_covered_tokens == 4 * CHUNK_SIZE
+    assert adapter.check_lookup_result.call_count == 4
+
+
+@requires_vllm
 def test_covered_boundary_frozen_only_when_a_lookup_is_sent():
     """A no-op poll must not move ``apc_covered_tokens``.
 
@@ -172,7 +225,8 @@ def test_covered_boundary_frozen_only_when_a_lookup_is_sent():
 
     adapter = MagicMock()
     adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
-    # A lookup is already in flight, so the adapter sends nothing.
+    # A lookup is already in flight, so the connector does not submit.
+    adapter.has_pending_lookup.return_value = True
     adapter.maybe_submit_lookup_request.return_value = False
     adapter.check_lookup_result.return_value = None
 
@@ -211,6 +265,7 @@ def _shrink_connector(covered_chunks: int = 4):
 
     adapter = MagicMock()
     adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
+    adapter.has_pending_lookup.return_value = True
     adapter.maybe_submit_lookup_request.return_value = False
     adapter.check_lookup_result.return_value = 6 * CHUNK_SIZE
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
@@ -249,9 +304,9 @@ def test_shrink_goes_sticky_and_remembers_the_stale_locked_range():
     adapter.free_lookup_locks.assert_not_called()
     assert tracker.pending_free_ranges == [(4 * CHUNK_SIZE, 6 * CHUNK_SIZE)]
     adapter.cleanup_lookup_result.assert_called_once_with(request.request_id)
-    # The full re-lookup is submitted in the same step: once at the top of
-    # the poll, once after the shrink was detected.
-    assert adapter.maybe_submit_lookup_request.call_count == 2
+    # The poll skipped the submit (a lookup was pending); the full re-lookup
+    # is submitted in the same step, after the shrink was detected.
+    assert adapter.maybe_submit_lookup_request.call_count == 1
     assert "start" not in adapter.maybe_submit_lookup_request.call_args.kwargs
     # Sticky, so a second shrink cannot recur for this request.
     assert tracker.need_full_lookup is True

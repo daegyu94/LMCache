@@ -272,6 +272,18 @@ def test_blocking_status_none_defers_and_zero_is_cached(
     assert client.queries == ["r", "r"]
 
 
+def test_has_pending_lookup_tracks_submit_and_cleanup(
+    make_adapter: AdapterFactory,
+) -> None:
+    adapter, _ = make_adapter()
+    assert not adapter.has_pending_lookup("r")
+    adapter.maybe_submit_lookup_request("r", list(range(256)))
+    assert adapter.has_pending_lookup("r")
+    assert not adapter.has_pending_lookup("other")
+    adapter.cleanup_lookup_result("r")
+    assert not adapter.has_pending_lookup("r")
+
+
 def test_blocking_mode_preserves_nonblocking_lookup_ack(
     make_adapter: AdapterFactory,
 ) -> None:

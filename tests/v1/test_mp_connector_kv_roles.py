@@ -170,6 +170,7 @@ def lazy_offload(request: pytest.FixtureRequest) -> bool:
 def mock_io(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Stub transport, telemetry and GPU resources, keeping worker logic real."""
     scheduler = MagicMock(lmcache_tokens_per_chunk=4)
+    scheduler.has_pending_lookup.return_value = False
     scheduler.check_lookup_result.return_value = 0
     transfer = MagicMock()
     transfer.create_recorded_event.return_value = None

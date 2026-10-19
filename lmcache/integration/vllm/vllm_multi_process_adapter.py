@@ -907,6 +907,22 @@ class LMCacheMPSchedulerAdapter:
             server_url,
         )
 
+    def has_pending_lookup(self, request_id: str) -> bool:
+        """Whether a lookup for ``request_id`` is submitted and not cleaned up.
+
+        Lets the caller skip building ``maybe_submit_lookup_request``
+        arguments (token ids, request configs) that would be discarded,
+        since that method is a no-op while a lookup is pending.
+
+        Args:
+            request_id: The ID of the lookup request.
+
+        Returns:
+            True from a successful ``maybe_submit_lookup_request`` until
+            ``cleanup_lookup_result`` is called for ``request_id``.
+        """
+        return request_id in self._pending_lookups
+
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
         self,

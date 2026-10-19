@@ -1338,18 +1338,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
-        submitted = self.scheduler_adapter.maybe_submit_lookup_request(
-            request.request_id,
-            token_ids=tracker.get_token_ids(),
-            cache_salt=tracker.cache_salt,
-            # vLLM's prefix-cache hit, for the server's KV load policy.
-            request_configs={
-                **(tracker.request_configs or {}),
-                "lmcache.hint.engine_computed_tokens": num_computed_tokens,
-            },
-            reserve_last_token=self._reserve_last_token_for_lookup,
-            start=lookup_start,
-        )
+        # vLLM re-polls every scheduler step; while a lookup is pending the
+        # submit is a no-op, so skip building its O(prompt) arguments.
+        submitted = False
+        if not self.scheduler_adapter.has_pending_lookup(request.request_id):
+            submitted = self.scheduler_adapter.maybe_submit_lookup_request(
+                request.request_id,
+                token_ids=tracker.get_token_ids(),
+                cache_salt=tracker.cache_salt,
+                # vLLM's prefix-cache hit, for the server's KV load policy.
+                request_configs={
+                    **(tracker.request_configs or {}),
+                    "lmcache.hint.engine_computed_tokens": num_computed_tokens,
+                },
+                reserve_last_token=self._reserve_last_token_for_lookup,
+                start=lookup_start,
+            )
         # Freeze only on a real submit: a no-op poll would re-freeze a
         # boundary the in-flight lookup never used.
         if submitted:
