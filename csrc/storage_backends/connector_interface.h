@@ -66,8 +66,10 @@ class IStorageConnector {
   /*
   submit a batch EXISTS operation
 
-  checks existence of multiple keys in parallel. work is automatically divided
-  among worker threads (tiling). returns a single future_id for the entire
+  checks existence of multiple keys. by default work is divided among worker
+  threads (tiling); connectors that can answer from local memory may instead
+  answer on the calling thread, in which case the completion is already
+  published when this call returns. returns a single future_id for the entire
   batch.
 
   args:

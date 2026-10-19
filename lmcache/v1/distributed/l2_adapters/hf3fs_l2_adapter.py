@@ -56,12 +56,15 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
     - numa_id: NUMA node ID (default -1 = current node).
     - iov_size: Per-thread I/O buffer in bytes (default 200MB, range [100MB, 2GB]).
     - enable_key_buffer (bool): Enable in-memory key buffer for accelerated
-        exists lookups. When enabled, do_batch_exists() uses a pre-scanned
-        hash set instead of filesystem calls. Default: True.
+        exists lookups. When enabled, lookups use a pre-scanned hash set
+        instead of filesystem calls and are answered at submit time, without
+        queueing behind store/load I/O. Default: True.
     - per_op_workers: Optional dict mapping lane keys
                 (``"lookup"``, ``"retrieve"``, ``"store"``,
                 ``"delete"``) to dedicated worker counts.  Ops
                 not mentioned use the shared ``num_workers`` pool.
+                The ``"lookup"`` lane only matters when
+                ``enable_key_buffer`` is False.
     """
 
     def __init__(

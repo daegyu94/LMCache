@@ -156,6 +156,8 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
   bool do_single_exists(WorkerHf3fsConn& conn, const std::string& key) override;
   bool do_single_delete(WorkerHf3fsConn& conn, const std::string& key) override;
   void do_batch_exists(WorkerHf3fsConn& conn, const Request& req) override;
+  bool try_exists_inline(const std::vector<std::string>& keys,
+                         std::vector<uint8_t>& results) override;
   void shutdown_connections() override;
 
  private:

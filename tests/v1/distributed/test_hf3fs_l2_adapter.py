@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 import os
 import shutil
+import threading
 import time
 import uuid
 
@@ -807,6 +808,121 @@ class TestHf3fsNativeConnector:
         assert len(completions) == 1
         assert completions[0][3] == [True]
 
+    def test_inline_exists_bitmap_and_future_id(self, hf3fs_native_client):
+        """Key-buffer exists is answered at submit time with exact layout."""
+        client = hf3fs_native_client[0]
+        stored = [_object_key_to_string(create_object_key(i)) for i in (400, 402)]
+        missing = [_object_key_to_string(create_object_key(i)) for i in (401, 403)]
+        client.submit_batch_set(stored, [memoryview(b"x" * 512)] * len(stored))
+        assert _wait_for_completions(client)[0][1]
+
+        query = [stored[0], missing[0], stored[1], missing[1]]
+        fid = client.submit_batch_exists(query)
+        # No waiting: the completion must already be queued when submit returns.
+        completions = client.drain_completions()
+        assert [c[0] for c in completions] == [fid]
+        _, ok, error, result = completions[0]
+        assert ok and not error
+        assert result == [True, False, True, False]
+
+        fid2 = client.submit_batch_exists(query)
+        assert fid2 != fid
+        assert [c[0] for c in client.drain_completions()] == [fid2]
+
+    def test_inline_exists_not_blocked_by_store_backlog(self, hf3fs_native_client):
+        """Exists completes while earlier large stores are still queued."""
+        client = hf3fs_native_client[0]
+        seed = _object_key_to_string(create_object_key(500))
+        client.submit_batch_set([seed], [memoryview(b"s" * 512)])
+        assert _wait_for_completions(client)[0][1]
+
+        payload = memoryview(bytes(8 * 1024 * 1024))
+        store_keys = [
+            _object_key_to_string(create_object_key(510 + i)) for i in range(32)
+        ]
+        store_fid = client.submit_batch_set(store_keys, [payload] * len(store_keys))
+
+        exists_fid = client.submit_batch_exists([seed, store_keys[-1]])
+        completions = client.drain_completions()
+        by_id = {c[0]: c for c in completions}
+        assert exists_fid in by_id
+        assert store_fid not in by_id, "store finished before exists; backlog too small"
+        assert by_id[exists_fid][3] == [True, False]
+
+        # Drain the store so teardown does not race in-flight I/O.
+        deadline = time.time() + 60
+        done = store_fid in by_id
+        while not done and time.time() < deadline:
+            done = any(c[0] == store_fid for c in _wait_for_completions(client, 60))
+        assert done
+
+        client.submit_batch_exists([store_keys[-1]])
+        assert _wait_for_completions(client)[0][3] == [True]
+
+    def test_inline_exists_racing_close(self, hf3fs_native_client):
+        """Inline exists submitted while the client closes never crashes."""
+        _, mount_point, base_path = hf3fs_native_client
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        client = LMCacheHf3fsClient(
+            mount_point=mount_point,
+            base_paths=base_path,
+            num_workers=2,
+            ior_entries=128,
+            io_depth=0,
+            numa_id=-1,
+            iov_size=209715200,
+            time_out=200,
+            enable_key_buffer=True,
+        )
+        keys = [_object_key_to_string(create_object_key(1000 + i)) for i in range(8)]
+        stop = threading.Event()
+
+        def _hammer() -> None:
+            while not stop.is_set():
+                try:
+                    client.submit_batch_exists(keys)
+                except Exception:  # noqa: BLE001 - post-close errors are fine
+                    return
+
+        threads = [threading.Thread(target=_hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        client.close()
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+            assert not t.is_alive()
+
+    def test_exists_without_key_buffer_uses_filesystem(self, hf3fs_native_client):
+        """With the key buffer disabled exists still reads the filesystem."""
+        _, mount_point, base_path = hf3fs_native_client
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        client = LMCacheHf3fsClient(
+            mount_point=mount_point,
+            base_paths=base_path,
+            num_workers=2,
+            ior_entries=128,
+            io_depth=0,
+            numa_id=-1,
+            iov_size=209715200,
+            time_out=200,
+            enable_key_buffer=False,
+        )
+        try:
+            key = _object_key_to_string(create_object_key(600))
+            other = _object_key_to_string(create_object_key(601))
+            client.submit_batch_set([key], [memoryview(b"y" * 512)])
+            assert _wait_for_completions(client)[0][1]
+            client.submit_batch_exists([key, other])
+            assert _wait_for_completions(client)[0][3] == [True, False]
+        finally:
+            client.close()
+
     def test_delete_key(self, hf3fs_native_client):
         """Test write then delete, verify key no longer exists."""
         client = hf3fs_native_client[0]
@@ -1025,6 +1141,54 @@ class TestHf3fsL2AdapterIntegration:
         _wait_for_lookup(hf3fs_l2_adapter)
         result = hf3fs_l2_adapter.query_lookup_and_lock_result(lookup_task_id)
         assert result is not None
+
+    def test_lookup_during_concurrent_stores(self, hf3fs_l2_adapter):
+        """Inline lookups resolve correctly while stores are in flight."""
+        stored = [create_object_key(700 + i) for i in range(4)]
+        missing = [create_object_key(800 + i) for i in range(4)]
+        store_id = hf3fs_l2_adapter.submit_store_task(
+            stored, [create_memory_obj(1024) for _ in stored]
+        )
+        assert store_id in _wait_for_store(hf3fs_l2_adapter)
+
+        big_keys = [create_object_key(900 + i) for i in range(16)]
+        big_objs = [create_memory_obj(2 * 1024 * 1024) for _ in big_keys]
+        big_id = hf3fs_l2_adapter.submit_store_task(big_keys, big_objs)
+
+        query = [stored[0], missing[0], stored[1], missing[1]]
+        task_ids = []
+
+        def _submit() -> None:
+            for _ in range(50):
+                task_ids.append(
+                    hf3fs_l2_adapter.submit_lookup_and_lock_task(
+                        query, {0: _EMPTY_LAYOUT}
+                    )
+                )
+
+        threads = [threading.Thread(target=_submit) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        pending = set(task_ids)
+        deadline = time.time() + 30
+        while pending and time.time() < deadline:
+            for task_id in list(pending):
+                bitmap = hf3fs_l2_adapter.query_lookup_and_lock_result(task_id)
+                if bitmap is None:
+                    continue
+                pending.discard(task_id)
+                assert [bitmap.test(i) for i in range(len(query))] == [
+                    True,
+                    False,
+                    True,
+                    False,
+                ]
+            time.sleep(0.01)
+        assert not pending
+        assert big_id in _wait_for_store(hf3fs_l2_adapter, timeout=60)
 
     def test_load_data(self, hf3fs_l2_adapter):
         """Test load operation."""

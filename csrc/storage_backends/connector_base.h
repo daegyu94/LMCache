@@ -127,6 +127,21 @@ class ConnectorBase : public IStorageConnector {
       throw std::runtime_error("keys list is empty");
     }
 
+    // Fast path: connectors that can answer from local memory skip the worker
+    // queue so lookups do not wait behind queued get/set I/O.
+    std::vector<uint8_t> inline_results;
+    if (!is_stopping() && try_exists_inline(keys, inline_results)) {
+      Completion comp;
+      comp.future_id = next_future_id_.fetch_add(1, std::memory_order_relaxed);
+      comp.ok = true;
+      comp.result_bytes = std::move(inline_results);
+      uint64_t inline_future_id = comp.future_id;
+      if (push_completion_unless_closed(std::move(comp))) {
+        return inline_future_id;
+      }
+      // Closed concurrently: fall through to the regular (dead) queue path.
+    }
+
     size_t num_items = keys.size();
     auto [batch_future_id, batch_state, num_tiles] =
         prepare_batch_operation(num_items, Op::BATCH_TILE_EXISTS);
@@ -244,6 +259,8 @@ class ConnectorBase : public IStorageConnector {
 
     // Close wakeup fd
     if (notifier_) {
+      std::lock_guard<std::mutex> lk(comp_mu_);
+      notifier_closed_ = true;
       notifier_->close();
     }
 
@@ -335,6 +352,24 @@ class ConnectorBase : public IStorageConnector {
       bool exists = do_single_exists(conn, req.keys[i]);
       req.batch->per_key_results[req.start_idx + i] = exists ? 1 : 0;
     }
+  }
+  // Optional hook: answer a batch exists on the submitting thread without
+  // queueing. Return true after filling results with one 0/1 byte per key (same
+  // layout as BatchState::per_key_results); return false to use the normal
+  // worker path. Must not wait on I/O, must be thread-safe and must not throw.
+  // The default declines.
+  //
+  // Contract: when the hook accepts, the completion is published (and the
+  // event fd signaled) BEFORE submit_batch_exists returns its future id.
+  // Consumers must therefore register the id atomically with respect to their
+  // drain loop (NativeConnectorL2Adapter does so by holding its lock across
+  // submit and registration). ConnectorClientBase::batch_exists_sync does not
+  // and is unsafe with connectors that override this hook.
+  virtual bool try_exists_inline(const std::vector<std::string>& keys,
+                                 std::vector<uint8_t>& results) {
+    (void)keys;
+    (void)results;
+    return false;
   }
   virtual void do_batch_delete(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
@@ -459,6 +494,19 @@ class ConnectorBase : public IStorageConnector {
       requests_.push(std::move(req));
     }
     req_cv_.notify_one();
+  }
+
+  // Publish and signal under comp_mu_ unless close() already closed the
+  // notifier. close() closes the notifier under the same mutex, so the notify
+  // can never hit a closed (or reused) fd.
+  bool push_completion_unless_closed(Completion&& c) {
+    std::lock_guard<std::mutex> lk(comp_mu_);
+    if (notifier_closed_) {
+      return false;
+    }
+    completions_.push(std::move(c));
+    signal_eventfd_();
+    return true;
   }
 
   void push_completion(Completion&& c) {
@@ -659,6 +707,7 @@ class ConnectorBase : public IStorageConnector {
   // completion queue (CQ)
   std::mutex comp_mu_;
   std::queue<Completion> completions_;
+  bool notifier_closed_ = false;  // guarded by comp_mu_
 
   std::vector<std::thread> workers_;
   // Populated only during start_workers() (single-threaded construction).

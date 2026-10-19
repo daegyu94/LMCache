@@ -149,6 +149,9 @@ What `ConnectorBase` gives you for free:
 - Automatic tiling: batch operations are split across workers
 - eventfd signaling on completion (kernel wakes Python)
 - Graceful shutdown (stop flag, drain, join)
+- Optional: override `try_exists_inline()` to answer `submit_batch_exists`
+  from local memory on the calling thread (the completion is published
+  before the future id is returned; see `connector_base.h`)
 
 ### Step 2: Pybind module
 

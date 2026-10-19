@@ -66,7 +66,9 @@ The **BUILD_HF3FS** environment variable controls compilation:
 - ``per_op_workers`` (``dict[str, int]``, optional): A dict mapping lane keys
   to dedicated worker thread counts.  Supported keys:
 
-  - ``"lookup"`` — threads for ``EXISTS`` operations.
+  - ``"lookup"`` — threads for ``EXISTS`` operations. Only used when
+    ``enable_key_buffer`` is ``false``; with the key buffer enabled, lookups
+    are answered at submit time and never reach this lane.
   - ``"retrieve"`` — threads for ``GET``/load operations.
   - ``"store"`` — threads for ``SET``/put operations.
   - ``"delete"`` — threads for ``DELETE`` operations.
@@ -90,7 +92,10 @@ The **BUILD_HF3FS** environment variable controls compilation:
 - ``enable_key_buffer`` (bool, default ``True``): Enable the in-memory
   key buffer for accelerated exists lookups.  When enabled, exist lookups
   respond from a hash set instead of issuing remote 3FS metadata calls.
-  This dramatically reduces lookup latency.
+  This dramatically reduces lookup latency, and lookups are answered at
+  submit time without queueing behind store/load I/O. They reflect the key
+  buffer at that moment: an in-flight store is an immediate miss, while
+  completed stores are always visible.
 
 **Configuration Example**
 
@@ -107,7 +112,6 @@ The **BUILD_HF3FS** environment variable controls compilation:
       "enable_key_buffer": true,
       "num_workers": 4,
       "per_op_workers": {
-        "lookup": 2,
         "retrieve": 16,
         "store": 4
       }

@@ -722,6 +722,26 @@ void Hf3fsConnector::do_batch_exists(WorkerHf3fsConn& conn,
 }
 
 /**
+ * Answer a batch exists inline from the key buffer.
+ *
+ * The lookup is a pure in-memory sharded-hash-set read, so it is done on the
+ * submitting thread instead of queueing behind multi-MB get/set tasks.
+ * Declines when the key buffer is disabled (filesystem lookups must stay on
+ * the workers).
+ */
+bool Hf3fsConnector::try_exists_inline(const std::vector<std::string>& keys,
+                                       std::vector<uint8_t>& results) {
+  if (!buffer_enabled_) {
+    return false;
+  }
+  results.resize(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = buffer_contains_(keys[i]) ? 1 : 0;
+  }
+  return true;
+}
+
+/**
  * Shutdown all connections.
  *
  * Worker destructors handle cleanup automatically,
