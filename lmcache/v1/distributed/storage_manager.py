@@ -33,6 +33,7 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError, strerror
 from lmcache.v1.distributed.internal_api import (
+    L1KeyState,
     L1ManagerInterface,
     L1MemoryDesc,
     L1OperationResult,
@@ -702,6 +703,41 @@ class StorageManager:
             adapters = list(self._l2_adapters.values())
         for adapter in adapters:
             adapter.submit_touch(keys)
+
+    def has_pending_write(self, chunk_keys: list[list[ObjectKey]]) -> bool:
+        """Whether a prefix lookup would stop at a chunk still being stored.
+
+        A key counts as resident if any L1 holds it, else staged if any L1
+        holds a live write reservation for it. Read-only: no locks, no
+        recency change.
+
+        Args:
+            chunk_keys: ``chunk_keys[i]`` holds every key (all object groups
+                and kv ranks) of chunk ``i``, in chunk order.
+
+        Returns:
+            True iff the first chunk that is not fully resident has at least
+            one staged key. False when every chunk is resident, or the first
+            gap has no writer (nothing to wait for).
+        """
+        flat = [key for keys in chunk_keys for key in keys]
+        if not flat:
+            return False
+        per_manager = [m.probe_keys(flat) for m in self._l1_managers_by_id.values()]
+        offset = 0
+        for keys in chunk_keys:
+            staged = False
+            resident = 0
+            for i in range(offset, offset + len(keys)):
+                states = [s[i] for s in per_manager]
+                if L1KeyState.RESIDENT in states:
+                    resident += 1
+                elif L1KeyState.STAGED in states:
+                    staged = True
+            offset += len(keys)
+            if resident < len(keys):
+                return staged
+        return False
 
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False

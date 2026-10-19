@@ -25,6 +25,19 @@ if TYPE_CHECKING:
 L1OperationResult = tuple[L1Error, "MemoryObj | None"]
 
 
+class L1KeyState(enum.Enum):
+    """What a read-only L1 probe reports for one key."""
+
+    RESIDENT = enum.auto()
+    """ A committed object exists; readers can lock it. """
+
+    STAGED = enum.auto()
+    """ No resident object, but a writer holds a live write reservation. """
+
+    ABSENT = enum.auto()
+    """ Neither resident nor staged (an expired reservation counts as absent). """
+
+
 @dataclass(frozen=True)
 class L1MemoryDesc:
     """Describe the contiguous L1 memory arena exposed to external backends.
@@ -320,6 +333,10 @@ class L1ManagerInterface(Protocol):
 
     def touch_keys(self, keys: list[ObjectKey]) -> None:
         """Record an access to the keys; takes no lock."""
+        ...
+
+    def probe_keys(self, keys: list[ObjectKey]) -> list[L1KeyState]:
+        """Report each key's state; takes no object read or write lock."""
         ...
 
     def clear(self, force: bool = False) -> None:

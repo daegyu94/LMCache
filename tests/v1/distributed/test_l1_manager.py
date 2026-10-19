@@ -65,6 +65,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.eviction import L1EvictionPolicy
 from lmcache.v1.distributed.eviction_policy.lru import LRUEvictionPolicy
+from lmcache.v1.distributed.internal_api import L1KeyState
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
 try:
@@ -2455,4 +2456,63 @@ class TestStagingAccounting:
         one_copy = manager.get_object_state(keys[0]).memory_obj.get_size()
         assert used == one_copy * len(keys)
 
+        manager.close()
+
+
+# =============================================================================
+# Tests for L1Manager.probe_keys()
+# =============================================================================
+
+
+class TestProbeKeys:
+    """probe_keys() reports resident / staged (live write lock) / absent."""
+
+    def test_states_follow_the_write_lifecycle(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        assert manager.probe_keys([key]) == [L1KeyState.ABSENT]
+
+        manager.reserve_write([key], [False], basic_layout)
+        assert manager.probe_keys([key]) == [L1KeyState.STAGED]
+
+        manager.finish_write([key])
+        assert manager.probe_keys([key]) == [L1KeyState.RESIDENT]
+        manager.close()
+
+    def test_preserves_order_for_mixed_keys(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        resident, staged, absent = (make_object_key(i) for i in (1, 2, 3))
+        write_ready(manager, [resident], basic_layout)
+        manager.reserve_write([staged], [False], basic_layout)
+
+        assert manager.probe_keys([absent, staged, resident]) == [
+            L1KeyState.ABSENT,
+            L1KeyState.STAGED,
+            L1KeyState.RESIDENT,
+        ]
+        manager.close()
+
+    def test_expired_reservation_is_absent(
+        self, short_write_ttl_l1_config, basic_layout
+    ):
+        manager = L1Manager(short_write_ttl_l1_config)
+        key = make_object_key(1)
+        manager.reserve_write([key], [False], basic_layout)
+        time.sleep(1.2)
+
+        assert manager.probe_keys([key]) == [L1KeyState.ABSENT]
+        manager.close()
+
+    def test_has_no_side_effects(self, basic_l1_config, basic_layout):
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(1)
+        write_ready(manager, [key], basic_layout)
+        staged = make_object_key(2)
+        manager.reserve_write([staged], [False], basic_layout)
+
+        manager.probe_keys([key, staged])
+
+        # No read lock was taken, and the staged key is still not readable.
+        assert manager.get_object_state(key).read_lock.is_locked() is False
+        assert manager.reserve_read([staged])[staged][0] == L1Error.KEY_NOT_EXIST
         manager.close()

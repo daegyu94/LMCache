@@ -429,3 +429,20 @@ def test_kv_load_policy_default_and_flag():
         _parse_mp(["--kv-load-policy", "my_pkg.policies:Custom"]).kv_load_policy
         == "my_pkg.policies:Custom"
     )
+
+
+def test_lookup_pending_write_wait_ms_default_and_flag():
+    """The pending-write hold is off by default and takes milliseconds."""
+    assert _parse_mp([]).lookup_pending_write_wait_ms == 0
+    assert (
+        _parse_mp(
+            ["--lookup-pending-write-wait-ms", "200"]
+        ).lookup_pending_write_wait_ms
+        == 200
+    )
+
+
+def test_negative_lookup_pending_write_wait_ms_rejected():
+    """A negative hold is a configuration error, not a silent 'off'."""
+    with pytest.raises(ValueError, match="pending-write wait"):
+        MPServerConfig(lookup_pending_write_wait_ms=-1)

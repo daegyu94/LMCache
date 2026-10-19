@@ -121,6 +121,21 @@ class _PrefetchJob:
     early_exit_reason: str = ""
 
 
+@dataclass
+class _DeferredLookup:
+    """A lookup held back because its first missing chunk is being stored.
+
+    Holds no L1 locks: nothing has been submitted yet.
+    """
+
+    spec: PrefetchTaskSpec
+    # ``chunk_keys[i]``: every key (object groups x kv ranks) of chunk i.
+    chunk_keys: list[list[ObjectKey]]
+    # The job to register once submitted; ``handle`` is a placeholder.
+    job: _PrefetchJob
+    deadline: float
+
+
 class LookupModule(DiscoverableModule):
     """Handles lookup, prefetch polling, lock release, and session lifecycle.
 
@@ -134,9 +149,26 @@ class LookupModule(DiscoverableModule):
             chunk size.
         load_policy: Decides per lookup whether to serve the request or let
             the engine recompute it. Defaults to ``DefaultKVLoadPolicy``.
+        pending_write_wait_ms: When positive, a lookup whose first
+            non-resident chunk has an in-flight L1 write reservation
+            (store not yet committed) is held, reporting "in progress" from
+            ``query_prefetch_status``, until the store commits or this many
+            milliseconds pass. 0 disables the hold. The hold needs no lock
+            and ends on its own: commits come from transfer completion
+            callbacks, not from polling, and a dead writer is bounded by the
+            deadline. Any in-flight L1 write reservation counts, including
+            another request's L2->L1 prefetch load, not only stores.
+        max_deferred_lookups: Most lookups held at once; beyond it a lookup
+            is submitted without being held.
     """
 
     module_name = "lookup"
+
+    #: Poll period of the blocking ``wait_prefetch_status`` while held.
+    _DEFERRED_POLL_S = 0.002
+    #: A held lookup nobody polls for this long past its deadline is dropped
+    #: when the cap is hit.
+    _DEFERRED_ABANDONED_S = 30.0
 
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
@@ -147,15 +179,25 @@ class LookupModule(DiscoverableModule):
                 build_ctx.mp_config.kv_load_policy,
                 build_ctx.mp_config.runtime_plugin_config.extra_config,
             ),
+            build_ctx.mp_config.lookup_pending_write_wait_ms,
         )
 
     def __init__(
         self,
         ctx: MPCacheServerContext,
         load_policy: KVLoadPolicy = _DEFAULT_LOAD_POLICY,
+        pending_write_wait_ms: int = 0,
+        max_deferred_lookups: int = 256,
     ) -> None:
         self._ctx = ctx
         self._load_policy = load_policy
+        self._pending_write_wait_s = pending_write_wait_ms / 1000.0
+        self._max_deferred_lookups = max_deferred_lookups
+        # Lookups held until a store commits, by request_id. Handlers run on
+        # a thread pool, so every access takes ``_deferred_lock`` (acquired
+        # before ``_prefetch_job_lock`` when both are needed).
+        self._deferred: dict[str, _DeferredLookup] = {}
+        self._deferred_lock = threading.Lock()
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
         self._setup_metrics()
@@ -195,12 +237,18 @@ class LookupModule(DiscoverableModule):
         and registers the job under ``key.request_id`` for later polling
         via query_prefetch_status. When the KV load policy declines the
         request, no prefetch is submitted and the job reports zero hits.
+        With ``pending_write_wait_ms`` > 0 and the first non-resident chunk
+        staged in L1, the lookup instead records a deferred job and submits
+        nothing yet; ``query_prefetch_status`` / ``wait_prefetch_status``
+        submit it once the write commits or the wait expires.
 
         Args:
             key: Cache key with request_id embedded.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
         model_name, world_size = key.model_name, key.world_size
+        if self._pending_write_wait_s > 0:
+            self._drop_deferred(key.request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_START,
@@ -349,6 +397,10 @@ class LookupModule(DiscoverableModule):
             ),
             num_kv_readers=num_kv_readers,
         )
+        if self._pending_write_wait_s > 0 and self._defer_if_staged(
+            spec, key, requested_tokens, attn_desc, start_chunk
+        ):
+            return
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
             external_request_id=key.request_id,
@@ -375,8 +427,10 @@ class LookupModule(DiscoverableModule):
         """Poll the status of a prefetch job by request_id.
 
         Returns the chunk count when the prefetch is complete, or None
-        if it is still in progress.  The job entry is automatically
-        removed once a non-None result is returned (exactly-once
+        if it is still in progress. A lookup held for an in-flight write
+        (``pending_write_wait_ms``) reports None; this call submits its
+        prefetch once the write commits or the wait expires. The job entry is
+        automatically removed once a non-None result is returned (exactly-once
         semantics).
 
         Args:
@@ -387,6 +441,8 @@ class LookupModule(DiscoverableModule):
             0 if the request_id is unknown (already completed and consumed,
             or invalid).
         """
+        if self._pending_write_wait_s > 0 and not self._resolve_deferred(request_id):
+            return None
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
         if job is None:
@@ -408,8 +464,11 @@ class LookupModule(DiscoverableModule):
 
         Like query_prefetch_status, but waits for the daemon to publish the
         result instead of returning None while the prefetch is still in
-        progress, so the caller does not have to busy-poll. The job entry is
-        removed once a non-None result is returned (exactly-once semantics).
+        progress, so the caller does not have to busy-poll. A held lookup
+        (``pending_write_wait_ms``) is waited on, polling the write state,
+        within ``timeout`` before its prefetch is submitted and awaited. The
+        job entry is removed once a non-None result is returned
+        (exactly-once semantics).
 
         Args:
             request_id: The external request ID passed in the lookup key.
@@ -419,6 +478,14 @@ class LookupModule(DiscoverableModule):
             Chunk count (int) when done, None if the wait timed out, 0 if the
             request_id is unknown (already completed and consumed, or invalid).
         """
+        if self._pending_write_wait_s > 0 and not self._resolve_deferred(request_id):
+            wait_deadline = time.monotonic() + timeout
+            while not self._resolve_deferred(request_id):
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(self._DEFERRED_POLL_S, remaining))
+            timeout = max(0.0, wait_deadline - time.monotonic())
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
         if job is None:
@@ -468,6 +535,9 @@ class LookupModule(DiscoverableModule):
                 exactly the keys it locked (sliding-window groups translate
                 from the hit).
         """
+        # A held lookup submitted nothing, so there is nothing to release.
+        if self._pending_write_wait_s > 0:
+            self._drop_deferred(key.request_id)
         if key.start >= key.end and not extra_ranges:
             return
 
@@ -547,6 +617,8 @@ class LookupModule(DiscoverableModule):
         Args:
             request_id: The request ID whose session should be removed.
         """
+        if self._pending_write_wait_s > 0:
+            self._drop_deferred(request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_VLLM_END_SESSION,
@@ -605,6 +677,106 @@ class LookupModule(DiscoverableModule):
         ).num_object_groups
         per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
         return [obj_key for group_keys in per_group for obj_key in group_keys]
+
+    def _defer_if_staged(
+        self,
+        spec: PrefetchTaskSpec,
+        key: IPCCacheServerKey,
+        requested_tokens: int,
+        attn_desc: AttnWindowDesc,
+        start_chunk: int,
+    ) -> bool:
+        """Hold the lookup if its first non-resident chunk is being written.
+
+        Args:
+            spec: The prefetch task to submit later.
+            key: The lookup's cache key.
+            requested_tokens: Hit-rate denominator tokens of the lookup.
+            attn_desc: The request's attention window descriptor.
+            start_chunk: First chunk of the looked-up range.
+
+        Returns:
+            True if the lookup was recorded as deferred (the caller must not
+            submit it); False if it should be submitted now (nothing staged,
+            or too many lookups are already held).
+        """
+        chunk_keys = [
+            [row.keys[i] for row in spec.key_groups] for i in range(spec.group_size)
+        ]
+        if not self._ctx.storage_manager.has_pending_write(chunk_keys):
+            return False
+        now = time.monotonic()
+        # Placeholder handle: replaced by the real one when submitted.
+        job = _PrefetchJob(
+            handle=PrefetchHandle(
+                prefetch_request_id=-1,
+                external_request_id=key.request_id,
+                total_requested_keys=0,
+                submit_time=now,
+            ),
+            row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
+            request_id=key.request_id,
+            requested_tokens=requested_tokens,
+            num_object_groups=attn_desc.num_object_groups,
+            attn_desc=attn_desc,
+            start_chunk=start_chunk,
+            model_name=key.model_name,
+            cache_salt=key.cache_salt,
+        )
+        with self._deferred_lock:
+            if len(self._deferred) >= self._max_deferred_lookups:
+                # Drop entries whose poller is gone, else they pin the cap.
+                for rid in [
+                    r
+                    for r, d in self._deferred.items()
+                    if now > d.deadline + self._DEFERRED_ABANDONED_S
+                ]:
+                    del self._deferred[rid]
+            if len(self._deferred) >= self._max_deferred_lookups:
+                return False
+            self._deferred[job.request_id] = _DeferredLookup(
+                spec, chunk_keys, job, now + self._pending_write_wait_s
+            )
+        return True
+
+    def _drop_deferred(self, request_id: str) -> None:
+        """Forget a held lookup, if any (it holds no locks)."""
+        with self._deferred_lock:
+            self._deferred.pop(request_id, None)
+
+    def _resolve_deferred(self, request_id: str) -> bool:
+        """Submit a held lookup once its store committed or its wait expired.
+
+        Returns:
+            True if the request has no held lookup (never deferred, or just
+            submitted); False while it is still held.
+        """
+        with self._deferred_lock:
+            deferred = self._deferred.get(request_id)
+        if deferred is None:
+            return True
+        expired = time.monotonic() >= deferred.deadline
+        if not expired and self._ctx.storage_manager.has_pending_write(
+            deferred.chunk_keys
+        ):
+            return False
+        with self._deferred_lock:
+            # Another poller may have submitted or dropped it meanwhile.
+            if self._deferred.get(request_id) is not deferred:
+                return True
+            if expired:
+                logger.debug(
+                    "Lookup %s: waited %.0f ms for an in-flight write; looking up now",
+                    request_id,
+                    self._pending_write_wait_s * 1000,
+                )
+            del self._deferred[request_id]
+            handle = self._ctx.storage_manager.submit_prefetch_task(
+                deferred.spec,
+                external_request_id=request_id,
+            )
+            self._register_prefetch_job(replace(deferred.job, handle=handle))
+        return True
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:

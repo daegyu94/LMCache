@@ -17,6 +17,7 @@ from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKe
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
+    L1KeyState,
     L1ManagerInterface,
     L1ManagerListener,
     L1ObjectMeta,
@@ -333,6 +334,35 @@ class L1Manager(L1ManagerInterface):
 
         self._report_read_reserved(successful_keys)
         return ret
+
+    @l1_mgr_synchronized
+    def probe_keys(self, keys: list[ObjectKey]) -> list[L1KeyState]:
+        """Report whether each key is resident, staged, or absent.
+
+        Read-only: takes no read or write lock, touches no recency, and
+        emits no events, so it can be polled freely.
+
+        Args:
+            keys: The object keys to probe.
+
+        Returns:
+            One state per key, in order. ``STAGED`` means some writer holds a
+            live write reservation and no object is resident yet; a key whose
+            reservations all expired is ``ABSENT``.
+        """
+        states: list[L1KeyState] = []
+        for key in keys:
+            if key in self._objects:
+                states.append(L1KeyState.RESIDENT)
+                continue
+            per_tag = self._staging.get(key, None)
+            if per_tag is not None and any(
+                staged.write_lock.is_locked() for staged in per_tag.values()
+            ):
+                states.append(L1KeyState.STAGED)
+            else:
+                states.append(L1KeyState.ABSENT)
+        return states
 
     @l1_mgr_synchronized
     def unsafe_read(

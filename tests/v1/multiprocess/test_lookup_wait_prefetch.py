@@ -47,6 +47,7 @@ def _make_module(ctx):
     module._ctx = ctx
     module._prefetch_jobs = {}
     module._prefetch_job_lock = threading.Lock()
+    module._pending_write_wait_s = 0.0
     return module
 
 

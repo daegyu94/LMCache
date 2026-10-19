@@ -144,6 +144,12 @@ class MPServerConfig:
     ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass. The
     policy is constructed with ``runtime_plugin_config.extra_config``."""
 
+    lookup_pending_write_wait_ms: int = 0
+    """Opt-in. Milliseconds a lookup may be held (reported as still in
+    progress) while its first non-resident chunk has an in-flight L1 write
+    reservation (a store not yet committed, or another request's L2->L1
+    prefetch load). 0 disables the hold; must not be negative."""
+
     worker_registration_grace_seconds: float = 3600.0
     """Silence budget (seconds) for a worker that registered but has never
     sent a PING (model warmup, or death before its first request). Must be
@@ -165,14 +171,19 @@ class MPServerConfig:
 
         Raises:
             ValueError: If the chunk size is not positive, a timeout is
-                non-finite, the reap timeout is negative or a non-zero value
-                below the 30 s floor, or the registration grace is below the
-                reap timeout.
+                non-finite, the lookup pending-write wait is negative, the
+                reap timeout is negative or a non-zero value below the 30 s
+                floor, or the registration grace is below the reap timeout.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
         if self.chunk_size < 1:
             raise ValueError(f"chunk size must be positive; got {self.chunk_size}")
+        if self.lookup_pending_write_wait_ms < 0:
+            raise ValueError(
+                "lookup pending-write wait must be >= 0 ms; "
+                f"got {self.lookup_pending_write_wait_ms}"
+            )
         if self.grpc_server_workers < 1:
             raise ValueError(
                 f"grpc server workers must be >= 1; got {self.grpc_server_workers}"
@@ -553,6 +564,16 @@ def add_mp_server_args(
         "custom KVLoadPolicy, constructed with --runtime-plugin-config.",
     )
     mp_group.add_argument(
+        "--lookup-pending-write-wait-ms",
+        type=int,
+        default=0,
+        help="Hold a lookup for up to this many ms while its first "
+        "non-resident chunk has an in-flight L1 write reservation (a store "
+        "not yet committed, or another request's L2->L1 prefetch load), so "
+        "the next turn of a multi-turn request hits instead of recomputing. "
+        "0 (default) disables the hold.",
+    )
+    mp_group.add_argument(
         "--worker-registration-grace-seconds",
         type=float,
         default=3600.0,
@@ -653,6 +674,7 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         session_ttl_seconds=args.session_ttl_seconds,
         kv_load_policy=args.kv_load_policy,
+        lookup_pending_write_wait_ms=args.lookup_pending_write_wait_ms,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         kv_event_log_size=args.kv_event_log_size,
         server_modules=parse_server_module_specs(args.server_module or []),

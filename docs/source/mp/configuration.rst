@@ -216,6 +216,14 @@ Source: ``lmcache/v1/multiprocess/config.py``
        ``package.module:ClassName`` value loads a custom
        ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass from
        the server's environment, constructed with ``--runtime-plugin-config``.
+   * - ``--lookup-pending-write-wait-ms``
+     - ``0``
+     - Opt-in. Hold a lookup for up to this many milliseconds while its first
+       non-resident chunk has an in-flight L1 write reservation (a store not
+       yet committed, or another request's L2-to-L1 prefetch load), so a follow-up turn hits instead of recomputing the
+       prefix. The lookup reports "in progress" and the engine re-polls; when
+       the store commits, or the wait expires, it proceeds normally. ``0``
+       disables the hold. See ``docs/design/v1/multiprocess/modules/lookup_pending_write.md``.
    * - ``--enable-segmented-prefix``
      - ``False``
      - CacheBlend (``--engine-type blend``) only: on a mid-prefix L2 retrieve
