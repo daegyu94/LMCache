@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Maximum number of keys passed to a single ``L1Manager.delete`` call during
+# eviction. ``delete`` holds the global L1 lock for the whole batch, so an
+# eviction action (``eviction_ratio`` of all tracked keys) is deleted in slices
+# of this size to bound how long concurrent L1 operations can be stalled.
+L1_DELETE_BATCH_SIZE = 512
+
 
 class EvictionController(StorageControllerInterface):
     """
@@ -189,13 +195,26 @@ class L1EvictionController(EvictionController):
                 self.execute_eviction_action(action)
             self._publish_triggered(usage, watermark)
 
-    def execute_eviction_action(self, action: EvictionAction):
-        if action.destination == EvictionDestination.DISCARD:
-            self._l1_manager.delete(action.keys)
-        else:
+    def execute_eviction_action(self, action: EvictionAction) -> None:
+        """Delete the action's keys from L1 in bounded slices.
+
+        Keys are passed to ``L1Manager.delete`` in slices of at most
+        ``L1_DELETE_BATCH_SIZE``, so the global L1 lock is released between
+        slices. Each slice emits its own listener callbacks and
+        ``L1_KEYS_EVICTED`` event, and each key's result reflects its state
+        when its slice runs. Unsupported destinations are treated as DISCARD.
+
+        Args:
+            action: The eviction action to execute.
+        """
+        if action.destination != EvictionDestination.DISCARD:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            self._l1_manager.delete(action.keys)
+        # Delete in bounded slices so the global L1 lock is released between
+        # them and concurrent lookup/store/retrieve calls are not starved.
+        keys = action.keys
+        for start in range(0, len(keys), L1_DELETE_BATCH_SIZE):
+            self._l1_manager.delete(keys[start : start + L1_DELETE_BATCH_SIZE])
 
 
 class L2AdapterEvictionState:

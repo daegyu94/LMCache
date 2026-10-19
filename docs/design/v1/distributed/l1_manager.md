@@ -62,6 +62,14 @@ loop -- `get_eviction_actions(key_eligible_filter=is_key_evictable)` followed
 by `delete` -- covers abandoned reservations with no special casing. Policies
 and controllers only ever see original keys; tags never leave the manager.
 
+`delete` holds the global L1 lock for its whole batch, and one eviction action
+carries `eviction_ratio` of all tracked keys. `L1EvictionController` therefore
+passes the action to `delete` in slices of at most `L1_DELETE_BATCH_SIZE`
+(512) keys, releasing the lock between slices so concurrent lookup, store and
+retrieve calls wait for one slice rather than the whole action. Each slice
+reports its own listener callbacks and `L1_KEYS_EVICTED` event; the totals are
+the same as for a single call.
+
 **Listener and event semantics.**
 
 | step | listeners | event bus |
