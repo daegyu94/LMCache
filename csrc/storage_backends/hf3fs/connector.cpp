@@ -40,6 +40,15 @@ Hf3fsConnector::Hf3fsConnector(std::string mount_point, std::string base_paths,
       iov_size_(iov_size),
       time_out_(time_out),
       buffer_enabled_(enable_key_buffer) {
+  if (ior_entries_ < 128 || ior_entries_ > 1024) {
+    throw std::runtime_error("ior_entries must be in range [128, 1024]");
+  }
+  if (io_depth_ < -128 || io_depth_ > 128) {
+    throw std::runtime_error("io_depth must be in range [-128, 128]");
+  }
+  if (iov_size_ < 104857600 || iov_size_ > size_t{2147483648}) {
+    throw std::runtime_error("iov_size must be in range [100MB, 2GB]");
+  }
   // Debug print worker pool configuration
   fprintf(stderr,
           "[LMCache HF3FS] Worker pool: num_workers=%d, "
@@ -733,3 +742,4 @@ void Hf3fsConnector::shutdown_connections() {
 
 }  // namespace connector
 }  // namespace lmcache
+
