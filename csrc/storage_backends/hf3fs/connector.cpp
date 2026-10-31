@@ -86,8 +86,11 @@ Hf3fsConnector::Hf3fsConnector(std::string mount_point, std::string base_paths,
   }
 
   // Validate each base_path is a subdirectory of mount_point
+  const auto mount_path = std::filesystem::weakly_canonical(mount_point_);
   for (const auto& bp : base_paths_) {
-    if (bp.find(mount_point_) != 0) {
+    const auto base_path = std::filesystem::weakly_canonical(bp);
+    if (std::mismatch(mount_path.begin(), mount_path.end(), base_path.begin(),
+                      base_path.end()).first != mount_path.end()) {
       throw std::runtime_error("base_path '" + bp +
                                "' is not a subdirectory of mount_point '" +
                                mount_point_ + "'");
@@ -733,3 +736,4 @@ void Hf3fsConnector::shutdown_connections() {
 
 }  // namespace connector
 }  // namespace lmcache
+
