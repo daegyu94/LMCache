@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <string>
-#include <vector>
+#include <algorithm>
+#include <array>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace lmcache {
 namespace connector {
@@ -44,37 +47,57 @@ std::string key_to_filename(const std::string& key,
   // '@' (invariant enforced on the Python side), so splitting on '@'
   // is unambiguous — no marker, no rsplit.
 
-  // Split on '@' — must yield 4 (unsalted) or 5 (salted) fields.
-  std::vector<std::string> parts;
+  // Views stay within this call; only the returned filename owns storage.
+  const std::string_view key_view(key);
+  std::array<std::string_view, 5> parts{};
+  size_t num_parts = 0;
   size_t start = 0;
   for (size_t pos = 0; pos <= key.size(); ++pos) {
     if (pos == key.size() || key[pos] == KEY_SEP) {
-      parts.emplace_back(key.substr(start, pos - start));
+      if (num_parts < parts.size()) {
+        parts[num_parts] = key_view.substr(start, pos - start);
+      }
+      ++num_parts;
       start = pos + 1;
     }
   }
-  if (parts.size() != 4 && parts.size() != 5) {
+  if (num_parts != 4 && num_parts != 5) {
     throw std::runtime_error(
         "FSConnector: malformed key (expected 4 or 5 '@'-separated fields): " +
         key);
   }
 
-  const std::string& model_name = parts[0];
-  const std::string& kv_rank_hex = parts[1];
-  const std::string& object_group_id_hex = parts[2];
-  const std::string& chunk_hash = parts[3];
-  const std::string cache_salt = parts.size() == 5 ? parts[4] : std::string();
+  const auto model_name = parts[0];
+  const auto kv_rank_hex = parts[1];
+  const auto object_group_id_hex = parts[2];
+  const auto chunk_hash = parts[3];
+  const auto cache_salt = num_parts == 5 ? parts[4] : std::string_view();
 
-  // Replace '/' with '-SEP-' for filesystem safety
-  std::string safe_model = replace_all(model_name, "/", PATH_SLASH_REPLACEMENT);
+  if (shard_directories && chunk_hash.size() < 4) {
+    throw std::runtime_error(
+        "shard_dirs requires a chunk hash of at least two bytes");
+  }
 
   // Emit filename. Salt is appended at the tail so the unsalted shape
   // matches what older builds wrote to disk.
   std::string result;
-  result.reserve(safe_model.size() + kv_rank_hex.size() +
+  const size_t slash_count = std::count(model_name.begin(), model_name.end(), '/');
+  result.reserve(model_name.size() + slash_count * 4 + kv_rank_hex.size() +
                  object_group_id_hex.size() + chunk_hash.size() +
                  cache_salt.size() + 32);
-  result += safe_model;
+  if (shard_directories) {
+    result += chunk_hash.substr(0, 2);
+    result += '/';
+    result += chunk_hash.substr(2, 2);
+    result += '/';
+  }
+  for (char c : model_name) {
+    if (c == '/') {
+      result += PATH_SLASH_REPLACEMENT;
+    } else {
+      result += c;
+    }
+  }
   result += KEY_SEP;
   result += "0x";
   result += kv_rank_hex;
@@ -88,12 +111,7 @@ std::string key_to_filename(const std::string& key,
   }
   result += FILE_EXT;
 
-  if (!shard_directories) return result;
-  if (chunk_hash.size() < 4) {
-    throw std::runtime_error(
-        "shard_dirs requires a chunk hash of at least two bytes");
-  }
-  return chunk_hash.substr(0, 2) + "/" + chunk_hash.substr(2, 2) + "/" + result;
+  return result;
 }
 
 // Inverse of key_to_filename(): convert a flat (non-sharded) filename back to
@@ -184,3 +202,4 @@ std::string get_chunk_hash_from_key(const std::string& key) {
 }
 }  // namespace connector
 }  // namespace lmcache
+
