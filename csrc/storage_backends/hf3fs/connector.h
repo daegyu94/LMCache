@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Third Party - sharded flat_hash_set for high-throughput key buffer
@@ -34,6 +35,25 @@ namespace connector {
  * management
  */
 struct WorkerHf3fsConn {
+  WorkerHf3fsConn() = default;
+  WorkerHf3fsConn(const WorkerHf3fsConn&) = delete;
+  WorkerHf3fsConn& operator=(const WorkerHf3fsConn&) = delete;
+  WorkerHf3fsConn& operator=(WorkerHf3fsConn&&) = delete;
+
+  // Returning a connection must transfer SDK ownership even without NRVO.
+  WorkerHf3fsConn(WorkerHf3fsConn&& other) noexcept
+      : fd(std::exchange(other.fd, -1)),
+        registered(std::exchange(other.registered, false)),
+        file_path(std::move(other.file_path)),
+        read_ior(other.read_ior),
+        read_ior_initialized(std::exchange(other.read_ior_initialized, false)),
+        write_ior(other.write_ior),
+        write_ior_initialized(std::exchange(other.write_ior_initialized, false)),
+        read_iov(other.read_iov),
+        read_iov_initialized(std::exchange(other.read_iov_initialized, false)),
+        write_iov(other.write_iov),
+        write_iov_initialized(std::exchange(other.write_iov_initialized, false)) {}
+
   // File descriptors
   int fd = -1;              // Linux file descriptor
   bool registered = false;  // Whether hf3fs_reg_fd succeeded
@@ -42,16 +62,16 @@ struct WorkerHf3fsConn {
   // I/O Rings (separate for read and write)
   // 3FS documentation states Ior cannot handle both read and write
   // simultaneously
-  hf3fs_ior read_ior;
+  hf3fs_ior read_ior{};
   bool read_ior_initialized = false;
-  hf3fs_ior write_ior;
+  hf3fs_ior write_ior{};
   bool write_ior_initialized = false;
 
   // I/O Buffers (separate for read and write)
   // Per-thread buffers avoid synchronization overhead
-  hf3fs_iov read_iov;
+  hf3fs_iov read_iov{};
   bool read_iov_initialized = false;
-  hf3fs_iov write_iov;
+  hf3fs_iov write_iov{};
   bool write_iov_initialized = false;
 
   /**
@@ -202,3 +222,4 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
 
 }  // namespace connector
 }  // namespace lmcache
+
