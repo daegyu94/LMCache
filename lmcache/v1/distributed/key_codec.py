@@ -10,8 +10,20 @@ from lmcache.v1.distributed.api import ObjectKey
 
 
 def encode_storage_key(key: ObjectKey) -> str:
-    """Return the canonical L2 wire name, including every matching field."""
-    return format_storage_key(key, "{model}@{rank}@{group}@{hash}{suffix}")
+    """Return the canonical L2 wire name without generic template expansion.
+
+    Args:
+        key: Object whose identity determines the storage name.
+
+    Returns:
+        ``model@rank@group@hash[@salt]``, preserving the established wire bytes.
+        Mutable operational metadata is excluded.
+    """
+    suffix = f"@{key.cache_salt}" if key.cache_salt else ""
+    return (
+        f"{key.model_name}@{key.kv_rank:08x}@{key.object_group_id:x}@"
+        f"{key.chunk_hash.hex()}{suffix}"
+    )
 
 
 def format_storage_key(
@@ -102,3 +114,4 @@ def decode_fs_filename(filename: str) -> ObjectKey:
     return decode_storage_key(
         filename[:-5], model_decoder=lambda model: model.replace("-SEP-", "/")
     )
+
