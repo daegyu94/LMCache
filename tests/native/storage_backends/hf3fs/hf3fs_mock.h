@@ -12,4 +12,6 @@ extern std::string mount_point;
 extern std::atomic<int> created;
 extern std::atomic<int> destroyed;
 extern std::atomic<int> duplicate_destroys;
+// hf3fs_dereg_fd calls.
+extern std::atomic<int> deregistered;
 }  // namespace hf3fs_mock

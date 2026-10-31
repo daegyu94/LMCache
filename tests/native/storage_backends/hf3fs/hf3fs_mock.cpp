@@ -16,6 +16,7 @@ std::string mount_point;
 std::atomic<int> created{0};
 std::atomic<int> destroyed{0};
 std::atomic<int> duplicate_destroys{0};
+std::atomic<int> deregistered{0};
 }  // namespace hf3fs_mock
 
 namespace {
@@ -77,7 +78,7 @@ void hf3fs_iordestroy(hf3fs_ior* ior) { destroy_resource(ior->iorh); }
 
 int hf3fs_reg_fd(int, uint64_t) { return 0; }
 
-void hf3fs_dereg_fd(int) {}
+void hf3fs_dereg_fd(int) { ++hf3fs_mock::deregistered; }
 
 int hf3fs_prep_io(const hf3fs_ior* ior, const hf3fs_iov* iov, bool read,
                   void* ptr, int fd, size_t off, uint64_t len, const void*) {
