@@ -225,7 +225,13 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     std::filesystem::remove(tmp_path);
     throw;
   }
-  ::close(fd);
+  if (::close(fd) < 0) {
+    const int close_error = errno;
+    std::error_code remove_ec;
+    std::filesystem::remove(tmp_path, remove_ec);
+    throw std::runtime_error("close after write failed: " + tmp_path.string() +
+                             ": " + strerror(close_error));
+  }
 
   // Atomic rename: tmp -> final
   std::error_code ec;
