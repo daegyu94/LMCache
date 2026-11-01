@@ -271,9 +271,14 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
 
         # Free all coalesced blocks
         total_count = 0
-        for address, size, count in coalesced_blocks:
+        if len(coalesced_blocks) == 1:
+            address, size, total_count = coalesced_blocks[0]
             self.address_manager.free(address, size)
-            total_count += count
+        elif coalesced_blocks:
+            self.address_manager.batched_free(
+                [(address, size) for address, size, _ in coalesced_blocks]
+            )
+            total_count = sum(count for _, _, count in coalesced_blocks)
 
         # For debug
         self.num_active_allocations -= total_count

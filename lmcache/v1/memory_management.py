@@ -1544,7 +1544,7 @@ class AddressManager:
 
     @_lmcache_nvtx_annotate
     @synchronized("_lock")
-    def free(self, address: int, size: int):
+    def free(self, address: int, size: int) -> None:
         """
         Free a previously allocated block of memory.
 
@@ -1552,19 +1552,25 @@ class AddressManager:
             address: The starting address of the block to free.
             size: The size of the block to free. Should be greater than 0.
         """
-        new_free_block = FreeBlock(start=address, size=size)
-        index = self._explicit_list.bisect_left(new_free_block)
-        prev_block = self._explicit_list[index - 1] if index > 0 else None
-        succ_block = (
-            self._explicit_list[index] if index < len(self._explicit_list) else None
-        )
+        self._free_unlocked(address, size)
 
-        coalesced = self._coalesce(new_free_block, prev_block, succ_block)
-        if not coalesced:
-            self._explicit_list.add(new_free_block)
+    def batched_free(self, blocks: list[tuple[int, int]]) -> None:
+        """Free allocated ranges under one address-space lock.
 
-        # For debug
-        self.total_allocated_size -= size
+        Subclasses overriding ``free`` retain their per-range dispatch and
+        synchronization. For the base implementation, allocation can resume
+        after the entire batch has been released.
+
+        Args:
+            blocks: Starting addresses and sizes of the allocated ranges.
+        """
+        if type(self).free is not AddressManager.free:
+            for address, size in blocks:
+                self.free(address, size)
+            return
+        with self._lock:
+            for address, size in blocks:
+                self._free_unlocked(address, size)
 
     @synchronized("_lock")
     def sbrk(self, size: int):
@@ -1623,6 +1629,22 @@ class AddressManager:
             return False
 
         return True
+
+    def _free_unlocked(self, address: int, size: int) -> None:
+        """Release a range while the caller holds the address-space lock."""
+        new_free_block = FreeBlock(start=address, size=size)
+        index = self._explicit_list.bisect_left(new_free_block)
+        prev_block = self._explicit_list[index - 1] if index > 0 else None
+        succ_block = (
+            self._explicit_list[index] if index < len(self._explicit_list) else None
+        )
+
+        coalesced = self._coalesce(new_free_block, prev_block, succ_block)
+        if not coalesced:
+            self._explicit_list.add(new_free_block)
+
+        # For debug
+        self.total_allocated_size -= size
 
 
 _CORE_EXPORTS = [
