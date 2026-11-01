@@ -420,6 +420,8 @@ class InFlightPrefetchRequest:
 
     # In flight L2 operations: L2 adapter idx -> L2 task ID
     inflight_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
+    # Original cell positions for adapters that accepted a sparse lookup.
+    lookup_cells_by_adapter: dict[int, Bitmap2D] = field(default_factory=dict)
     inflight_load_tasks: dict[int, L2TaskId] = field(default_factory=dict)
 
     # L2 adapter idx -> L1 bytes reserved for that adapter's in-flight load.
@@ -1161,15 +1163,29 @@ class PrefetchController(StorageControllerInterface):
             self._retire_request(request)
             return
 
-        # TODO(ApostaC): Here, we submit the full keys to L2 adapters.
-        # In the future, we can do `All keys - L1 hit keys` to reduce the
-        # L2 lookup overhead.
-        # However, for P2P case, this will require the storage manager to
-        # support unequal length of key groups. We left this as future refactor
-        # TODOs.
+        sparse_keys = None
+        missing_cells = None
+        if self._policy.prefers_l1_hits() and any(
+            adapter.supports_sparse_lookup() for adapter in active_adapters.values()
+        ):
+            l1_hits = _merged_or_zeros(
+                request.key_states.l1_locked_keys, request.key_groups
+            )
+            if l1_hits.popcount():
+                missing_cells = l1_hits.ones_like() - l1_hits
+                sparse_keys = _gather_keys(request.key_groups, missing_cells)
+
         for adapter_idx, adapter in active_adapters.items():
+            lookup_keys = flattened_keys
+            if (
+                sparse_keys is not None
+                and missing_cells is not None
+                and adapter.supports_sparse_lookup()
+            ):
+                lookup_keys = sparse_keys
+                request.lookup_cells_by_adapter[adapter_idx] = missing_cells
             task_id = adapter.submit_lookup_and_lock_task(
-                flattened_keys, spec.group_layout_descs
+                lookup_keys, spec.group_layout_descs
             )
             request.inflight_lookup_tasks[adapter_idx] = task_id
 
@@ -1290,12 +1306,13 @@ class PrefetchController(StorageControllerInterface):
             if result is None:
                 continue
 
-            # Update the l2 locked key states
-            # NOTE: since we do full global bitmap for L2 load, we use
-            # _scatter_bitmaps_full_global instead of _scatter_bitmaps here.
-            # Will be changed in the future after we implemented partial L2
-            # lookup.
-            l2_found_bitmap = _scatter_bitmaps_full_global(result, num_rows, num_cols)
+            lookup_cells = request.lookup_cells_by_adapter.pop(adapter_idx, None)
+            if lookup_cells is None:
+                l2_found_bitmap = _scatter_bitmaps_full_global(
+                    result, num_rows, num_cols
+                )
+            else:
+                l2_found_bitmap = _scatter_bitmaps(lookup_cells, result)
             request.key_states.l2_locked_keys[adapter_idx] = l2_found_bitmap
 
             # Snapshot before the load plan trims it, so the result can

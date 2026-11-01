@@ -301,6 +301,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         return task_id
 
+    def supports_sparse_lookup(self) -> bool:
+        """Opt in while native independent-key lookup is used unchanged."""
+        return (
+            type(self).submit_lookup_and_lock_task
+            is NativeConnectorL2Adapter.submit_lookup_and_lock_task
+        )
+
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         with self._lock:
             return self._completed_lookups.pop(task_id, None)

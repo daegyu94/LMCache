@@ -123,6 +123,14 @@ class L2AdapterInterface(ABC):
     and prefetch controller), therefore, it needs to be thread-safe.
     """
 
+    def supports_sparse_lookup(self) -> bool:
+        """Whether lookup accepts key subsets without equal group widths.
+
+        Opt-in adapters return results and acquire locks in submitted key
+        order independently of the original prefetch grid.
+        """
+        return False
+
     def __init__(self, max_capacity_bytes: int = 0) -> None:
         """
         Args:

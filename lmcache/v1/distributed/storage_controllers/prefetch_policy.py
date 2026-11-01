@@ -125,6 +125,14 @@ class PrefetchPolicy(ABC):
     The functions should be **pure** without any side-effects.
     """
 
+    def prefers_l1_hits(self) -> bool:
+        """Whether lookup may omit cells already locked in L1.
+
+        Policies opting in must never require L2 copies of L1-held cells.
+        The default preserves complete L2 results for third-party policies.
+        """
+        return False
+
     @abstractmethod
     def plan_load(
         self,
@@ -197,6 +205,14 @@ class DefaultPrefetchPolicy(PrefetchPolicy):
     L1 managers are considered before L2 adapters, and within a tier lower
     indices win. Nothing loaded from L2 is retained in L1.
     """
+
+    def prefers_l1_hits(self) -> bool:
+        """Opt in only while the default L1-first planning method is used.
+
+        A subclass replacing the plan keeps full lookups unless it explicitly
+        overrides this capability too.
+        """
+        return type(self).plan_load is DefaultPrefetchPolicy.plan_load
 
     def plan_load(
         self,
