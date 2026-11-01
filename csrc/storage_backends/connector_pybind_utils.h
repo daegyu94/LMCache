@@ -65,9 +65,13 @@ auto bind_submit_batch_get() {
 
     for (size_t i = 0; i < keys.size(); ++i) {
       py::memoryview mv = memviews[i].cast<py::memoryview>();
-      py::buffer_info info = py::buffer(mv).request();
+      py::buffer_info info = py::buffer(mv).request(true);
+      const Py_buffer* view = PyMemoryView_GET_BUFFER(mv.ptr());
+      if (!PyBuffer_IsContiguous(view, 'C')) {
+        throw py::value_error("GET destination must be C-contiguous");
+      }
       bufs.push_back(info.ptr);
-      lens.push_back(static_cast<size_t>(info.size));
+      lens.push_back(static_cast<size_t>(view->len));
     }
 
     // use the first buffer's size as batch_chunk_num_bytes (all must match)
@@ -98,8 +102,12 @@ auto bind_submit_batch_set() {
     for (size_t i = 0; i < keys.size(); ++i) {
       py::memoryview mv = memviews[i].cast<py::memoryview>();
       py::buffer_info info = py::buffer(mv).request();
+      const Py_buffer* view = PyMemoryView_GET_BUFFER(mv.ptr());
+      if (!PyBuffer_IsContiguous(view, 'C')) {
+        throw py::value_error("SET source must be C-contiguous");
+      }
       bufs.push_back(info.ptr);
-      lens.push_back(static_cast<size_t>(info.size));
+      lens.push_back(static_cast<size_t>(view->len));
     }
 
     // use the first buffer's size as batch_chunk_num_bytes (all must match)
