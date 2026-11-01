@@ -1072,8 +1072,17 @@ class PrefetchController(StorageControllerInterface):
     def _start_pending_requests(self) -> None:
         """Start pending requests in arrival order while L1 can admit the
         head of the queue (see ``_can_admit_new_prefetch``)."""
+        if not self._pending_queue:
+            return
+        # Lookup completions are processed by this same controller thread,
+        # outside this drain; only requests started below can change this sum.
+        lookup_bytes = sum(
+            request.get_max_load_bytes()
+            for request in self._in_flight_requests.values()
+            if request.phase == PrefetchPhase.LOOKUP
+        )
         while self._pending_queue and self._can_admit_new_prefetch(
-            self._pending_queue[0][1]
+            self._pending_queue[0][1], lookup_bytes
         ):
             request_id, spec = self._pending_queue.popleft()
             try:
@@ -1083,8 +1092,13 @@ class PrefetchController(StorageControllerInterface):
                 request = self._in_flight_requests.get(request_id)
                 if request is not None:
                     self._abort_request(request)
+            request = self._in_flight_requests.get(request_id)
+            if request is not None and request.phase == PrefetchPhase.LOOKUP:
+                lookup_bytes += request.get_max_load_bytes()
 
-    def _can_admit_new_prefetch(self, spec: PrefetchTaskSpec) -> bool:
+    def _can_admit_new_prefetch(
+        self, spec: PrefetchTaskSpec, lookup_bytes: int | None = None
+    ) -> bool:
         """Return whether the pending request ``spec`` may start now.
 
         The request can be admitted when both of the following conditions
@@ -1098,6 +1112,8 @@ class PrefetchController(StorageControllerInterface):
 
         Args:
             spec: The request at the head of the pending queue.
+            lookup_bytes: Outstanding lookup bytes in this controller drain;
+                computed from in-flight requests when omitted.
 
         Returns:
             True if ``spec`` may start.
@@ -1105,11 +1121,12 @@ class PrefetchController(StorageControllerInterface):
         if not self._in_flight_requests:
             return True
         request_bytes = _get_max_load_bytes(spec.key_groups)
-        lookup_bytes = sum(
-            request.get_max_load_bytes()
-            for request in self._in_flight_requests.values()
-            if request.phase == PrefetchPhase.LOOKUP
-        )
+        if lookup_bytes is None:
+            lookup_bytes = sum(
+                request.get_max_load_bytes()
+                for request in self._in_flight_requests.values()
+                if request.phase == PrefetchPhase.LOOKUP
+            )
         target_l1_indices = {
             self._l2_affinity[adapter_idx]
             for adapter_idx in self._l2_adapters
