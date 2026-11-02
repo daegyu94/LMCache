@@ -230,7 +230,7 @@ Done. Keys remain in L1 unless the policy deletes them.
 
 ### StorePolicy
 
-The policy decides two things:
+The policy decides three things:
 
 1. **`select_store_targets(keys, adapters) → dict[int, list[ObjectKey]]`**
    Which adapters get which keys. A key can go to multiple adapters.
@@ -240,7 +240,17 @@ The policy decides two things:
    Which keys to evict from L1 after successful L2 store.
    `DefaultStorePolicy`: never delete (empty list).
 
+3. **`select_l1_deletions_for_skipped(keys) → list[ObjectKey]`**
+   Which keys to delete from L1 that were never stored to L2 because their
+   request set `lmcache.skip_l2_store`. L1 holds the only copy of these keys.
+   Not abstract: the base class keeps all (empty list);
+   `BufferOnlyStorePolicy` (`skip_l1`) deletes all so a noop-eviction L1
+   still drains.
+
 Policies are selected by name via `--l2-store-policy` (default: `"default"`).
+Keys whose request set `lmcache.skip_l2_store` are filtered out before
+`select_store_targets` and handed to `select_l1_deletions_for_skipped`; see
+[`../storage_controllers/skip_l2_store.md`](../storage_controllers/skip_l2_store.md).
 New policies self-register with `register_store_policy(name, cls)` at import
 time and are auto-discovered by `storage_controllers/__init__.py`.
 

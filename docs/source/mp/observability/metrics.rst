@@ -184,6 +184,11 @@ L2 Metrics
    * - ``lmcache_mp.l2_store_completed_objects``
      - Counter (attr: ``cache_salt``)
      - Number of chunks successfully stored to L2, grouped by tenant.
+   * - ``lmcache_mp.l2_store_skipped_objects``
+     - Counter (attr: ``reason``, ``cache_salt``)
+     - Number of newly written chunks kept out of L2, e.g.
+       ``reason="request_hint"`` for requests that set
+       ``lmcache.skip_l2_store``.
    * - ``lmcache_mp.l2_prefetch_lookup``
      - Counter
      - Number of L2 prefetch lookup requests.

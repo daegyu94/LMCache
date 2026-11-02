@@ -11,7 +11,9 @@ Tests are written against the StorePolicy contract defined in store_policy.py.
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.storage_controllers.store_policy import (
+    BufferOnlyStorePolicy,
     DefaultStorePolicy,
+    StorePolicy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 
@@ -117,3 +119,31 @@ class TestDefaultStorePolicyDeletions:
         result = policy.select_l1_deletions([])
 
         assert result == []
+
+
+class TestL1DeletionsForSkipped:
+    """Test select_l1_deletions_for_skipped for keys never stored to L2."""
+
+    def test_base_class_keeps_all(self):
+        """A policy that does not override the hook keeps skipped keys."""
+
+        class StoreNothingPolicy(StorePolicy):
+            def select_store_targets(self, keys, adapters):
+                return {}
+
+            def select_l1_deletions(self, keys):
+                return list(keys)
+
+        keys = [make_object_key(i) for i in range(3)]
+
+        assert StoreNothingPolicy().select_l1_deletions_for_skipped(keys) == []
+
+    def test_default_keeps_all(self):
+        keys = [make_object_key(i) for i in range(3)]
+
+        assert DefaultStorePolicy().select_l1_deletions_for_skipped(keys) == []
+
+    def test_buffer_only_deletes_all(self):
+        keys = [make_object_key(i) for i in range(3)]
+
+        assert BufferOnlyStorePolicy().select_l1_deletions_for_skipped(keys) == keys

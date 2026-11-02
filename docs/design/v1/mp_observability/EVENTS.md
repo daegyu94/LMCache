@@ -90,6 +90,18 @@ enables per-tenant attribution on the subscriber side.
 On the failure path of `L2_STORE_COMPLETED`, `key_count_per_salt` is absent
 (no succeeded keys to attribute).
 
+| EventType | Metadata keys | Types | Vocabulary |
+|---|---|---|---|
+| `L2_STORE_SKIPPED` | `reason`, `key_count`, `key_count_per_salt` | `str`, `int`, `dict[str, int]` | `reason` ∈ {`request_hint`} |
+
+Published by `StoreController._process_new_keys` for the distinct keys of one
+listener batch it kept out of L2, when at least one key was skipped and at
+least one non-draining adapter is attached. Ordering contract: it is published
+after all of that batch's `submit_store_task` calls and policy L1 deletions,
+so a subscriber can treat it as "the batch was fully handled". `reason=request_hint`: every writer of the key
+in the batch set `lmcache.skip_l2_store` (see
+`docs/design/v1/distributed/storage_controllers/skip_l2_store.md`).
+
 ---
 
 ## L2 Prefetch Controller Events

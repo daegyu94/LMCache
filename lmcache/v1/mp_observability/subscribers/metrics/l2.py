@@ -37,6 +37,8 @@ class L2MetricsSubscriber(EventSubscriber):
     - ``lmcache_mp.l2_store_submitted_objects`` — chunks submitted for L2 store
     - ``lmcache_mp.l2_store_completed`` — store requests completed (attr: ``l2_name``)
     - ``lmcache_mp.l2_store_completed_objects`` — chunks successfully stored to L2
+    - ``lmcache_mp.l2_store_skipped_objects`` — newly written chunks kept out
+      of L2 (attr: ``reason``)
     - ``lmcache_mp.l2_load_completed`` — per-adapter load tasks completed
       (attr: ``l2_name``)
     - ``lmcache_mp.l2_prefetch_lookup`` — prefetch lookup requests
@@ -72,6 +74,11 @@ class L2MetricsSubscriber(EventSubscriber):
         self._store_completed_objects = meter.create_counter(
             "lmcache_mp.l2_store_completed_objects",
             description="Total chunks successfully stored to L2",
+            unit="chunks",
+        )
+        self._store_skipped_objects = meter.create_counter(
+            "lmcache_mp.l2_store_skipped_objects",
+            description="Total newly written chunks kept out of L2",
             unit="chunks",
         )
 
@@ -123,6 +130,7 @@ class L2MetricsSubscriber(EventSubscriber):
         return {
             EventType.L2_STORE_SUBMITTED: self._on_store_submitted,
             EventType.L2_STORE_COMPLETED: self._on_store_completed,
+            EventType.L2_STORE_SKIPPED: self._on_store_skipped,
             EventType.L2_LOAD_TASK_COMPLETED: self._on_load_task_completed,
             EventType.L2_PREFETCH_LOOKUP_SUBMITTED: self._on_lookup_submitted,
             EventType.L2_PREFETCH_LOAD_SUBMITTED: self._on_load_submitted,
@@ -143,6 +151,13 @@ class L2MetricsSubscriber(EventSubscriber):
         emit_salt_counts(
             self._store_completed_objects,
             event.metadata.get("key_count_per_salt", {}),
+        )
+
+    def _on_store_skipped(self, event: Event) -> None:
+        emit_salt_counts(
+            self._store_skipped_objects,
+            event.metadata["key_count_per_salt"],
+            attributes={"reason": event.metadata["reason"]},
         )
 
     def _on_load_task_completed(self, event: Event) -> None:

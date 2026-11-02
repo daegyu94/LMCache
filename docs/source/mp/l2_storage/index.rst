@@ -164,6 +164,86 @@ is deleted shortly after that read ends.
     --l2-store-policy skip_l1 \
     --l2-prefetch-policy default
 
+Per-Request L2 Store Opt-Out
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A request that sets ``"lmcache.skip_l2_store": true`` in its
+``kv_transfer_params`` opts out of L2 write-through: the chunks it newly
+writes to L1 are not stored to any L2 adapter.  The request is served
+normally.  The hint works with every ``--l2-store-policy``, and the policy
+still decides L1 retention: with ``default`` the opted-out chunks stay in L1,
+serve L1 hits, and leave through normal L1 eviction; with ``skip_l1`` they are
+deleted from L1 as soon as their readers release them, so buffer-only mode
+with ``--eviction-policy noop`` does not fill up.  Under ``skip_l1`` the hint
+therefore means "do not cache": the chunks are lost to later requests in the
+same step.  For rollouts that want in-step L1 hits (for example the other
+samples of a GRPO group), use ``--l2-store-policy default`` with
+``--eviction-policy LRU``.
+
+.. note::
+
+   Only the vLLM ``LMCacheMPConnector`` forwards client request configs to
+   the MP server.  Requests from the SGLang and TensorRT-LLM MP connectors
+   cannot carry this hint.
+
+Use it when the client knows the KV will not be read after L1 drops it.  The
+motivating case is RL rollouts (GRPO/PPO, agentic multi-turn RL), where KV is
+only valid until the next policy-weight update and most write-through is never
+read back from L2.  The rollout framework decides per request; set the hint
+when no other request will read this request's KV (expected reuse 0) **and**
+the trajectory does not send another turn that resends this context.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 40
+
+   * - Request
+     - ``lmcache.skip_l2_store``
+     - Why
+   * - GRPO sample, group size ``G > 1``
+     - ``false`` (or omit)
+     - The other ``G - 1`` samples read the group prompt.
+   * - Single-shot sample (``G = 1``), no further turn
+     - ``true``
+     - Nothing reads the KV again.
+   * - Multi-turn trajectory, a turn that will be followed by another
+     - ``false`` (or omit)
+     - The next turn resends this context.
+   * - Multi-turn trajectory, last turn, no other reader
+     - ``true``
+     - Its new chunks are never read again.
+
+For example, the last turn of a single-sample agentic trajectory:
+
+.. code-block:: json
+
+    {
+        "model": "Qwen/Qwen3-8B",
+        "prompt": "<conversation so far>",
+        "max_tokens": 1024,
+        "kv_transfer_params": {
+            "lmcache.skip_l2_store": true
+        }
+    }
+
+The hint is an opt-out by the writing request, with these semantics:
+
+- Requests that share a prefix produce the same chunk keys.  The request whose
+  write makes a chunk resident in L1 decides.  A shared prefix first written
+  by an opting-out request is not stored to L2 until it leaves L1, even if later
+  requests omit the hint; a later request writing a chunk that is already
+  resident does not change the decision.  The hint is safe when the client
+  owns all traffic under its ``cache_salt``.
+- The hint covers every chunk the request newly writes.  With the vLLM
+  connector's default ``lmcache.mp.save_decode_cache: false`` that is the
+  prompt only.
+- A value that is not a JSON boolean (for example ``"true"``) is ignored, so
+  the chunks are stored, and the server logs a rate-limited warning.
+
+Skipped chunks are counted by ``lmcache_mp.l2_store_skipped_objects``
+(``reason="request_hint"``); stored chunks appear in the usual
+``lmcache_mp.l2_store_submitted_objects``.
+
 Policies are extensible -- new policies can be added by creating a file
 in ``storage_controllers/`` and calling ``register_store_policy()`` or
 ``register_prefetch_policy()`` at import time.  See the design doc

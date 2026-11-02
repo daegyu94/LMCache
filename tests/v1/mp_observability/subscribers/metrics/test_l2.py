@@ -154,6 +154,30 @@ class TestL2StoreMetrics:
         assert delta["lmcache_mp.l2_store_submitted"] == 2
         assert delta["lmcache_mp.l2_store_submitted_objects"] == 15
 
+    def test_store_skipped_counts_by_reason(self, bus, subscriber):
+        bus.start()
+        name = "lmcache_mp.l2_store_skipped_objects"
+        before = _read_counters_by_attrs().get(name, {})
+        keys = _make_keys(4) + _make_keys(2, cache_salt="tenant-a")
+        bus.publish(
+            Event(
+                event_type=EventType.L2_STORE_SKIPPED,
+                metadata={
+                    "reason": "request_hint",
+                    "key_count": 6,
+                    "key_count_per_salt": _salt_counts(keys),
+                },
+            )
+        )
+        time.sleep(_DRAIN_WAIT)
+        bus.stop()
+
+        after = _read_counters_by_attrs().get(name, {})
+        plain = (("reason", "request_hint"),)
+        salted = (("cache_salt", "tenant-a"), ("reason", "request_hint"))
+        assert after.get(plain, 0) == before.get(plain, 0) + 4
+        assert after.get(salted, 0) == before.get(salted, 0) + 2
+
     def test_store_completed_success(self, bus, subscriber, snapshot):
         bus.start()
         keys = _make_keys(8)
@@ -384,12 +408,13 @@ class TestL2MetricsSubscriptions:
         subs = subscriber.get_subscriptions()
         assert EventType.L2_STORE_SUBMITTED in subs
         assert EventType.L2_STORE_COMPLETED in subs
+        assert EventType.L2_STORE_SKIPPED in subs
         assert EventType.L2_LOAD_TASK_COMPLETED in subs
         assert EventType.L2_PREFETCH_LOOKUP_SUBMITTED in subs
         assert EventType.L2_PREFETCH_LOAD_SUBMITTED in subs
         assert EventType.L2_PREFETCH_LOAD_COMPLETED in subs
         assert EventType.L2_KEYS_EVICTED in subs
-        assert len(subs) == 7
+        assert len(subs) == 8
 
 
 # ---------------------------------------------------------------------------

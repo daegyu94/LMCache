@@ -183,6 +183,7 @@ contribute to histograms; counters above always count all events.
 | `lmcache_mp.l2_store_submitted_objects` | `lmcache_mp_l2_store_submitted_objects_chunks_total` | Counter (attr: `cache_salt`) | `L2_STORE_SUBMITTED` | `+count` per `cache_salt` via `key_count_per_salt` |
 | `lmcache_mp.l2_store_completed` | `lmcache_mp_l2_store_completed_requests_total` | Counter (attr: `l2_name`) | `L2_STORE_COMPLETED` | +1 per event |
 | `lmcache_mp.l2_store_completed_objects` | `lmcache_mp_l2_store_completed_objects_chunks_total` | Counter (attr: `cache_salt`) | `L2_STORE_COMPLETED` | `+count` per `cache_salt` via `key_count_per_salt` |
+| `lmcache_mp.l2_store_skipped_objects` | `lmcache_mp_l2_store_skipped_objects_chunks_total` | Counter (attrs: `reason`, `cache_salt`) | `L2_STORE_SKIPPED` | `+count` per `cache_salt` via `key_count_per_salt`, labeled with the event's `reason` |
 
 **What it answers:** How many chunks are being pushed to L2? What fraction fail?
 

@@ -2,9 +2,11 @@
 """
 Store policy interface and default implementation for L1-to-L2 storage decisions.
 
-The store policy makes two decisions after data is written to L1:
+The store policy makes these decisions after data is written to L1:
 1. Which L2 adapter(s) should each key be stored to?
 2. After a successful L2 store, should the key be deleted from L1?
+3. For a key its request kept out of L2 (``lmcache.skip_l2_store``), should
+   the key be deleted from L1?
 """
 
 # Standard
@@ -23,6 +25,8 @@ class StorePolicy(ABC):
     1. Which adapter(s) to store each key to (select_store_targets).
     2. Which keys to delete from L1 after successful L2 store
        (select_l1_deletions).
+    3. Which keys to delete from L1 when their request kept them out of L2
+       (select_l1_deletions_for_skipped; optional, keeps all by default).
     """
 
     @abstractmethod
@@ -59,6 +63,26 @@ class StorePolicy(ABC):
         Returns:
             Keys to delete from L1. Empty list means keep all.
         """
+
+    def select_l1_deletions_for_skipped(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        """
+        Decide which keys to delete from L1 that were never stored to L2.
+
+        Called by the StoreController for keys whose writing request set
+        ``lmcache.skip_l2_store``. Unlike :meth:`select_l1_deletions`, L1
+        holds the only copy of these keys, so deleting one discards it.
+
+        Args:
+            keys: Distinct keys that finished writing to L1 and were kept
+                out of L2 by their request; none of them is in L2.
+
+        Returns:
+            Keys to delete from L1. The default keeps all (empty list).
+        """
+        return []
 
 
 # -----------------------------------------------------------------------------
@@ -159,7 +183,8 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 
     Inherits ``select_store_targets`` from ``DefaultStorePolicy``
     (store all keys to all adapters) and only overrides the L1
-    deletion decision.
+    deletion decisions. Keys their request kept out of L2 are deleted
+    too, so a pure write buffer (noop eviction) does not fill up.
     """
 
     def select_l1_deletions(
@@ -171,6 +196,24 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 
         Args:
             keys: Keys that were successfully stored to L2.
+
+        Returns:
+            All keys (remove everything from L1).
+        """
+        return list(keys)
+
+    def select_l1_deletions_for_skipped(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        """
+        Delete keys kept out of L2 from L1 as well.
+
+        A buffer-only L1 has no eviction, so retaining them would leak L1.
+        The keys are not cached anywhere afterwards.
+
+        Args:
+            keys: Keys that were kept out of L2 by their request.
 
         Returns:
             All keys (remove everything from L1).

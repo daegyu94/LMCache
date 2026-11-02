@@ -55,6 +55,11 @@ adapter add ``lmcache.hint.engine_computed_tokens``, the tokens the engine
 already holds in its own prefix cache, to their lookups.  vLLM omits it on
 eager-prefetch lookups, which run before vLLM checks its prefix cache.
 
+The store controller acts on ``lmcache.skip_l2_store``: chunks newly written
+by a request that sets it to ``true`` are not stored to L2, under every
+``--l2-store-policy``; the policy still decides whether they stay in L1.  Only the vLLM ``LMCacheMPConnector``
+forwards it.  See :doc:`/mp/l2_storage/index` for RL rollout guidance.
+
 MP Server
 ---------
 

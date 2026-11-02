@@ -11,6 +11,7 @@ the full integration without mocking internals.
 
 # Standard
 from typing import NoReturn
+import logging
 import select
 import threading
 import time
@@ -32,7 +33,11 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
 )
+from lmcache.v1.distributed.storage_controllers import (
+    store_controller as store_controller_module,
+)
 from lmcache.v1.distributed.storage_controllers.store_controller import (
+    SKIP_L2_STORE_CONFIG,
     StoreController,
     StoreListener,
 )
@@ -43,6 +48,8 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventBusConfig, init_event_bus
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
 if not torch_dev.is_available():
@@ -800,3 +807,167 @@ class TestBufferOnlyMode:
 
         ctrl.stop()
         adapter.close()
+
+
+def make_hinted_key(chunk_id: int, hint: object) -> ObjectKey:
+    """Create a test ObjectKey whose request set ``lmcache.skip_l2_store``."""
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name="test_model",
+        kv_rank=0,
+        extra_attributes={SKIP_L2_STORE_CONFIG: hint},
+    )
+
+
+class SkippedEventCollector:
+    """Captures ``L2_STORE_SKIPPED`` events from a fresh global event bus.
+
+    Must be created before the StoreController so the controller binds to
+    this bus.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+        self.arrived = threading.Event()
+        self._bus = init_event_bus(EventBusConfig(enabled=True, max_queue_size=1000))
+        self._bus.subscribe(EventType.L2_STORE_SKIPPED, self._on_event)
+        self._bus.start()
+
+    def close(self) -> None:
+        """Stop the bus and restore a disabled global bus."""
+        self._bus.stop()
+        init_event_bus(EventBusConfig(enabled=False))
+
+    def _on_event(self, event: Event) -> None:
+        self.events.append(event)
+        self.arrived.set()
+
+
+class _WarningCapture(logging.Handler):
+    """Collects WARNING records; the lmcache logger does not reach caplog."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def skipped_events():
+    collector = SkippedEventCollector()
+    yield collector
+    collector.close()
+
+
+class TestSkipL2StoreHint:
+    """End-to-end L1 write -> L2 store with the ``lmcache.skip_l2_store`` hint."""
+
+    def test_hinted_keys_stay_in_l1_under_default_policy(
+        self, l1_manager, skipped_events
+    ):
+        """Hinted keys skip L2; the default policy keeps them in L1."""
+        adapter = make_adapter()
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultStorePolicy(),
+        )
+        ctrl.start()
+        kept = [make_hinted_key(0, False), make_object_key(1)]
+        skipped = [make_hinted_key(2, True), make_hinted_key(3, True)]
+        try:
+            write_keys_to_l1(l1_manager, kept + skipped, make_layout())
+
+            # The event is published after the batch's store submissions.
+            assert skipped_events.arrived.wait(timeout=5.0)
+            ok = wait_for_condition(
+                lambda: adapter.debug_get_stored_object_count() == len(kept),
+                timeout=5.0,
+            )
+            assert ok, "Keys without a skip hint should be stored in L2"
+            assert all(adapter.debug_has_key(k) for k in kept)
+            assert not any(adapter.debug_has_key(k) for k in skipped)
+            assert all(l1_manager.get_object_state(k) is not None for k in skipped)
+            assert len(skipped_events.events) == 1
+            assert skipped_events.events[0].metadata["reason"] == "request_hint"
+            assert skipped_events.events[0].metadata["key_count"] == 2
+        finally:
+            ctrl.stop()
+            adapter.close()
+
+    def test_buffer_only_drains_hinted_keys_from_l1(self, l1_manager, skipped_events):
+        """skip_l1 still deletes hinted keys, so a noop-eviction L1 empties."""
+        adapter = make_adapter()
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=BufferOnlyStorePolicy(),
+        )
+        ctrl.start()
+        kept = [make_object_key(0)]
+        skipped = [make_hinted_key(i, True) for i in range(1, 4)]
+        try:
+            write_keys_to_l1(l1_manager, kept + skipped, make_layout())
+
+            assert skipped_events.arrived.wait(timeout=5.0)
+            ok = wait_for_condition(
+                lambda: l1_manager.get_memory_usage()[0] == 0, timeout=5.0
+            )
+            assert ok, "Buffer-only L1 should drain hinted and stored keys"
+            assert adapter.debug_has_key(kept[0])
+            assert not any(adapter.debug_has_key(k) for k in skipped)
+        finally:
+            ctrl.stop()
+            adapter.close()
+
+    def test_no_live_adapter_reports_no_skip(self, l1_manager, skipped_events):
+        """Without a live adapter the hint is not counted as a skip."""
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[],
+            adapter_descriptors=[],
+            policy=DefaultStorePolicy(),
+        )
+        ctrl.start()
+        try:
+            write_keys_to_l1(l1_manager, [make_hinted_key(0, True)], make_layout())
+
+            assert not skipped_events.arrived.wait(timeout=0.5)
+        finally:
+            ctrl.stop()
+
+    def test_invalid_hint_warning_is_rate_limited(self, l1_manager):
+        """Two malformed-hint batches within the interval warn once."""
+        adapter = make_adapter()
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultStorePolicy(),
+        )
+        capture = _WarningCapture()
+        controller_logger = logging.getLogger(store_controller_module.__name__)
+        controller_logger.addHandler(capture)
+        ctrl.start()
+        try:
+            for chunk_id in range(2):
+                key = make_hinted_key(chunk_id, "x" * 1000)
+                write_keys_to_l1(l1_manager, [key], make_layout())
+                ok = wait_for_condition(
+                    lambda key=key: adapter.debug_has_key(key), timeout=5.0
+                )
+                assert ok, "A key with a malformed hint should be stored"
+        finally:
+            ctrl.stop()
+            adapter.close()
+            controller_logger.removeHandler(capture)
+
+        assert len(capture.records) == 1
+        message = capture.records[0].getMessage()
+        assert SKIP_L2_STORE_CONFIG in message
+        assert "str" in message
+        assert "x" * 100 not in message

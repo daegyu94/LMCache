@@ -41,6 +41,8 @@ class EventType(Enum):
     # L2 Store Controller events
     L2_STORE_SUBMITTED = "l2.store.submitted"
     L2_STORE_COMPLETED = "l2.store.completed"
+    # Newly written L1 keys the StoreController kept out of L2.
+    L2_STORE_SKIPPED = "l2.store.skipped"
 
     # L2 Prefetch Controller events
     L2_PREFETCH_LOOKUP_SUBMITTED = "l2.prefetch.lookup.submitted"

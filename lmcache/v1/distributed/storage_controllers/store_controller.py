@@ -46,6 +46,62 @@ logger = init_logger(__name__)
 # Poll timeout in milliseconds for the store loop
 STORE_LOOP_POLL_TIMEOUT_MS = 500
 
+SKIP_L2_STORE_CONFIG = "lmcache.skip_l2_store"
+"""Request config: ``true`` keeps the request's newly written keys out of L2."""
+
+# Minimum seconds between warnings about malformed skip-L2-store hints.
+INVALID_HINT_WARNING_INTERVAL_S = 10.0
+
+
+@dataclass(frozen=True)
+class SkipL2StoreSplit:
+    """Result of :func:`split_by_skip_l2_store_hint`."""
+
+    to_store: list[ObjectKey]
+    """Keys to hand to the store policy, in input order (duplicates kept)."""
+
+    skipped: list[ObjectKey]
+    """Distinct keys every occurrence of which asked to skip L2."""
+
+    invalid: list[ObjectKey]
+    """Distinct keys with a non-bool hint; they are in ``to_store``."""
+
+
+def split_by_skip_l2_store_hint(keys: list[ObjectKey]) -> SkipL2StoreSplit:
+    """Split newly written keys by the ``lmcache.skip_l2_store`` request hint.
+
+    The hint is read from each key's ``extra_attributes`` (the writing
+    request's ``lmcache.*`` request configs). A key is skipped only when every
+    occurrence of it in ``keys`` carries ``true``; one occurrence without the
+    hint, or with ``false``, keeps the key. A hint that is not a ``bool`` is
+    treated as absent and reported in ``invalid``.
+
+    Args:
+        keys: One batch of keys that finished writing to L1, as popped from
+            the store listener. Equal keys may appear more than once with
+            different ``extra_attributes``.
+
+    Returns:
+        The split; ``to_store`` is ``keys`` itself when nothing is skipped.
+    """
+    skip_votes: dict[ObjectKey, bool] = {}
+    invalid: dict[ObjectKey, None] = {}
+    for key in keys:
+        hint = key.extra_attributes.get(SKIP_L2_STORE_CONFIG, False)
+        if not isinstance(hint, bool):
+            invalid[key] = None
+            hint = False
+        skip_votes[key] = skip_votes.get(key, True) and hint
+    skipped = [key for key, skip in skip_votes.items() if skip]
+    if not skipped:
+        return SkipL2StoreSplit(to_store=keys, skipped=[], invalid=list(invalid))
+    skipped_set = set(skipped)
+    return SkipL2StoreSplit(
+        to_store=[key for key in keys if key not in skipped_set],
+        skipped=skipped,
+        invalid=list(invalid),
+    )
+
 
 def _group_keys_by_shape(
     keys: list[ObjectKey],
@@ -204,7 +260,10 @@ class StoreController(StorageControllerInterface):
     2. Runs a background thread with an event-driven loop using
        select.poll() on the listener eventfd and all L2 adapter
        store eventfds.
-    3. On new keys: consults StorePolicy to decide targets,
+    3. On new keys: drops keys whose request set
+       ``lmcache.skip_l2_store`` (see :func:`split_by_skip_l2_store_hint`)
+       and applies the policy's ``select_l1_deletions_for_skipped`` to them,
+       consults StorePolicy to decide targets for the rest,
        calls reserve_read to get MemoryObjs, and submits store
        tasks to L2 adapters.
     4. On L2 task completion: releases read locks, optionally
@@ -266,6 +325,8 @@ class StoreController(StorageControllerInterface):
         # Only the store loop thread changes these.
         self._deferred_l1_deletions: set[ObjectKey] = set()
         self._last_l1_deletion_retry = 0.0
+        # Monotonic time of the last malformed-hint warning (rate limit).
+        self._last_invalid_hint_warning = float("-inf")
 
         # Shadow counter for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -574,6 +635,10 @@ class StoreController(StorageControllerInterface):
         """
         Process a batch of newly written keys.
 
+        0. While a live adapter exists, drop keys whose request asked to
+           skip L2, apply the policy's ``select_l1_deletions_for_skipped`` to
+           them, and report them with one ``L2_STORE_SKIPPED`` event after
+           the submissions below.
         1. Ask the policy which adapters each key should go to.
         2. For each adapter target, reserve read access on L1 to get
            MemoryObj references (skip keys that fail — best-effort).
@@ -586,11 +651,6 @@ class StoreController(StorageControllerInterface):
 
         # A rewritten key is deleted again once its own store finishes.
         self._deferred_l1_deletions.difference_update(keys)
-        for group in _group_keys_by_shape(keys).values():
-            self._submit_store_for_single_shape(group)
-
-    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
-        """Submit ``keys`` (all same shape) to their target adapters."""
         # Only route to adapters that are live (not draining). Descriptors
         # for draining adapters are kept for in-flight completion handling
         # but excluded here so no new task targets them.
@@ -599,6 +659,42 @@ class StoreController(StorageControllerInterface):
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
+        split = split_by_skip_l2_store_hint(keys)
+        if split.invalid:
+            self._warn_invalid_skip_hint(split.invalid)
+        # Without a live adapter nothing is stored either way, so the hint
+        # changes nothing and must not be counted as a skip.
+        to_store = split.to_store if routing_descriptors else keys
+        for group in _group_keys_by_shape(to_store).values():
+            self._submit_store_for_single_shape(group, routing_descriptors)
+        if split.skipped and routing_descriptors:
+            # The policy still owns L1 retention: skip_l1 must drain skipped
+            # keys too, or buffer-only L1 (noop eviction) fills up.
+            delete_keys = self._policy.select_l1_deletions_for_skipped(split.skipped)
+            if delete_keys:
+                self._delete_from_l1(delete_keys)
+            # Published after the submissions so the event also marks the
+            # batch as fully handled.
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_STORE_SKIPPED,
+                    metadata={
+                        "reason": "request_hint",
+                        "key_count": len(split.skipped),
+                        "key_count_per_salt": Counter(
+                            k.cache_salt for k in split.skipped
+                        ),
+                    },
+                )
+            )
+
+    def _submit_store_for_single_shape(
+        self,
+        keys: list[ObjectKey],
+        routing_descriptors: list[L2AdapterDescriptor],
+    ) -> None:
+        """Submit ``keys`` (all same shape) to their target adapters among
+        ``routing_descriptors`` (the live, non-draining adapters)."""
         plan = self._policy.select_store_targets(keys, routing_descriptors)
 
         l1_mgr = self._l1_manager
@@ -716,6 +812,22 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(successful_keys),
             )
+
+    def _warn_invalid_skip_hint(self, keys: list[ObjectKey]) -> None:
+        """Warn, at most once per interval, about non-bool skip hints."""
+        now = time.monotonic()
+        if now - self._last_invalid_hint_warning < INVALID_HINT_WARNING_INTERVAL_S:
+            return
+        self._last_invalid_hint_warning = now
+        # Only the type is logged: the value is client-controlled and unbounded.
+        logger.warning(
+            "Ignoring non-bool %s of type %s on %d key(s), e.g. %s; "
+            "the keys are stored to L2 as usual.",
+            SKIP_L2_STORE_CONFIG,
+            type(keys[0].extra_attributes[SKIP_L2_STORE_CONFIG]).__name__,
+            len(keys),
+            keys[0],
+        )
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
