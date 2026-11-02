@@ -1,41 +1,41 @@
 # `kv_version.py`: Bounded-Staleness, Version-Qualified KV
 
-The MP server can keep KV of several producer versions apart and serve a
-request KV that is at most `max_kv_staleness` versions old, reporting which
-version each served span came from. The driving workload is asynchronous RL
+The MP server can keep KV of several producer versions apart, serve a request
+KV that is at most `max_kv_staleness` versions old, and report which version
+each served span came from. The driving workload is asynchronous RL
 (PipelineRL, AReaL, prime-rl): the rollout fleet updates weights in flight,
 several weight versions are live, and a request sampled under version `v` may
 continue after the engine moved to `v+1`. Without this feature a deployment
 has two choices: one key space for all versions (stale reuse, unbounded and
 invisible), or a per-version `cache_salt` (hard isolation, no cross-version
-reuse at all). The feature is opt-in per request; a request without the hint
+reuse). The feature is opt-in per request; a request without the hint
 resolves exactly today's keys.
 
 Nothing in the server interprets "version" as weights: it is an opaque
-integer the client attaches to the KV it produces (weights, adapter, or any
-other producer revision), in the spirit of `lmcache.skip_load`.
+integer the client attaches to the KV it produces, in the spirit of
+`lmcache.skip_load`. This is a proof of concept; where a choice was needed
+the simplest safe semantics won.
 
 ## Request hints
 
 | Key (`request_configs`) | Type | Meaning |
 |---|---|---|
 | `lmcache.kv_version` | int, `0 <= v < 2^63` | version of the KV this request computes |
-| `lmcache.max_kv_staleness` | int, `0..16`, default 0 | accept cached KV with version in `[v - s, v]` |
+| `lmcache.max_kv_staleness` | int `>= 0`, default 0, capped at 16 | accept cached KV with version in `[v - s, v]` |
 
-Malformed hints never widen what the client asked for:
+Hints the server cannot honour never widen what the client asked for:
 
 | Hint | Treatment |
 |---|---|
-| `kv_version` not an int (bool, str, float), negative, `>= 2^63` | versioning off for the request: today's unversioned keys |
+| `kv_version` not an int (bool, str, float), negative, `>= 2^63` | fail closed: no load (lookup reports a miss without prefetching) and no store |
 | `max_kv_staleness` not an int or negative | window narrowed to the exact version |
-| `max_kv_staleness > 16` | capped to 16 (bounds lookup rounds, below) |
+| `max_kv_staleness > 16` | capped to 16 (bounds the lookup rounds, below) |
 | `max_kv_staleness` without `kv_version` | ignored |
 | `max_kv_staleness > 0` on a layout with a sliding-window group | narrowed to 0 (see Non-scope) |
+| any `kv_version` on a server not in LMCache-driven transfer mode | fail closed: no load (see Capability) |
 
-Each problem is logged by a rate-limited warner (once per 60 s per problem,
-with an occurrence count) that never logs the client's raw value. The lookup
-and the store-key resolution are the two places a request's hints first
-reach the server, so only they warn.
+Problems go to one process-wide warner that reports each problem at most once
+per 60 s with an occurrence count, and never logs the client's raw value.
 
 ## Where the version lives: key namespace, not object metadata
 
@@ -49,103 +49,164 @@ versioned_chunk_hash(h_i, version) =
 
 where `h_i` is the ordinary prefix-chained token hash. The version is part of
 `ObjectKey.chunk_hash`, so it is part of the object's identity in L1, in every
-L2 adapter's on-media key, in P2P transfers and in KV events, with no change
-to `ObjectKey`, serde or any adapter. The token chain is not re-hashed per
-version: `h_i` depends on tokens only, so chunks of different versions can be
-mixed along one prefix.
+L2 adapter's on-media key and in P2P transfers, with no change to `ObjectKey`,
+serde or any adapter. The token chain is not re-hashed per version: `h_i`
+depends on tokens only, so chunks of different versions can be mixed along
+one served prefix.
 
 The alternative, the version stored as object metadata with an unversioned
 key, was rejected:
 
 | | Key namespace (chosen) | Metadata on the object |
 |---|---|---|
-| L1 + every L2 adapter | works unchanged (opaque hash) | version must be plumbed through `MemoryObj` metadata, serde and each adapter's stored format |
-| two versions of the same tokens | coexist as different objects | collide: L1 rejects the second write (`KEY_NOT_WRITABLE`), so the first version sticks until eviction and newer requests miss forever |
-| lookup cost | up to `s + 1` prefetch rounds | 1 round, plus a post-lookup version check |
+| L1 + every L2 adapter | works unchanged (opaque hash) | version plumbed through `MemoryObj` metadata, serde and each adapter's stored format |
+| two versions of the same tokens | coexist as different objects | collide: L1 rejects the second write (`KEY_NOT_WRITABLE`), the first version sticks until eviction and newer requests miss |
+| lookup cost | up to `s + 1` prefetch rounds | 1 round plus a version check |
 | capacity | one copy per live version | one copy |
 
-Correctness for L1 *and* L2 with zero adapter changes decided it; the probe
-cost is bounded (`s <= 16`, typically 1-4) and is paid only by requests that
-ask for a window.
+## What is stored: only KV of exactly one version
 
-## Lookup: newest-first probe, one round per version
+KV is stored only under the request's own `kv_version`, and only if every run
+the request's lookup served has that version
+(`KVVersionAssignment.allows_store`). A request served older KV computes the
+rest of its prompt with new weights attending to the old KV, so that KV
+belongs to no single version:
+
+- stored under the request's version, a later exact-version request would get
+  KV derived from older weights as an exact hit;
+- stored under the older version, a later exact older-version request would
+  get KV computed with newer weights, and that older version's real KV could
+  never be written (`KEY_NOT_WRITABLE`).
+
+Either breaks the window, so it is not stored. The gate is
+`MPCacheServerContext.kv_version_allows_store`, checked by the LMCache-driven
+STORE handler after key resolution: a refused store commits nothing and
+answers success with an empty event handle (no device work). It also refuses
+every store of a request with a malformed `kv_version`. The cost: a
+stale-served request adds nothing to the cache; the next request that misses
+on the stale part recomputes it from scratch and stores fresh KV.
+
+## Lookup
 
 ```
 lookup(key, v, s), chunk hashes h_0..h_{n-1}, p = key.start (engine-covered prefix)
-  round 0: prefetch [p, n) under version v       -> hits [p, p+r0)   run (p, p+r0, v)
-  round 1: prefetch [p+r0, n) under v-1          -> hits r1          run (.., v-1)
-  ...       until p reaches n or the version drops below max(0, v-s)
-  hit = final p; session records the runs
+  s == 0: one ordinary prefetch of [p, n) under version v      run (p, hit, v)
+  s >  0: a probe worker, newest first, one round per version:
+    round 0: prefetch [p, n) under v      -> hits [p, p+r0)   run (p, p+r0, v)
+    round 1: prefetch [p+r0, n) under v-1 -> hits r1          run (.., v-1)
+    ...      until p reaches n or the version drops below max(0, v-s)
+  the session records the runs before the hit length
 ```
 
 Each round is an ordinary `PrefetchTaskSpec` (prefix policy, read locks) over
 the remaining suffix, exactly like the engine-covered suffix lookup that
-already exists. A finished round is consumed by `query_prefetch_status` /
-`wait_prefetch_status`; if chunks and versions remain, the module submits the
-next round and reports "still running" (`None`), so the connector's polling
-contract is unchanged. `wait_prefetch_status`'s timeout bounds all rounds.
+already exists. Properties:
 
-Properties:
-
-- A chunk whose only cached versions lie outside the window is a miss and
-  ends the prefix: no round can serve it.
-- Every round lowers the version, so at most `s + 1` rounds run, and served
+- A chunk whose cached versions all lie outside the window is a miss and ends
+  the prefix.
+- Every round lowers the version, so at most `s + 1` rounds run and served
   versions never increase along the prompt. The probe prefers the newest
   version at the start of each run rather than per chunk; per-chunk newest
-  would cost up to `(s + 1)` rounds per run.
-- `s = 0` is one round: the same cost as an unversioned lookup.
-- Locks are taken per round on the served keys only; their union is the
-  served prefix, so `free_lookup_locks` releases exactly them.
+  would cost up to `s + 1` rounds per run.
+- `s = 0` is one prefetch: the same cost as an unversioned lookup.
+
+### The probe worker
+
+Rounds of an `s > 0` lookup are driven on the server by a small pool
+(`_KV_PROBE_WORKERS = 4` threads, more probes queue): a worker waits for a
+round with `wait_prefetch_status` and submits the next one at once, so a
+round costs a prefetch, not a scheduler step plus an RPC. `QUERY_PREFETCH_STATUS`
+reports `None` until the worker has recorded the result; `WAIT_PREFETCH_STATUS`
+waits for the worker, its timeout bounding all rounds.
+
+Ownership is explicit: only the worker submits rounds. It records the result
+on the session (runs, then hit length and L1 owners) under the probe lock, and
+only if the probe was not cancelled. Cancellation happens when the lookup is
+abandoned before its result is recorded:
+
+| Event | Effect |
+|---|---|
+| `FREE_LOOKUP_LOCKS` mid-probe | the probe is cancelled and its job dropped; only `extra_ranges` are released by the call |
+| a new `LOOKUP` of the same request | the old probe is cancelled before the new lookup touches the session |
+| `END_SESSION` mid-probe | the probe is cancelled before the session is removed |
+| an unexpected error in the worker | the probe is cancelled; the lookup reports a miss |
+
+A cancelled probe's worker releases every read lock its rounds took, including
+the round in flight when it ends. No other path releases them, so there is
+neither a leak nor a double release, and a cancelled probe can never write
+into a newer lookup's session or job (the worker never registers jobs, and a
+consumed job is only removed if it is still the registered one). A probe whose
+result is already recorded is a plain lookup result and is released by
+`FREE_LOOKUP_LOCKS` through the session as before.
+
+Locks are taken per round on the served keys only; their union is the served
+prefix, so `free_lookup_locks` releases exactly them. A request's earlier,
+abandoned lookups (vLLM's APC-shrink re-lookup) keep their runs on the
+session, so `extra_ranges` release under the versions those lookups locked; a
+range no lookup served is left to the read-lock TTL rather than guessed.
 
 ## Chunk-to-version map (`KVVersionAssignment`)
 
-Store, retrieve, lock release and `END_SESSION` touch resolve keys through one
-map built from the session's served runs:
+Retrieve, lock release and the `END_SESSION` touch resolve keys through one
+map built from the session's served runs: a chunk inside a served run keeps
+that run's version; every other chunk uses the request's `kv_version`.
+`MPCacheServerContext.resolve_obj_keys` applies it for STORE and RETRIEVE;
+`LookupModule` applies it for lock release (`resolve_prefetched_obj_keys`
+takes it as a required argument, so no caller can silently release
+unversioned keys). The touch of the engine-covered prefix at lookup is
+skipped for versioned requests: LMCache did not serve those chunks, so which
+version's copy to refresh is unknown.
 
-- a chunk inside a served run keeps that run's version (retrieve reads and
-  releases exactly what the lookup locked; a re-store of a served chunk hits
-  the existing object instead of re-stamping it);
-- every other chunk is stamped `write_version = min(kv_version, oldest served
-  version)`.
+## Capability
 
-The `min` is the staleness guarantee. A chunk computed under `v` attends to
-the reused version-`u` prefix, so its KV depends on `u`; stamping it `u`
-makes "every served chunk was influenced only by versions `>= v - s`" hold
-transitively. Without it, a multi-turn rollout that reuses the previous turn
-each time would chain staleness without bound. The cost: KV computed on a
-stale prefix is not reusable by a stricter request, which recomputes from
-scratch and then stores fresh KV.
+An older server ignores the hints and would serve and store the request in
+the unversioned key space. A server therefore advertises
+`KV_VERSION_CAPABILITY` (`"kv_version"`) through `GET_EXPERIMENTAL`, and only
+in the LMCache-driven transfer mode, whose STORE implements the gate above.
+The engine-driven (`PREPARE`/`COMMIT`) store paths do not; a server in
+`engine_driven` or `auto` mode does not advertise the capability and its
+lookup reports a miss for any versioned request.
 
-`MPCacheServerContext.resolve_obj_keys` applies the map for every
-engine-driven and LMCache-driven STORE/RETRIEVE; `LookupModule` applies it
-for lock release (`resolve_prefetched_obj_keys` takes it as a required
-argument, so no caller can silently release unversioned keys) and for the
-`END_SESSION` touch. A request's earlier, abandoned lookups (vLLM's APC-shrink
-re-lookup) keep their runs on the session, so `extra_ranges` release under
-the versions those lookups locked; a range no lookup served is left to the
-read-lock TTL rather than guessed.
+The vLLM scheduler adapter checks the capability on every server at startup.
+Without it, or with a malformed `kv_version`, the connector bypasses LMCache
+for the request: no lookup, and `max_offload_tokens = 0` so nothing is
+stored. One warning is logged per connector.
+
+## Several servers
+
+Each server holds a shard of the KV (a TP rank set) and would resolve
+versions independently, so with a window two shards could serve one token
+from different versions and store on top of them. The scheduler adapter
+narrows `max_kv_staleness` to 0 when it has more than one server (one
+warning): every shard then serves and stores only `kv_version`, so the shards
+agree by construction. Bounded staleness with several servers would need one
+version decision shared across servers; that is future work.
 
 ## Provenance: `QUERY_KV_VERSION_SPANS`
 
 ```
-connector.request_finished(req)              server LookupModule
-  if lmcache.kv_version in request configs:
-    QUERY_KV_VERSION_SPANS(req_id) ───────►  session runs as
-                                             [(start_tok, end_tok, version), ...]
-                                             None if no session
-    merge over servers, clip to [vLLM hit, LMCache hit)
-    return_params["kv_version_spans"] = [[s, e, v], ...]
-  END_SESSION(req_id)
+connector                               adapter                       server LookupModule
+ get_num_new_matched_tokens  ── check_lookup_result resolves ──►
+                                        QUERY_KV_VERSION_SPANS(req) ─► session runs as
+                                        (futures kept, not awaited)    [(start, end, version)]
+ request_finished ───────────── take_kv_version_spans (never waits)
+   merge over servers (oldest version wins), clip to [vLLM hit, LMCache hit)
+   return_params["kv_version_spans"] = [[0, vllm_hit, None], [s, e, v], ...]
+ END_SESSION
 ```
 
-A new RPC (ZMQ by name, gRPC `LookupService.QueryKvVersionSpans`) rather than
-a wider `QUERY_PREFETCH_STATUS` reply, so the existing contract and every
-engine connector stay untouched. With several servers (TP shards) each server
-resolves versions independently; the adapter keeps tokens every server
-served and reports the oldest version among them. The connector clips to the
-tokens LMCache actually loaded: KV below the vLLM prefix-cache hit came from
-the engine. `None` (server unhealthy, timeout, no session, e.g. reaped after
-`--session-ttl-seconds`) omits the field instead of reporting an empty list.
+The RPC is new (ZMQ by name, gRPC `LookupService.QueryKvVersionSpans`) rather
+than a wider `QUERY_PREFETCH_STATUS` reply, so the existing contract stays
+untouched. It answers `None` while the lookup's result is unconsumed and when
+the server has no session, `[]` when the finished lookup served nothing
+versioned. The adapter sends it when the lookup resolves (every server has
+handed its result over by then) and `request_finished` only collects replies
+that have arrived, so the scheduler thread never blocks; a missing, failed or
+`None` reply omits `kv_version_spans`.
+
+The connector reports the tokens LMCache loaded with their versions, led by
+`[0, n, None]` for the `n` tokens vLLM's own prefix cache supplied: their
+version is unknown to LMCache.
 
 The spans are diagnostics: a framework can log them per trajectory, mask
 stale spans out of the loss, or decide to recompute. They are not needed for
@@ -155,31 +216,42 @@ included.
 
 ## Assumptions
 
-- The engine's own prefix cache holds no KV older than the request's
-  `kv_version` (reset the engine's prefix cache after loading new weights,
-  or accept that engine-held KV is outside this accounting). LMCache stamps
-  what the engine stores with the request's write version.
-- The stamp records the *declared* version. A request that straddles an
-  in-flight weight update keeps its declared version, which is the oldest
-  weights that contributed: conservative, never fresher than reality.
-- Chunk granularity: spans are chunk-aligned.
+- **vLLM's prefix cache.** LMCache cannot version KV the engine holds itself
+  and reports it as `[0, n, None]`. Two ways keep it out of the window
+  accounting: reset vLLM's prefix cache when loading new weights (keeps
+  cross-version reuse through LMCache), or give requests a per-version vLLM
+  `cache_salt` (for example `f"v{weight_version}"`). The salt is part of the
+  LMCache key as well, so it also isolates LMCache by version: the window then
+  only ever matches the exact version, which is hard isolation again.
+- **Declared version.** A request that straddles an in-flight weight update
+  keeps its declared version, which is the oldest weights that contributed:
+  conservative, never fresher than reality.
+- Spans are chunk-aligned.
 
 ## Non-scope
 
 - **Sliding-window / hybrid layouts**: a later round's window check would need
   the trailing chunks of an earlier round, which its rows do not contain, and
   the session lock model would no longer match. `max_kv_staleness` is
-  narrowed to 0 (exact version, one round) with a warning.
-- **CacheBlend** (`CB_UNIFIED_LOOKUP`, blend store): ignores the hints and
-  uses unversioned keys. Do not combine `lmcache.kv_version` with blend.
+  narrowed to 0 (exact version, one round).
+- **Engine-driven transfer**: no store gate, so versioning is disabled (fail
+  closed). A client that ignores the missing capability and sends a
+  malformed `kv_version` to such a server could still store unversioned KV
+  through its `PREPARE`/`COMMIT` path; the vLLM connector never does.
+- **CacheBlend** (`CB_UNIFIED_LOOKUP`, blend store) ignores the hints and uses
+  unversioned keys. Do not combine `lmcache.kv_version` with blend.
 - **Token-addressed cache control** (HTTP pin / prefetch / delete through
   `key_resolver`, coordinator directory queries) addresses unversioned keys
   only.
-- **Connectors**: only the vLLM MP connector returns `kv_version_spans`. Other
-  MP connectors get versioned keys if they forward the request's `lmcache.*`
-  configs, but no spans.
+- **Connectors**: only the vLLM MP connector checks the capability, bypasses
+  unservable requests and returns `kv_version_spans`.
 - **Capacity**: each live version holds its own copy; eviction treats them as
   unrelated objects. Old versions age out under the normal eviction policy.
-- **KV events / routers**: stored/removed events of versioned objects carry
-  the version-qualified hash; a router that recomputes token-only hashes does
-  not match them.
+- **KV events**: server-side stored/removed events (`MP_TOKENS` bindings) of
+  versioned objects carry the version-qualified hash. The vLLM worker
+  adapter's fallback store events, which hash tokens locally, are not emitted
+  for versioned stores, since a token-only hash would name an object that
+  does not exist. A router that recomputes token-only hashes does not match
+  versioned KV.
+- **Capability changes** after the adapter started (a server replaced by an
+  older one) are not detected.

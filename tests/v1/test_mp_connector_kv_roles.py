@@ -837,32 +837,40 @@ def test_full_prompt_hit_stays_chunk_aligned_under_prefix_replay(
         scheduler.shutdown()
 
 
+def _versioned_request(params: dict[str, Any]) -> Request:
+    request = _request()
+    request.kv_transfer_params = params
+    request.sampling_params = SimpleNamespace(extra_args={"kv_transfer_params": params})
+    return request
+
+
 def test_request_finished_returns_kv_version_spans(
     connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
     mock_io: SimpleNamespace,
 ) -> None:
     """A request with ``lmcache.kv_version`` gets the served version spans,
-    clipped to what LMCache loaded, queried before the session ends."""
+    collected without blocking, before the session ends; the vLLM-cached
+    prefix is reported with an unknown version."""
     scheduler, _ = connectors
-    request = _request()
-    params = {"lmcache.kv_version": 3, "lmcache.max_kv_staleness": 1}
-    request.kv_transfer_params = params
-    request.sampling_params = SimpleNamespace(extra_args={"kv_transfer_params": params})
+    request = _versioned_request(
+        {"lmcache.kv_version": 3, "lmcache.max_kv_staleness": 1}
+    )
+    mock_io.scheduler.supports_kv_versions = True
     mock_io.scheduler.check_lookup_result.side_effect = [8]
-    mock_io.scheduler.query_kv_version_spans.return_value = [(4, 8, 2)]
+    mock_io.scheduler.take_kv_version_spans.return_value = [(4, 8, 2)]
     calls = MagicMock()
-    calls.attach_mock(mock_io.scheduler.query_kv_version_spans, "query")
+    calls.attach_mock(mock_io.scheduler.take_kv_version_spans, "take")
     calls.attach_mock(mock_io.scheduler.end_session, "end_session")
 
     assert scheduler.get_num_new_matched_tokens(request, 4) == (4, True)
     _, returned = scheduler.request_finished(request, [])
 
-    assert returned == {"kv_version_spans": [[4, 8, 2]]}
-    assert [c[0] for c in calls.mock_calls][:2] == ["query", "end_session"]
-    mock_io.scheduler.query_kv_version_spans.assert_called_once_with("request", 4, 8)
+    assert returned == {"kv_version_spans": [[0, 4, None], [4, 8, 2]]}
+    assert [c[0] for c in calls.mock_calls][:2] == ["take", "end_session"]
+    mock_io.scheduler.take_kv_version_spans.assert_called_once_with("request", 4, 8)
 
 
-def test_request_finished_without_kv_version_does_not_query_spans(
+def test_request_finished_without_kv_version_does_not_take_spans(
     connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
     mock_io: SimpleNamespace,
 ) -> None:
@@ -872,4 +880,25 @@ def test_request_finished_without_kv_version_does_not_query_spans(
     scheduler.get_num_new_matched_tokens(request, 0)
     _, returned = scheduler.request_finished(request, [])
     assert returned is not None and "kv_version_spans" not in returned
-    mock_io.scheduler.query_kv_version_spans.assert_not_called()
+    mock_io.scheduler.take_kv_version_spans.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "supported, version", [(False, 3), (True, "3"), (True, 3.0), (True, True)]
+)
+def test_unservable_kv_version_neither_loads_nor_stores(
+    connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
+    mock_io: SimpleNamespace,
+    supported: bool,
+    version: object,
+) -> None:
+    """An older server or a malformed version must not fall back to the
+    unversioned key space: no lookup and no store for the request."""
+    scheduler, _ = connectors
+    request = _versioned_request({"lmcache.kv_version": version})
+    mock_io.scheduler.supports_kv_versions = supported
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    mock_io.scheduler.maybe_submit_lookup_request.assert_not_called()
+    # No chunk is ever offloaded for the request.
+    assert scheduler.request_trackers["request"].max_offload_tokens == 0

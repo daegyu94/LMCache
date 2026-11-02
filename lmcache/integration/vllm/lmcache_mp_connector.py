@@ -84,7 +84,10 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import CacheRemoveEvent
 from lmcache.utils import init_logger as lmcache_init_logger
-from lmcache.v1.multiprocess.kv_version import KV_VERSION_CONFIG
+from lmcache.v1.multiprocess.kv_version import (
+    KV_VERSION_CONFIG,
+    parse_kv_version_hints,
+)
 
 try:
     # First Party
@@ -761,6 +764,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 required_chunk_alignment=scheduler_block_size,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Whether the versioned-request bypass warning was logged.
+            self._warned_kv_version_bypass = False
             # Worker events aggregated per step, awaiting take_events().
             self._kv_cache_events: list[KVCacheEvent] = []
 
@@ -1317,6 +1322,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             into account.
         """
         tracker = self._get_or_create_request_tracker(request)
+        if self._bypass_unservable_kv_version(tracker):
+            return 0, False
 
         # A failed asynchronous load is bypassed until vLLM admits the request
         # for local computation via update_state_after_alloc().  The scheduler
@@ -1681,8 +1688,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             returned by the engine. A request whose ``kv_transfer_params`` set
             ``lmcache.kv_version`` gets ``kv_version_spans``:
             ``[[start_token, end_token, kv_version], ...]`` for the prompt
-            tokens loaded from LMCache, omitted when the servers cannot
-            answer.
+            tokens loaded from LMCache, led by ``[0, n, None]`` for the ``n``
+            tokens vLLM's own prefix cache supplied (version unknown). It is
+            omitted when the spans are not known.
         """
 
         params: dict[str, Any] | None = getattr(request, "kv_transfer_params", None)
@@ -1708,15 +1716,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             and tracker is not None
             and KV_VERSION_CONFIG in (tracker.request_configs or {})
         ):
-            # Before end_session below, which drops the servers' record. KV
-            # below the vLLM hit came from vLLM's own prefix cache.
-            spans = self.scheduler_adapter.query_kv_version_spans(
-                request.request_id,
-                tracker.num_vllm_hit_tokens,
-                tracker.num_lmcache_hit_tokens,
+            # Collected when the lookup resolved; this never waits. KV below
+            # the vLLM hit came from vLLM's own prefix cache, whose version
+            # LMCache cannot know: reported with version None.
+            num_vllm = tracker.num_vllm_hit_tokens
+            spans = self.scheduler_adapter.take_kv_version_spans(
+                request.request_id, num_vllm, tracker.num_lmcache_hit_tokens
             )
             if spans is not None:
-                return_params["kv_version_spans"] = [list(span) for span in spans]
+                unknown = [[0, num_vllm, None]] if num_vllm > 0 else []
+                return_params["kv_version_spans"] = unknown + [
+                    list(span) for span in spans
+                ]
 
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
@@ -1984,6 +1995,38 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if records:
             self.scheduler_adapter.report_block_allocations(records)
+
+    def _bypass_unservable_kv_version(self, tracker: LMCacheMPRequestTracker) -> bool:
+        """Keep a versioned request away from LMCache when it cannot be served.
+
+        A malformed ``lmcache.kv_version``, or a server that does not honour
+        the hints, would otherwise load from and store into the unversioned
+        key space. Such a request neither loads nor stores (fail closed); a
+        warning is logged once per connector.
+
+        Args:
+            tracker: The request's tracker.
+
+        Returns:
+            True if the request bypasses LMCache.
+        """
+        configs = tracker.request_configs or {}
+        if KV_VERSION_CONFIG not in configs:
+            return False
+        if self.scheduler_adapter.supports_kv_versions and not (
+            parse_kv_version_hints(configs).bypasses_lmcache
+        ):
+            return False
+        if not self._warned_kv_version_bypass:
+            self._warned_kv_version_bypass = True
+            logger.warning(
+                "Requests with lmcache.kv_version bypass LMCache: the hint is "
+                "malformed or an LMCache server does not support it."
+            )
+        tracker.max_offload_tokens = 0
+        if tracker.state == LMCacheMPRequestState.PREFETCHING:
+            tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
+        return True
 
     def _get_request_tracker(self, request_id: str) -> LMCacheMPRequestTracker:
         assert request_id in self.request_trackers, (

@@ -2,6 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from functools import partial
 import threading
@@ -25,10 +26,7 @@ from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.engine_context import (
-    KV_VERSION_HINT_WARN_INTERVAL_S,
-    MPCacheServerContext,
-)
+from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
     DiscoverableModule,
     EngineModule,
@@ -41,15 +39,18 @@ from lmcache.v1.multiprocess.kv_load_policy import (
     create_kv_load_policy,
 )
 from lmcache.v1.multiprocess.kv_version import (
+    KV_VERSION_CAPABILITY,
     KVVersionAssignment,
     KVVersionHintProblem,
-    KVVersionHintWarner,
+    KVVersioning,
     KVVersionRun,
     KVVersionWindow,
-    parse_kv_version_hints,
+    read_kv_version_hints,
     versioned_chunk_hash,
+    warn_kv_version_problem,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens, unpack_token_ids
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
@@ -57,6 +58,11 @@ logger = init_logger(__name__)
 
 # Stateless, so one instance can serve every LookupModule.
 _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
+
+# Concurrent multi-round versioned lookups; more queue for a free worker.
+_KV_PROBE_WORKERS = 4
+# How often a probe worker blocked on a round checks for shutdown.
+_KV_PROBE_POLL_S = 1.0
 
 
 def resolve_prefetched_obj_keys(
@@ -121,12 +127,18 @@ def resolve_prefetched_obj_keys(
 class _KVVersionProbe:
     """A versioned lookup that probes its window newest-first.
 
-    Each prefetch round looks up chunks ``[p, n)`` under one version, where
-    ``p`` is where the earlier rounds' hits ended, and the next round lowers
-    the version by one. A lookup therefore runs at most
-    ``max_staleness + 1`` rounds, and the served versions never increase
-    along the prompt. Only one round is in flight at a time; the thread that
-    consumes a round's result is the only one that mutates the probe.
+    Round ``r`` prefetches chunks ``[p, n)`` under version
+    ``window.version - r``, where ``p`` is where the earlier rounds' hits
+    ended. A worker thread (``LookupModule._drive_kv_probe``) submits each
+    round as soon as the previous one finishes, so the rounds do not wait for
+    the engine to poll. A lookup runs at most ``max_staleness + 1`` rounds and
+    the served versions never increase along the prompt.
+
+    Ownership: only the driver submits rounds and writes the round fields.
+    ``cancelled`` and ``recorded`` change only under ``lock``. Once
+    ``finished`` is set the driver no longer touches the probe. A cancelled
+    probe's driver releases every lock its rounds took; a recorded probe has
+    handed its locks to the session like a plain lookup.
     """
 
     window: KVVersionWindow
@@ -136,32 +148,26 @@ class _KVVersionProbe:
     group_layout_descs: dict[int, MemoryLayoutDesc]
     attn_desc: AttnWindowDesc
     num_kv_readers: int
-    # Version the in-flight round looks up.
+    # The in-flight round: its version, first chunk, spec and handle.
     version: int
+    round_start: int
+    round_spec: PrefetchTaskSpec
+    handle: PrefetchHandle
     # Accumulated over finished rounds.
+    hit_chunks: int
     runs: list[KVVersionRun] = field(default_factory=list)
+    locked: list[tuple[list[ObjectKey], dict[ObjectKey, int]]] = field(
+        default_factory=list
+    )
     l1_chunks: int = 0
     l2_chunks: int = 0
     l1_hit_keys: int = 0
     l2_hit_keys: int = 0
     l1_owners: dict[ObjectKey, int] = field(default_factory=dict)
-
-    def add_round(
-        self,
-        start_chunk: int,
-        end_chunk: int,
-        l1_chunks: int,
-        l2_chunks: int,
-        result: PrefetchResult,
-    ) -> None:
-        """Account one finished round that hit ``[start_chunk, end_chunk)``."""
-        if end_chunk > start_chunk:
-            self.runs.append(KVVersionRun(start_chunk, end_chunk, self.version))
-        self.l1_chunks += l1_chunks
-        self.l2_chunks += l2_chunks
-        self.l1_hit_keys += result.l1_hit_count
-        self.l2_hit_keys += result.l2_hit_count
-        self.l1_owners.update(result.l1_owners)
+    cancelled: bool = False
+    recorded: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    finished: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -195,8 +201,11 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
-    # Set for a request with ``lmcache.kv_version``; ``handle`` is then the
-    # in-flight round and ``start_chunk`` that round's first chunk.
+    # The version a single-round versioned lookup (``max_kv_staleness`` 0)
+    # looked up; None for unversioned and multi-round lookups.
+    kv_version: int | None = None
+    # Set for a multi-round versioned lookup; its driver owns the rounds and
+    # ``handle`` is unused.
     kv_probe: _KVVersionProbe | None = None
 
 
@@ -204,8 +213,8 @@ class LookupModule(DiscoverableModule):
     """Handles lookup, prefetch polling, lock release, and session lifecycle.
 
     Owns the prefetch-job bookkeeping (``_prefetch_jobs``) and exposes
-    handlers for the LOOKUP, QUERY_PREFETCH_STATUS, FREE_LOOKUP_LOCKS, and
-    END_SESSION request types.
+    handlers for the LOOKUP, QUERY_PREFETCH_STATUS, FREE_LOOKUP_LOCKS,
+    END_SESSION and QUERY_KV_VERSION_SPANS request types.
 
     Args:
         ctx: Shared engine context providing storage manager, token hasher,
@@ -213,33 +222,52 @@ class LookupModule(DiscoverableModule):
             chunk size.
         load_policy: Decides per lookup whether to serve the request or let
             the engine recompute it. Defaults to ``DefaultKVLoadPolicy``.
+        kv_versioning: Whether requests with ``lmcache.kv_version`` are
+            served. Only the LMCache-driven STORE path refuses KV that
+            belongs to no single version, so the server enables it only in
+            that transfer mode. Defaults to ``DISABLED`` (fail closed).
     """
 
     module_name = "lookup"
 
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
-        """Build the lookup module; it applies to every configuration."""
+        """Build the lookup module; it applies to every configuration.
+
+        KV versioning is enabled, and advertised as
+        :data:`~lmcache.v1.multiprocess.kv_version.KV_VERSION_CAPABILITY`,
+        only in the LMCache-driven transfer mode.
+        """
+        kv_versioning = KVVersioning.DISABLED
+        if build_ctx.mp_config.supported_transfer_mode == "lmcache_driven":
+            kv_versioning = KVVersioning.ENABLED
+            build_ctx.add_experimental(KV_VERSION_CAPABILITY)
         return cls(
             build_ctx.engine_context,
             create_kv_load_policy(
                 build_ctx.mp_config.kv_load_policy,
                 build_ctx.mp_config.runtime_plugin_config.extra_config,
             ),
+            kv_versioning=kv_versioning,
         )
 
     def __init__(
         self,
         ctx: MPCacheServerContext,
         load_policy: KVLoadPolicy = _DEFAULT_LOAD_POLICY,
+        *,
+        kv_versioning: KVVersioning = KVVersioning.DISABLED,
     ) -> None:
         self._ctx = ctx
         self._load_policy = load_policy
+        self._kv_versioning = kv_versioning
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
-        self._kv_version_hint_warner = KVVersionHintWarner(
-            KV_VERSION_HINT_WARN_INTERVAL_S
+        # Drives multi-round versioned lookups; threads start on first use.
+        self._kv_probe_pool = ThreadPoolExecutor(
+            max_workers=_KV_PROBE_WORKERS, thread_name_prefix="lmcache-kv-probe"
         )
+        self._closing = threading.Event()
         self._setup_metrics()
 
     @property
@@ -258,8 +286,13 @@ class LookupModule(DiscoverableModule):
         }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Stop the version-probe workers.
+
+        Probes still running stop at their next wait; their read locks are
+        left to the read-lock TTL.
+        """
+        self._closing.set()
+        self._kv_probe_pool.shutdown(wait=False, cancel_futures=True)
 
     # -----------------------------------------------------------------
     # Handlers
@@ -279,16 +312,20 @@ class LookupModule(DiscoverableModule):
         request, no prefetch is submitted and the job reports zero hits.
 
         A key whose request configs carry ``lmcache.kv_version`` looks up
-        version-qualified keys, newest version first: each further prefetch
-        round (submitted when the previous one is consumed) continues where
-        the previous hits ended, one version older, until the prompt is
-        covered or the window ``lmcache.max_kv_staleness`` is exhausted. A
-        chunk with no version in the window is a miss and ends the prefix.
+        version-qualified keys. With ``lmcache.max_kv_staleness`` 0 that is one
+        ordinary prefetch. Otherwise a worker thread probes newest version
+        first: each round continues where the previous hits ended, one version
+        older, until the prompt is covered or the window is exhausted. A chunk
+        with no version in the window is a miss and ends the prefix. A
+        malformed version, or versioning disabled on this server, reports a
+        miss without prefetching (fail closed).
 
         Args:
             key: Cache key with request_id embedded.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
+        # A previous multi-round lookup of this request is superseded.
+        self._abandon_kv_probe(key.request_id)
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -404,32 +441,46 @@ class LookupModule(DiscoverableModule):
             )
             return
 
-        window = self._kv_version_hint_warner.parse(key.request_configs)
+        hints = read_kv_version_hints(key.request_configs)
+        window = hints.window
+        if hints.bypasses_lmcache or (
+            window is not None and self._kv_versioning is KVVersioning.DISABLED
+        ):
+            if window is not None:
+                warn_kv_version_problem(KVVersionHintProblem.UNSUPPORTED_TRANSFER_MODE)
+            # Fail closed: a version hint the server cannot honour must never
+            # be served from, or mixed into, the unversioned key space.
+            self._register_empty_prefetch_job(
+                key,
+                requested_tokens=looked_up_tokens,
+                num_object_groups=attn_desc.num_object_groups,
+                attn_desc=attn_desc,
+                engine_covered_chunks=start_chunk,
+                early_exit_reason="kv_version_unsupported",
+            )
+            return
         if window is not None and window.max_staleness > 0:
             # A later round's sliding-window check would need the trailing
             # chunks of an earlier round, which its rows do not contain.
             if any(
                 w != FULL_ATTENTION_WINDOW_CHUNKS for w in attn_desc.num_chunks_in_sw
             ):
-                self._kv_version_hint_warner.warn(
-                    (KVVersionHintProblem.STALENESS_UNSUPPORTED_LAYOUT,)
+                warn_kv_version_problem(
+                    KVVersionHintProblem.STALENESS_UNSUPPORTED_LAYOUT
                 )
                 window = replace(window, max_staleness=0)
 
         # Keep the covered prefix's recency without locking or prefetching
-        # it. After the load policy, so a declined lookup leaves no trace.
-        if start_chunk:
-            covered_hashes = chunk_hashes[:start_chunk]
-            if window is not None:
-                covered_hashes = [
-                    versioned_chunk_hash(h, window.version) for h in covered_hashes
-                ]
+        # it. After the load policy, so a declined lookup leaves no trace. A
+        # versioned request skips it: LMCache did not serve the engine-held
+        # prefix, so which version's copy to refresh is unknown.
+        if start_chunk and window is None:
             self._ctx.storage_manager.touch_cached_keys(
                 [
                     obj_key
                     for group_keys in ipc_key_to_object_keys(
                         key,
-                        covered_hashes,
+                        chunk_hashes[:start_chunk],
                         list(range(attn_desc.num_object_groups)),
                     )
                     for obj_key in group_keys
@@ -451,20 +502,17 @@ class LookupModule(DiscoverableModule):
             )
             return
 
-        kv_probe = None
-        if window is None:
-            spec = PrefetchTaskSpec(
-                key_groups=ipc_key_to_grouped_object_keys(
-                    key,
-                    suffix_hashes,
-                    list(range(attn_desc.num_object_groups)),
-                    group_layout_descs,
-                    attn_desc,
-                ),
-                num_kv_readers=num_kv_readers,
+        if window is not None and window.max_staleness > 0:
+            round_spec = self._kv_round_spec(
+                key,
+                chunk_hashes,
+                start_chunk,
+                window.version,
+                group_layout_descs,
+                attn_desc,
+                num_kv_readers,
             )
-        else:
-            kv_probe = _KVVersionProbe(
+            probe = _KVVersionProbe(
                 window=window,
                 key=key,
                 chunk_hashes=chunk_hashes,
@@ -472,33 +520,48 @@ class LookupModule(DiscoverableModule):
                 attn_desc=attn_desc,
                 num_kv_readers=num_kv_readers,
                 version=window.version,
+                round_start=start_chunk,
+                round_spec=round_spec,
+                handle=self._ctx.storage_manager.submit_prefetch_task(
+                    round_spec, external_request_id=key.request_id
+                ),
+                hit_chunks=start_chunk,
             )
-            spec = self._kv_round_spec(kv_probe, start_chunk)
+            job = self._new_prefetch_job(
+                key, probe.handle, (), looked_up_tokens, attn_desc, start_chunk
+            )
+            job.kv_probe = probe
+            self._register_prefetch_job(job)
+            self._kv_probe_pool.submit(self._drive_kv_probe, job, probe)
+            return
+
+        kv_version = None if window is None else window.version
+        if kv_version is not None:
+            suffix_hashes = [versioned_chunk_hash(h, kv_version) for h in suffix_hashes]
+        spec = PrefetchTaskSpec(
+            key_groups=ipc_key_to_grouped_object_keys(
+                key,
+                suffix_hashes,
+                list(range(attn_desc.num_object_groups)),
+                group_layout_descs,
+                attn_desc,
+            ),
+            num_kv_readers=num_kv_readers,
+        )
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
             external_request_id=key.request_id,
         )
-        self._register_prefetch_job(
-            _PrefetchJob(
-                handle=handle,
-                row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
-                request_id=key.request_id,
-                requested_tokens=looked_up_tokens,
-                num_object_groups=attn_desc.num_object_groups,
-                attn_desc=attn_desc,
-                start_chunk=start_chunk,
-                engine_covered_chunks=start_chunk,
-                prompt_tokens=num_packed_tokens(key.token_bytes),
-                engine_hit_tokens=int(
-                    (key.request_configs or {}).get(
-                        "lmcache.hint.engine_computed_tokens", 0
-                    )
-                ),
-                model_name=model_name,
-                cache_salt=key.cache_salt,
-                kv_probe=kv_probe,
-            )
+        job = self._new_prefetch_job(
+            key,
+            handle,
+            tuple(row.sliding_window_size for row in spec.key_groups),
+            looked_up_tokens,
+            attn_desc,
+            start_chunk,
         )
+        job.kv_version = kv_version
+        self._register_prefetch_job(job)
 
     @request_handler(HandlerType.BLOCKING)
     def query_prefetch_status(
@@ -553,8 +616,8 @@ class LookupModule(DiscoverableModule):
             request_id is unknown (already completed and consumed, or invalid).
 
         Note:
-            A versioned lookup may need several prefetch rounds; ``timeout``
-            bounds the wait for all of them.
+            A multi-round versioned lookup's rounds run on a worker thread;
+            ``timeout`` bounds the wait for all of them.
         """
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
@@ -565,21 +628,13 @@ class LookupModule(DiscoverableModule):
             )
             return 0
 
-        deadline = time.monotonic() + timeout
-        wait_s = timeout
-        while True:
-            if not self._ctx.storage_manager.wait_prefetch_status(job.handle, wait_s):
+        if job.kv_probe is not None:
+            # The probe's worker drives every round; ``timeout`` bounds all.
+            if not job.kv_probe.finished.wait(timeout):
                 return None
-            hit_chunks = self.query_prefetch_status(request_id)
-            if hit_chunks is not None or job.kv_probe is None:
-                return hit_chunks
-            # The finished round submitted the next one; wait for that.
-            with self._prefetch_job_lock:
-                next_job = self._prefetch_jobs.get(request_id)
-            if next_job is None:
-                return 0
-            job = next_job
-            wait_s = max(0.0, deadline - time.monotonic())
+        elif not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
+            return None
+        return self.query_prefetch_status(request_id)
 
     @request_handler(HandlerType.BLOCKING)
     def free_lookup_locks(
@@ -608,6 +663,10 @@ class LookupModule(DiscoverableModule):
         is still running nothing is released: its locks still belong to the
         prefetch controller and expire with the read-lock TTL.
 
+        A multi-round versioned lookup that is still probing is cancelled
+        instead: its worker releases every lock its rounds took, and this
+        call releases only ``extra_ranges``.
+
         Args:
             key: Cache key whose read locks should be released.
             tp_size: Legacy wire field; ignored (kept for payload arity).
@@ -621,6 +680,20 @@ class LookupModule(DiscoverableModule):
             return
 
         session = self._ctx.session_manager.get_or_create(key.request_id)
+        window = read_kv_version_hints(key.request_configs).window
+        if self._abandon_kv_probe(key.request_id):
+            # A multi-round lookup was still running; its worker releases
+            # every lock its rounds took, so only the extra ranges remain.
+            self._finish_read_locks(
+                key, self._extra_range_obj_keys(key, session, window, extra_ranges)
+            )
+            return
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(key.request_id)
+        if job is not None and job.kv_probe is not None:
+            # A finished probe already recorded its result on the session;
+            # report it so the job does not outlive the release.
+            self._consume_prefetch_result(job)
         if session.prefetch_hit_chunks < 0:
             # The lookup result has not reached the session yet (no
             # QUERY/WAIT_PREFETCH_STATUS consumed it). Hand it over now so
@@ -655,7 +728,6 @@ class LookupModule(DiscoverableModule):
         # would drop another request's lock on the shared object key.
         lookup_key = session.lookup_ipc_key
         lock_floor = lookup_key.start if lookup_key is not None else 0
-        window = parse_kv_version_hints(key.request_configs).window
         obj_keys: list[ObjectKey] = []
         if key.start < key.end:
             # The lookup never locked below its own ``start``.
@@ -672,46 +744,8 @@ class LookupModule(DiscoverableModule):
                     ),
                 )
             )
-        chunk_size = self._ctx.chunk_size
-        for range_start, range_end in extra_ranges:
-            if range_start >= range_end:
-                continue
-            abandoned_versions = None
-            if window is not None:
-                abandoned_versions = session.abandoned_kv_version_assignment(
-                    window, range_start // chunk_size, range_end // chunk_size
-                )
-                if abandoned_versions is None:
-                    # Unknown versions mean unknown keys; guessing could strip
-                    # another request's anonymous lock, so leave it to the TTL.
-                    logger.warning(
-                        "free_lookup_locks for request %s: no earlier lookup "
-                        "served [%d, %d); leaving its locks to the read-lock TTL",
-                        key.request_id,
-                        range_start,
-                        range_end,
-                    )
-                    continue
-            # An abandoned lookup's range ends at its hit boundary, so the
-            # range is its own lock model: resolve with that hit, not the
-            # current lookup's.
-            obj_keys.extend(
-                resolve_prefetched_obj_keys(
-                    self._ctx,
-                    replace(key, start=range_start, end=range_end),
-                    range_end // chunk_size,
-                    session.prefetch_locked_gids,
-                    kv_versions=abandoned_versions,
-                )
-            )
-        if not obj_keys:
-            return
-
-        self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys,
-            read_locks=key.require_num_kv_readers(),
-            l1_owners=self._ctx.get_read_owners(key.request_id),
-        )
+        obj_keys.extend(self._extra_range_obj_keys(key, session, window, extra_ranges))
+        self._finish_read_locks(key, obj_keys)
 
     @request_handler(HandlerType.BLOCKING)
     def end_session(self, request_id: str) -> None:
@@ -726,6 +760,8 @@ class LookupModule(DiscoverableModule):
                 metadata={"request_id": request_id},
             )
         )
+        # Before the session goes, so a running probe cannot record into it.
+        self._abandon_kv_probe(request_id)
         session = self._ctx.session_manager.remove(request_id)
         self._ctx.event_bus.publish(
             Event(
@@ -744,7 +780,7 @@ class LookupModule(DiscoverableModule):
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
-        window = parse_kv_version_hints(session.lookup_ipc_key.request_configs).window
+        window = read_kv_version_hints(session.lookup_ipc_key.request_configs).window
         if window is not None:
             chunk_hashes = session.kv_version_assignment(window).apply(chunk_hashes, 0)
         obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
@@ -770,11 +806,15 @@ class LookupModule(DiscoverableModule):
             ``[start_token, end_token, version]`` per served run, in token
             order, chunk-aligned and starting at the lookup's ``start``.
             Several versions mean a mixed prefix; versions never increase
-            along it. Empty when the lookup served no versioned KV (no hint,
-            a miss, or the lookup has not finished). None when the server has
-            no session for ``request_id`` (never looked up, ended, or reaped
-            after its TTL).
+            along it. Empty when the finished lookup served no versioned KV
+            (no hint, or a miss). None when the answer is not known yet or
+            any more: the lookup's result has not been consumed, or the
+            server has no session for ``request_id`` (never looked up,
+            ended, or reaped after its TTL).
         """
+        with self._prefetch_job_lock:
+            if request_id in self._prefetch_jobs:
+                return None
         session = self._ctx.session_manager.get(request_id)
         if session is None:
             return None
@@ -874,66 +914,76 @@ class LookupModule(DiscoverableModule):
         so ``query_prefetch_status`` and ``free_lookup_locks`` cannot disagree
         about what a lookup locked.
 
-        For a versioned lookup, a finished round that leaves chunks and
-        versions to probe submits the next round instead and returns None;
-        only the last round hands the combined result over.
+        A multi-round versioned lookup has already recorded its result on
+        the session from its worker (see ``_drive_kv_probe``); this only
+        reports it once the worker has finished.
 
         Returns:
             The hit chunk count, or None while the prefetch is still running
             (the job is kept so a later call can resolve it).
         """
-        result = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if result is None:
-            return None
-        if job.row_windows:
-            found_count, _retain = fold_unfold_grouped(
-                result.hit_cells, job.row_windows
-            )
-            l1_found_count, _l1_retain = fold_unfold_grouped(
-                result.l1_hit_cells, job.row_windows
-            )
-        else:
-            # Nothing was submitted (early exit), so nothing can be hit.
-            found_count = 0
-            l1_found_count = 0
-
-        # The fold covers only the looked-up sub-range: the tier split is
-        # attributed on it, so the covered prefix never counts as an L1 hit.
-        l1_chunks = min(l1_found_count, found_count)
-        l2_chunks = found_count - l1_chunks
-        # The engine resolves the hit in absolute chunks; shift it back.
-        found_count += job.start_chunk
-        l1_owners = result.l1_owners
-        l1_hit_keys = result.l1_hit_count
-        l2_hit_keys = result.l2_hit_count
-
-        session = self._ctx.session_manager.get_or_create(job.request_id)
         probe = job.kv_probe
         if probe is not None:
-            probe.add_round(job.start_chunk, found_count, l1_chunks, l2_chunks, result)
-            if self._submit_next_kv_round(job, found_count):
+            with probe.lock:
+                recorded = probe.recorded
+            if not recorded and not probe.finished.is_set():
                 return None
-            l1_chunks, l2_chunks = probe.l1_chunks, probe.l2_chunks
-            l1_owners = probe.l1_owners
-            l1_hit_keys, l2_hit_keys = probe.l1_hit_keys, probe.l2_hit_keys
+            # A probe that failed released its locks and serves nothing.
+            found_count = probe.hit_chunks if recorded else job.start_chunk
+            l1_chunks = probe.l1_chunks if recorded else 0
+            l2_chunks = probe.l2_chunks if recorded else 0
+            l1_hit_keys = probe.l1_hit_keys if recorded else 0
+            l2_hit_keys = probe.l2_hit_keys if recorded else 0
             if len(probe.runs) > 1:
                 logger.debug(
                     "Request %s served a mixed-version prefix: %s",
                     job.request_id,
                     probe.runs,
                 )
-            # Before the hit length, so a reader seeing the hit sees its runs.
-            session.record_kv_version_runs(tuple(probe.runs))
+        else:
+            result = self._ctx.storage_manager.query_prefetch_status(job.handle)
+            if result is None:
+                return None
+            if job.row_windows:
+                found_count, _retain = fold_unfold_grouped(
+                    result.hit_cells, job.row_windows
+                )
+                l1_found_count, _l1_retain = fold_unfold_grouped(
+                    result.l1_hit_cells, job.row_windows
+                )
+            else:
+                # Nothing was submitted (early exit), so nothing can be hit.
+                found_count = 0
+                l1_found_count = 0
 
-        # Record the model-wide hit length on the session so a later
-        # free_lookup_locks can reconstruct which keys the prefetch
-        # read-locked (see ``unfold``: full-attention groups lock the whole
-        # hit prefix, sliding-window groups only its in-window suffix).
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-            l1_owners,
-        )
+            # The fold covers only the looked-up sub-range: the tier split is
+            # attributed on it, so the covered prefix never counts as an L1
+            # hit.
+            l1_chunks = min(l1_found_count, found_count)
+            l2_chunks = found_count - l1_chunks
+            # The engine resolves the hit in absolute chunks; shift it back.
+            found_count += job.start_chunk
+            l1_hit_keys = result.l1_hit_count
+            l2_hit_keys = result.l2_hit_count
+
+            session = self._ctx.session_manager.get_or_create(job.request_id)
+            if job.kv_version is not None:
+                # Before the hit length, so a reader seeing the hit sees its
+                # versions.
+                session.record_kv_version_runs(
+                    (KVVersionRun(job.start_chunk, found_count, job.kv_version),)
+                    if found_count > job.start_chunk
+                    else ()
+                )
+            # Record the model-wide hit length on the session so a later
+            # free_lookup_locks can reconstruct which keys the prefetch
+            # read-locked (see ``unfold``: full-attention groups lock the whole
+            # hit prefix, sliding-window groups only its in-window suffix).
+            session.record_prefetch_result(
+                found_count,
+                tuple(range(job.attn_desc.num_object_groups)),
+                result.l1_owners,
+            )
 
         chunk_size = self._ctx.chunk_size
         covered_tokens = job.engine_covered_chunks * chunk_size
@@ -969,60 +1019,265 @@ class LookupModule(DiscoverableModule):
         )
 
         with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(job.request_id, None)
+            # A newer lookup of the same request may have replaced this job.
+            if self._prefetch_jobs.get(job.request_id) is job:
+                del self._prefetch_jobs[job.request_id]
 
         return found_count
 
+    def _new_prefetch_job(
+        self,
+        key: IPCCacheServerKey,
+        handle: PrefetchHandle,
+        row_windows: tuple[int, ...],
+        requested_tokens: int,
+        attn_desc: AttnWindowDesc,
+        start_chunk: int,
+    ) -> _PrefetchJob:
+        """Build the job of a submitted lookup (the caller registers it)."""
+        return _PrefetchJob(
+            handle=handle,
+            row_windows=row_windows,
+            request_id=key.request_id,
+            requested_tokens=requested_tokens,
+            num_object_groups=attn_desc.num_object_groups,
+            attn_desc=attn_desc,
+            start_chunk=start_chunk,
+            engine_covered_chunks=start_chunk,
+            prompt_tokens=num_packed_tokens(key.token_bytes),
+            engine_hit_tokens=int(
+                (key.request_configs or {}).get(
+                    "lmcache.hint.engine_computed_tokens", 0
+                )
+            ),
+            model_name=key.model_name,
+            cache_salt=key.cache_salt,
+        )
+
     def _kv_round_spec(
-        self, probe: _KVVersionProbe, start_chunk: int
+        self,
+        key: IPCCacheServerKey,
+        chunk_hashes: list[bytes],
+        start_chunk: int,
+        version: int,
+        group_layout_descs: dict[int, MemoryLayoutDesc],
+        attn_desc: AttnWindowDesc,
+        num_kv_readers: int,
     ) -> PrefetchTaskSpec:
-        """Build the prefetch of chunks ``[start_chunk, n)`` at ``probe.version``."""
+        """Build the prefetch of chunks ``[start_chunk, n)`` under ``version``."""
         return PrefetchTaskSpec(
             key_groups=ipc_key_to_grouped_object_keys(
-                probe.key,
-                [
-                    versioned_chunk_hash(h, probe.version)
-                    for h in probe.chunk_hashes[start_chunk:]
-                ],
-                list(range(probe.attn_desc.num_object_groups)),
-                probe.group_layout_descs,
-                probe.attn_desc,
+                key,
+                [versioned_chunk_hash(h, version) for h in chunk_hashes[start_chunk:]],
+                list(range(attn_desc.num_object_groups)),
+                group_layout_descs,
+                attn_desc,
             ),
-            num_kv_readers=probe.num_kv_readers,
+            num_kv_readers=num_kv_readers,
         )
 
-    def _submit_next_kv_round(self, job: _PrefetchJob, hit_chunks: int) -> bool:
-        """Submit the next, one version older, round of a versioned lookup.
+    def _drive_kv_probe(self, job: _PrefetchJob, probe: _KVVersionProbe) -> None:
+        """Run a probe's rounds until it is done or cancelled.
+
+        Runs on a probe worker thread. Each finished round either ends the
+        probe or immediately submits the next one (``_finish_kv_round``). An
+        unexpected error cancels the probe and releases its locks, so the
+        lookup reports a miss.
 
         Args:
-            job: The job whose round just finished; its ``kv_probe`` is set.
-            hit_chunks: Absolute hit boundary after that round.
+            job: The registered job of the lookup.
+            probe: ``job.kv_probe``.
+        """
+        storage = self._ctx.storage_manager
+        try:
+            while True:
+                while not storage.wait_prefetch_status(probe.handle, _KV_PROBE_POLL_S):
+                    if self._closing.is_set():
+                        return
+                result = storage.query_prefetch_status(probe.handle)
+                if result is None:
+                    raise RuntimeError("probe round result was taken by another reader")
+                if self._finish_kv_round(job, probe, result):
+                    return
+        except Exception:
+            logger.exception(
+                "KV version probe for request %s failed; reporting a miss",
+                job.request_id,
+            )
+            with probe.lock:
+                probe.cancelled = True
+            self._release_kv_probe_locks(probe)
+        finally:
+            probe.finished.set()
+
+    def _finish_kv_round(
+        self, job: _PrefetchJob, probe: _KVVersionProbe, result: PrefetchResult
+    ) -> bool:
+        """Account one finished round, then record, release or continue.
 
         Returns:
-            True if a round was submitted (the job now tracks it), False when
-            the prompt is covered or the window is exhausted.
+            True when the probe is over: its result is recorded on the
+            session, or it was cancelled and its locks are released. False
+            when the next round has been submitted.
         """
-        probe = job.kv_probe
-        assert probe is not None
-        if (
-            hit_chunks >= len(probe.chunk_hashes)
-            or probe.version <= probe.window.oldest
-        ):
-            return False
-        probe.version -= 1
-        spec = self._kv_round_spec(probe, hit_chunks)
-        handle = self._ctx.storage_manager.submit_prefetch_task(
-            spec, external_request_id=job.request_id
+        row_windows = tuple(
+            row.sliding_window_size for row in probe.round_spec.key_groups
         )
-        self._register_prefetch_job(
-            replace(
-                job,
-                handle=handle,
-                row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
-                start_chunk=hit_chunks,
+        found, _retain = fold_unfold_grouped(result.hit_cells, row_windows)
+        l1_found, _l1_retain = fold_unfold_grouped(result.l1_hit_cells, row_windows)
+        hit_chunks = probe.round_start + found
+        # Every group is full attention (checked at lookup), so each row
+        # locked exactly its first ``found`` keys.
+        probe.locked.append(
+            (
+                [k for row in probe.round_spec.key_groups for k in row.keys[:found]],
+                result.l1_owners,
             )
         )
+        if found:
+            probe.runs.append(
+                KVVersionRun(probe.round_start, hit_chunks, probe.version)
+            )
+        probe.hit_chunks = hit_chunks
+        probe.l1_chunks += min(l1_found, found)
+        probe.l2_chunks += found - min(l1_found, found)
+        probe.l1_hit_keys += result.l1_hit_count
+        probe.l2_hit_keys += result.l2_hit_count
+        probe.l1_owners.update(result.l1_owners)
+        done = (
+            hit_chunks >= len(probe.chunk_hashes)
+            or probe.version <= probe.window.oldest
+        )
+
+        with probe.lock:
+            cancelled = probe.cancelled
+            if done and not cancelled:
+                session = self._ctx.session_manager.get_or_create(job.request_id)
+                # Runs before the hit length, so a reader seeing the hit sees
+                # its versions.
+                session.record_kv_version_runs(tuple(probe.runs))
+                session.record_prefetch_result(
+                    hit_chunks,
+                    tuple(range(probe.attn_desc.num_object_groups)),
+                    dict(probe.l1_owners),
+                )
+                probe.recorded = True
+        if cancelled:
+            self._release_kv_probe_locks(probe)
+            return True
+        if done:
+            return True
+
+        probe.version -= 1
+        probe.round_start = hit_chunks
+        probe.round_spec = self._kv_round_spec(
+            probe.key,
+            probe.chunk_hashes,
+            hit_chunks,
+            probe.version,
+            probe.group_layout_descs,
+            probe.attn_desc,
+            probe.num_kv_readers,
+        )
+        probe.handle = self._ctx.storage_manager.submit_prefetch_task(
+            probe.round_spec, external_request_id=job.request_id
+        )
+        return False
+
+    def _abandon_kv_probe(self, request_id: str) -> bool:
+        """Cancel the request's multi-round lookup if it has not finished.
+
+        A cancelled probe's job is dropped and its worker releases every
+        lock its rounds took once its in-flight round ends; nothing else
+        submits rounds. A probe that already recorded its result is left as
+        a plain lookup result.
+
+        Args:
+            request_id: The request whose lookup is abandoned.
+
+        Returns:
+            True if a running probe was cancelled.
+        """
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.get(request_id)
+            probe = job.kv_probe if job is not None else None
+            if probe is None:
+                return False
+            with probe.lock:
+                if probe.recorded:
+                    return False
+                probe.cancelled = True
+            del self._prefetch_jobs[request_id]
         return True
+
+    def _release_kv_probe_locks(self, probe: _KVVersionProbe) -> None:
+        """Release every read lock a cancelled probe's rounds took."""
+        storage = self._ctx.storage_manager
+        for keys, owners in probe.locked:
+            if keys:
+                storage.finish_read_prefetched(
+                    keys,
+                    read_locks=probe.num_kv_readers,
+                    l1_owners=owners if storage.is_multi_l1 else None,
+                )
+        probe.locked.clear()
+
+    def _extra_range_obj_keys(
+        self,
+        key: IPCCacheServerKey,
+        session: Session,
+        window: KVVersionWindow | None,
+        extra_ranges: tuple[tuple[int, int], ...],
+    ) -> list[ObjectKey]:
+        """Resolve the keys earlier, abandoned lookups of a request locked.
+
+        Each range ends at its lookup's hit boundary, so it is its own lock
+        model. A versioned range resolves under the versions that lookup
+        served; one no recorded lookup served is skipped with a warning and
+        left to the read-lock TTL, since guessing could strip another
+        request's anonymous lock.
+        """
+        chunk_size = self._ctx.chunk_size
+        obj_keys: list[ObjectKey] = []
+        for range_start, range_end in extra_ranges:
+            if range_start >= range_end:
+                continue
+            abandoned_versions = None
+            if window is not None:
+                abandoned_versions = session.abandoned_kv_version_assignment(
+                    window, range_start // chunk_size, range_end // chunk_size
+                )
+                if abandoned_versions is None:
+                    logger.warning(
+                        "free_lookup_locks for request %s: no earlier lookup "
+                        "served [%d, %d); leaving its locks to the read-lock TTL",
+                        key.request_id,
+                        range_start,
+                        range_end,
+                    )
+                    continue
+            obj_keys.extend(
+                resolve_prefetched_obj_keys(
+                    self._ctx,
+                    replace(key, start=range_start, end=range_end),
+                    range_end // chunk_size,
+                    session.prefetch_locked_gids,
+                    kv_versions=abandoned_versions,
+                )
+            )
+        return obj_keys
+
+    def _finish_read_locks(
+        self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]
+    ) -> None:
+        """Release a lookup's read locks on ``obj_keys`` (no-op when empty)."""
+        if not obj_keys:
+            return
+        self._ctx.storage_manager.finish_read_prefetched(
+            obj_keys,
+            read_locks=key.require_num_kv_readers(),
+            l1_owners=self._ctx.get_read_owners(key.request_id),
+        )
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""

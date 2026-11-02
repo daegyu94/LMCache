@@ -113,25 +113,35 @@ def test_versioned_hash_isolates_versions_and_keeps_length(hash_len: int) -> Non
     assert versioned_chunk_hash(base, 2) == versioned_chunk_hash(base, 2)
 
 
-def test_assignment_keeps_served_versions_and_stamps_the_rest() -> None:
-    window = KVVersionWindow(version=9, max_staleness=3)
+def test_assignment_keeps_served_versions_and_stamps_the_request_version() -> None:
     runs = (KVVersionRun(1, 3, 9), KVVersionRun(3, 4, 7))
-    assignment = KVVersionAssignment.for_window(window, runs)
+    assignment = KVVersionAssignment(runs=runs, version=9)
 
-    # New KV computed on top of version-7 KV is stamped 7, not 9.
-    assert assignment.write_version == 7
-    assert [assignment.version_of(c) for c in range(6)] == [7, 9, 9, 7, 7, 7]
+    assert [assignment.version_of(c) for c in range(6)] == [9, 9, 9, 7, 9, 9]
     hashes = [bytes([c]) * 8 for c in range(2, 5)]
     assert assignment.apply(hashes, start_chunk=2) == [
         versioned_chunk_hash(hashes[0], 9),
         versioned_chunk_hash(hashes[1], 7),
-        versioned_chunk_hash(hashes[2], 7),
+        versioned_chunk_hash(hashes[2], 9),
     ]
 
 
-def test_assignment_without_runs_stamps_the_request_version() -> None:
-    assignment = KVVersionAssignment.for_window(KVVersionWindow(5, 2), ())
-    assert assignment.write_version == 5
+def test_store_is_allowed_only_on_top_of_own_version_kv() -> None:
+    assert KVVersionAssignment(runs=(), version=5).allows_store
+    assert KVVersionAssignment(runs=(KVVersionRun(0, 2, 5),), version=5).allows_store
+    # KV computed on top of version-4 KV belongs to no single version.
+    stale = (KVVersionRun(0, 2, 5), KVVersionRun(2, 3, 4))
+    assert not KVVersionAssignment(runs=stale, version=5).allows_store
+
+
+def test_only_a_malformed_version_bypasses_lmcache() -> None:
+    assert parse_kv_version_hints({KV_VERSION_CONFIG: "10"}).bypasses_lmcache
+    assert parse_kv_version_hints({KV_VERSION_CONFIG: 10.0}).bypasses_lmcache
+    assert not parse_kv_version_hints({KV_VERSION_CONFIG: 10}).bypasses_lmcache
+    assert not parse_kv_version_hints(None).bypasses_lmcache
+    assert not parse_kv_version_hints(
+        {KV_VERSION_CONFIG: 1, MAX_KV_STALENESS_CONFIG: "x"}
+    ).bypasses_lmcache
 
 
 def test_warner_rate_limits_and_never_logs_raw_values(
@@ -140,7 +150,8 @@ def test_warner_rate_limits_and_never_logs_raw_values(
     warner = KVVersionHintWarner(interval_s=3600.0)
     secret = "client-secret-value"
     for _ in range(3):
-        assert warner.parse({KV_VERSION_CONFIG: secret}) is None
+        hints = parse_kv_version_hints({KV_VERSION_CONFIG: secret})
+        warner.warn(hints.problems)
     assert len(warnings_logged) == 1
     message = warnings_logged[0].getMessage()
     assert "lmcache.kv_version" in message

@@ -218,7 +218,7 @@ class Session:
         """
         with self._lock:
             runs = self._kv_version_runs
-        return KVVersionAssignment.for_window(window, runs)
+        return KVVersionAssignment(runs=runs, version=window.version)
 
     def abandoned_kv_version_assignment(
         self, window: KVVersionWindow, start_chunk: int, end_chunk: int
@@ -240,7 +240,7 @@ class Session:
                 if runs[0].start_chunk == start_chunk and runs[-1].end_chunk == (
                     end_chunk
                 ):
-                    return KVVersionAssignment.for_window(window, runs)
+                    return KVVersionAssignment(runs=runs, version=window.version)
         return None
 
     def kv_version_spans(self, chunk_size: int) -> list[tuple[int, int, int]]:

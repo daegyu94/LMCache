@@ -8,7 +8,10 @@ LMCache keeps every version apart, serves only versions inside the request's
 window, and reports which version each served token span came from.
 
 This feature is opt-in per request. A request without the hints behaves
-exactly as before. The LMCache server needs no flags.
+exactly as before. The LMCache server needs no flags, but it must run in the
+default LMCache-driven transfer mode (``--supported-transfer-mode
+lmcache_driven``); servers in another mode, and older servers, do not
+advertise the feature and versioned requests then bypass LMCache.
 
 .. contents::
    :local:
@@ -47,16 +50,17 @@ Pass the hints in the request's ``kv_transfer_params``; the vLLM
    * - ``lmcache.kv_version``
      - int, ``>= 0``
      - Version of the KV this request computes, e.g. the weight version the
-       engine serves it with. KV the request stores is stamped with it.
+       engine serves it with. KV the request stores is stored under it.
    * - ``lmcache.max_kv_staleness``
-     - int, ``0``-``16``, default ``0``
+     - int, ``>= 0``, default ``0``
      - How many versions older than ``kv_version`` to accept. Each extra
-       version can cost one more lookup round.
+       version can cost one more lookup round, so values above 16 are capped
+       to 16.
 
 Malformed values are logged (rate limited, without the value) and never widen
-the window: a malformed ``kv_version`` turns versioning off for that request,
-a malformed ``max_kv_staleness`` means "exact version only", and values above
-16 are capped.
+the window: a malformed ``kv_version`` makes the request bypass LMCache (no
+load, no store), and a malformed ``max_kv_staleness`` means "exact version
+only".
 
 Example
 -------
@@ -83,14 +87,15 @@ The response's ``kv_transfer_params`` reports what LMCache served:
 .. code-block:: json
 
    {
-     "kv_version_spans": [[256, 1024, 42], [1024, 1536, 40]]
+     "kv_version_spans": [[0, 256, null], [256, 1024, 42], [1024, 1536, 40]]
    }
 
 Each entry is ``[start_token, end_token, kv_version]``: prompt tokens
 ``[256, 1024)`` were loaded from version-42 KV and ``[1024, 1536)`` from
-version 40. Tokens not listed were computed by the engine or came from vLLM's
-own prefix cache (here ``[0, 256)``). An empty list means LMCache served
-nothing; the field is omitted when the servers could not answer.
+version 40. ``[0, 256)`` came from vLLM's own prefix cache, whose version
+LMCache cannot know (``null``). Tokens not listed were computed by the
+engine. The field is omitted when the spans are not known (for example the
+lookup never finished); it is never fetched with a blocking call.
 
 How it behaves
 --------------
@@ -101,26 +106,33 @@ How it behaves
   spans). Versions never increase along the prompt.
 - **Out of window is a miss.** The first chunk with no version inside the
   window ends the hit; the engine recomputes the rest.
-- **Conservative stamping.** KV a request computes on top of reused older KV
-  is stamped with the oldest version it reused, not with ``kv_version``: its
-  values depend on that older KV. Staleness therefore cannot accumulate
-  across turns that each reuse the previous turn.
+- **Only single-version KV is stored.** A request stores its KV under
+  ``kv_version``, and only if everything LMCache served it had that exact
+  version. A request that reused older KV computes the rest of its prompt
+  attending to that older KV, so its new KV belongs to no single version and
+  is not stored. Staleness therefore cannot accumulate across turns that each
+  reuse the previous turn; the next request that misses recomputes and stores
+  fresh KV.
 - **Cost.** ``max_kv_staleness: 0`` costs exactly one lookup, like an
-  unversioned request. A window of ``s`` can cost up to ``s + 1`` lookup
-  rounds. Every version keeps its own copy in L1 and L2.
+  unversioned request. A window of ``s`` can cost up to ``s + 1`` prefetch
+  rounds, which the server runs back to back. Every version keeps its own
+  copy in L1 and L2.
 
 Relation to other features
 --------------------------
 
 - **cache_salt.** A per-version salt is hard isolation. Versioning is reuse
-  within a bounded window. Both can be combined: the salt still separates
-  tenants, versions are kept apart inside each tenant.
+  within a bounded window. A per-tenant salt combines with versioning: the
+  salt separates tenants, versions are kept apart inside each tenant.
 - **In-flight weight updates.** Set ``lmcache.kv_version`` to the weight
   version the request is *submitted* under. If the engine switches weights
   while the request is running, its KV keeps the submitted (older) version,
-  which errs on the stale side. Reset vLLM's own prefix cache when loading
-  new weights, otherwise the engine may reuse its own older KV outside
-  LMCache's accounting.
+  which errs on the stale side.
+- **vLLM's own prefix cache.** LMCache cannot version KV that vLLM keeps
+  itself. Reset vLLM's prefix cache when loading new weights so it never
+  serves older KV outside this accounting. A per-version vLLM ``cache_salt``
+  would also enforce that, but the salt is part of the LMCache key too, so it
+  reduces the window to the exact version.
 - **Importance sampling.** If the sampler records behavior log-probabilities,
   decoupled PPO / importance sampling already corrects for what was actually
   sampled, stale KV included. ``kv_version_spans`` are for diagnostics,
@@ -133,6 +145,9 @@ Limitations
 - ``max_kv_staleness`` needs every attention group to be full attention.
   Models with sliding-window or hybrid layers get exact-version matching
   (a warning is logged).
+- With more than one LMCache server per engine, versioned requests get
+  exact-version matching (a warning is logged): each server holds a shard
+  of the KV and could otherwise pick different versions for one token.
 - CacheBlend ignores the hints; do not combine them.
 - Only the vLLM ``LMCacheMPConnector`` returns ``kv_version_spans``.
 - Token-addressed cache operations (HTTP pin, prefetch, delete) address only

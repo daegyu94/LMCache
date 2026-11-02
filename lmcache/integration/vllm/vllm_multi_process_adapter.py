@@ -52,6 +52,11 @@ from lmcache.v1.multiprocess.kv_event_subscriber import (
     KVEventStreamClosed,
     MPKVEventSubscriber,
 )
+from lmcache.v1.multiprocess.kv_version import (
+    KV_VERSION_CAPABILITY,
+    KV_VERSION_CONFIG,
+    MAX_KV_STALENESS_CONFIG,
+)
 from lmcache.v1.multiprocess.token_codec import (
     TOKEN_STRIDE,
     num_packed_tokens,
@@ -850,6 +855,19 @@ class LMCacheMPSchedulerAdapter:
             )
         self.blocks_in_chunk = self.lmcache_tokens_per_chunk // vllm_block_size
 
+        # Version hints are honoured only if every server advertises them: an
+        # older server ignores them and would share the unversioned keys.
+        self._supports_kv_versions = all(
+            KV_VERSION_CAPABILITY in get_experimental(client, timeout=self._mq_timeout)
+            for client in self.req_clients.values()
+        )
+        # Per versioned request: None until its lookup resolves, then the
+        # QUERY_KV_VERSION_SPANS replies of every server, keyed by URL.
+        self._kv_version_spans: dict[
+            str, dict[str, MessagingFuture[list[KVVersionSpan] | None]] | None
+        ] = {}
+        self._warned_kv_staleness_narrowed = False
+
         # Health state: one Event per server. The adapter is considered healthy
         # only if ALL per-server events are set (any unhealthy server taints
         # the whole adapter, matching the min() semantics used for lookups).
@@ -883,6 +901,15 @@ class LMCacheMPSchedulerAdapter:
     def tp_size(self) -> int:
         """The tensor parallel size."""
         return self.parallel_strategy.kv_tp_size
+
+    @property
+    def supports_kv_versions(self) -> bool:
+        """Whether every server honours ``lmcache.kv_version`` hints.
+
+        Checked once at construction. A request with the hints must not be
+        served from LMCache when this is False.
+        """
+        return self._supports_kv_versions
 
     @property
     def is_healthy(self) -> bool:
@@ -987,6 +1014,10 @@ class LMCacheMPSchedulerAdapter:
             lookup_tokens // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
 
+        if request_configs is not None and KV_VERSION_CONFIG in request_configs:
+            request_configs = self._narrow_kv_staleness_for_shards(request_configs)
+            self._kv_version_spans[request_id] = None
+
         key = self._create_key(
             packed_token_ids,
             start=start,
@@ -1044,7 +1075,17 @@ class LMCacheMPSchedulerAdapter:
 
         for url in lookup.on_scheduler_check():
             self._mark_lookup_timed_out(url)
-        return lookup.get_result()
+        result = lookup.get_result()
+        if result is not None and request_id in self._kv_version_spans:
+            if self._kv_version_spans[request_id] is None:
+                # Every server has handed its lookup result over, so each can
+                # answer which versions it served. Collected, without
+                # waiting, by take_kv_version_spans.
+                self._kv_version_spans[request_id] = {
+                    url: self.req_clients[url].query_kv_version_spans(request_id)
+                    for url in self._server_urls
+                }
+        return result
 
     def num_blocks_per_chunk(self) -> int:
         """
@@ -1179,6 +1220,7 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
+        self._kv_version_spans.pop(request_id, None)
         if not self.is_healthy:
             return
 
@@ -1192,13 +1234,14 @@ class LMCacheMPSchedulerAdapter:
         for url in self._server_urls:
             self.req_clients[url].end_session(request_id)
 
-    def query_kv_version_spans(
+    def take_kv_version_spans(
         self, request_id: str, loaded_start: int, loaded_end: int
     ) -> list[KVVersionSpan] | None:
-        """Ask every server which KV versions it served a request.
+        """Return which KV versions the servers served a request, if known.
 
-        Blocks for at most the MQ timeout. Must be called before
-        :meth:`end_session`, which drops the servers' record.
+        Never blocks: the spans were requested when the request's lookup
+        resolved (see :meth:`check_lookup_result`); a reply that has not
+        arrived yet counts as unknown. Each request's spans are taken once.
 
         Args:
             request_id: The ID of the request.
@@ -1211,31 +1254,25 @@ class LMCacheMPSchedulerAdapter:
             The spans merged across servers (see
             :func:`merge_kv_version_spans`) and clipped to
             ``[loaded_start, loaded_end)``, in absolute token positions;
-            empty when no versioned KV was loaded. None when the answer is
-            unknown: a server is unhealthy, does not answer in time, fails,
-            or has no session for the request.
+            empty when no versioned KV was loaded. None when unknown: the
+            request sent no version, its lookup never resolved, a reply is
+            missing or failed, or a server had no answer.
         """
-        if not self.is_healthy:
+        futures = self._kv_version_spans.pop(request_id, None)
+        if futures is None:
             return None
-        deadline = time.monotonic() + self._mq_timeout
-        futures = {
-            url: self.req_clients[url].query_kv_version_spans(request_id)
-            for url in self._server_urls
-        }
         per_server: list[list[KVVersionSpan]] = []
         for url, future in futures.items():
-            try:
-                spans = future.result(timeout=max(0.0, deadline - time.monotonic()))
-            except TimeoutError:
-                logger.warning(
-                    "QUERY_KV_VERSION_SPANS to %s did not complete within %ss.",
-                    url,
-                    self._mq_timeout,
-                )
+            if not future.wait(0):
                 return None
-            except Exception:
+            try:
+                spans = future.result(timeout=0)
+            except Exception as exc:
                 logger.warning(
-                    "QUERY_KV_VERSION_SPANS to %s failed.", url, exc_info=True
+                    "QUERY_KV_VERSION_SPANS to %s failed for request %s: %s",
+                    url,
+                    request_id,
+                    type(exc).__name__,
                 )
                 return None
             if spans is None:
@@ -1325,6 +1362,37 @@ class LMCacheMPSchedulerAdapter:
         else:
             self._store_request_pending_counts[req_id] = total
             return False
+
+    def _narrow_kv_staleness_for_shards(
+        self, request_configs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Accept only the exact KV version when several servers serve.
+
+        Each server resolves versions for its own shard of the KV, so with
+        a window two shards could serve one token from different versions
+        and store on top of them. With ``max_kv_staleness`` 0 every server
+        serves and stores only ``kv_version``.
+
+        Args:
+            request_configs: A versioned request's configs.
+
+        Returns:
+            ``request_configs``, or a copy with ``lmcache.max_kv_staleness``
+            set to 0 when this adapter has more than one server.
+        """
+        if len(self._server_urls) == 1 or not request_configs.get(
+            MAX_KV_STALENESS_CONFIG
+        ):
+            return request_configs
+        if not self._warned_kv_staleness_narrowed:
+            self._warned_kv_staleness_narrowed = True
+            logger.warning(
+                "lmcache.max_kv_staleness is not supported with %d LMCache "
+                "servers; versioned requests accept only their exact "
+                "lmcache.kv_version.",
+                len(self._server_urls),
+            )
+        return {**request_configs, MAX_KV_STALENESS_CONFIG: 0}
 
     def _mark_lookup_timed_out(self, url: str) -> None:
         """Log and mark ``url`` unhealthy after an unanswered lookup RPC."""
@@ -2505,8 +2573,15 @@ class LMCacheMPWorkerAdapter:
         self,
         key: IPCCacheServerKey,
     ) -> list[CacheStoreEvent]:
-        """Build LMCache cache-store events for a submitted store key."""
+        """Build LMCache cache-store events for a submitted store key.
+
+        Versioned stores (``lmcache.kv_version``) get none: their keys are
+        version-qualified by the server, so token-only hashes would announce
+        objects that do not exist.
+        """
         if self._kv_event_hasher is None:
+            return []
+        if KV_VERSION_CONFIG in (key.request_configs or {}):
             return []
 
         chunk_size = self.lmcache_tokens_per_chunk

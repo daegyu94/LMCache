@@ -117,6 +117,7 @@ def test_store_owner_callback_round_trip(
         storage_manager=storage,
         event_bus=MagicMock(),
         resolve_obj_keys=lambda key, gids: [[k] for k in keys],
+        kv_version_allows_store=lambda key: True,
     )
     module = transfer.LMCacheDrivenTransferModule(cast(Any, ctx))
     backend = MagicMock()

@@ -18,9 +18,11 @@ hint keeps the plain chunk hashes, so its keys are exactly today's.
 The lookup probes the window newest-first. A served prefix is a sequence of
 runs (:class:`KVVersionRun`) whose versions never increase along the prompt;
 :class:`KVVersionAssignment` maps every chunk of a request to the version it
-is addressed under for retrieve, lock release and store.
+is addressed under. KV is only ever stored under the request's own
+``kv_version``, and only when every served run has that version: KV computed
+on top of older KV depends on it, so it is not stored at all.
 
-This module is pure: no I/O and no server state.
+Apart from the shared, rate-limited hint warner, this module is pure.
 """
 
 # Standard
@@ -46,10 +48,27 @@ MAX_KV_STALENESS_LIMIT = 16
 """Upper bound on ``lmcache.max_kv_staleness``. A lookup costs up to
 ``max_kv_staleness + 1`` prefetch rounds, so the bound caps lookup latency."""
 
+KV_VERSION_CAPABILITY = "kv_version"
+"""Experimental feature a server advertises through ``GET_EXPERIMENTAL`` when
+it honours the version hints. Clients must not send them to a server without
+it: an older server ignores them and would share the unversioned key space."""
+
 _MAX_KV_VERSION = (1 << 63) - 1
 # blake2b personalization (at most 16 bytes) that separates version-qualified
 # hashes from every other use of the chunk hash.
 _VERSIONED_HASH_PERSON = b"lmcache.kv_ver"
+# Seconds between two reports of one hint problem.
+_HINT_WARN_INTERVAL_S = 60.0
+
+
+class KVVersioning(enum.Enum):
+    """Whether a server component honours the version hints."""
+
+    ENABLED = enum.auto()
+    """Versioned requests are served within their window."""
+
+    DISABLED = enum.auto()
+    """Versioned requests are not served from LMCache (fail closed)."""
 
 
 class KVVersionHintProblem(enum.Enum):
@@ -59,8 +78,8 @@ class KVVersionHintProblem(enum.Enum):
     """
 
     INVALID_VERSION = (
-        "lmcache.kv_version is not an int in [0, 2^63); the request is served "
-        "without version isolation"
+        "lmcache.kv_version is not an int in [0, 2^63); the request bypasses "
+        "LMCache (no load, no store)"
     )
     STALENESS_WITHOUT_VERSION = (
         "lmcache.max_kv_staleness is set without lmcache.kv_version; ignored"
@@ -76,6 +95,10 @@ class KVVersionHintProblem(enum.Enum):
         "lmcache.max_kv_staleness needs every object group to use full "
         "attention; only the exact kv_version is accepted"
     )
+    UNSUPPORTED_TRANSFER_MODE = (
+        "lmcache.kv_version needs the LMCache-driven transfer mode; the "
+        "request is not served from LMCache"
+    )
 
 
 @dataclass(frozen=True)
@@ -84,7 +107,7 @@ class KVVersionWindow:
 
     Attributes:
         version: The version of the KV the request computes; KV it stores is
-            stamped with at most this version.
+            stamped with exactly this version.
         max_staleness: How many versions older than ``version`` the request
             accepts, ``0 <= max_staleness <= MAX_KV_STALENESS_LIMIT``.
     """
@@ -115,13 +138,20 @@ class KVVersionHints:
 
     Attributes:
         window: The accepted versions, or None when the request carries no
-            usable ``lmcache.kv_version`` (its keys stay unversioned).
+            usable ``lmcache.kv_version``.
         problems: Every malformed hint found, in check order; empty when the
             hints are well formed or absent.
     """
 
     window: KVVersionWindow | None
     problems: tuple[KVVersionHintProblem, ...]
+
+    @property
+    def bypasses_lmcache(self) -> bool:
+        """Whether the request must neither load nor store: it sent a
+        ``lmcache.kv_version`` the server cannot interpret. Serving it from
+        the unversioned key space would be the widest possible reuse."""
+        return KVVersionHintProblem.INVALID_VERSION in self.problems
 
 
 @dataclass(frozen=True)
@@ -144,41 +174,29 @@ class KVVersionAssignment:
     """Maps every chunk of a versioned request to the version it addresses.
 
     Chunks inside a served run keep that run's version, so retrieve and lock
-    release address exactly the objects the lookup locked, and a re-store of
-    a served chunk hits the existing object instead of re-stamping it. Every
-    other chunk is addressed under ``write_version``.
+    release address exactly the objects the lookup locked. Every other chunk
+    is addressed under the request's own ``version``.
 
     Attributes:
         runs: Served runs in chunk order, non-overlapping; empty when the
             lookup served nothing (or has not run).
-        write_version: The version stored KV is stamped with:
-            ``min(kv_version, oldest served version)``. A chunk computed on
-            top of older cached KV attends to it, so it is stamped with the
-            oldest version that influenced it; staleness therefore cannot
-            accumulate across turns that each reuse the previous turn's KV.
+        version: The request's ``kv_version``.
     """
 
     runs: tuple[KVVersionRun, ...]
-    write_version: int
+    version: int
 
-    @classmethod
-    def for_window(
-        cls, window: KVVersionWindow, runs: tuple[KVVersionRun, ...]
-    ) -> "KVVersionAssignment":
-        """Build the assignment of a request from its window and served runs.
+    @property
+    def allows_store(self) -> bool:
+        """Whether KV this request computes may be stored.
 
-        Args:
-            window: The request's accepted versions.
-            runs: The runs its lookup served, in chunk order.
-
-        Returns:
-            The assignment, with ``write_version`` derived from ``window`` and
-            the oldest served run.
+        Only when every served run has the request's own version. A chunk
+        computed on top of older KV depends on it through attention, so
+        storing it under ``version`` would serve stale-derived KV as fresh,
+        and storing it under the older version would serve newer-weights KV
+        as old: either breaks the window, so it is not stored.
         """
-        return cls(
-            runs=runs,
-            write_version=min([window.version, *(run.version for run in runs)]),
-        )
+        return all(run.version == self.version for run in self.runs)
 
     def version_of(self, chunk: int) -> int:
         """Return the version chunk ``chunk`` is addressed under.
@@ -187,12 +205,12 @@ class KVVersionAssignment:
             chunk: Absolute chunk index.
 
         Returns:
-            The covering run's version, else ``write_version``.
+            The covering run's version, else the request's ``version``.
         """
         for run in self.runs:
             if run.start_chunk <= chunk < run.end_chunk:
                 return run.version
-        return self.write_version
+        return self.version
 
     def apply(self, chunk_hashes: list[bytes], start_chunk: int) -> list[bytes]:
         """Version-qualify consecutive chunk hashes.
@@ -212,7 +230,7 @@ class KVVersionAssignment:
 
 
 class KVVersionHintWarner:
-    """Rate-limited warnings for malformed version hints.
+    """Rate-limited warnings for malformed or unsupported version hints.
 
     Hints come from clients, so one misconfigured client could otherwise
     flood the server log. Each problem is reported at most once per
@@ -234,22 +252,6 @@ class KVVersionHintWarner:
         self._pending: dict[KVVersionHintProblem, int] = {}
         self._last_report: dict[KVVersionHintProblem, float] = {}
 
-    def parse(
-        self, request_configs: Mapping[str, object] | None
-    ) -> KVVersionWindow | None:
-        """Parse a request's hints and report any problem found.
-
-        Args:
-            request_configs: The request's ``lmcache.*`` entries, or None.
-
-        Returns:
-            The window of :func:`parse_kv_version_hints`.
-        """
-        hints = parse_kv_version_hints(request_configs)
-        if hints.problems:
-            self.warn(hints.problems)
-        return hints.window
-
     def warn(self, problems: tuple[KVVersionHintProblem, ...]) -> None:
         """Count ``problems`` and log those whose interval has passed.
 
@@ -267,10 +269,15 @@ class KVVersionHintWarner:
                     self._last_report[problem] = now
         for problem, count in due:
             logger.warning(
-                "Malformed KV version hint: %s (%d request(s) since last report)",
+                "KV version hint: %s (%d request(s) since last report)",
                 problem.value,
                 count,
             )
+
+
+# One warner per process: a request's hints are read at several handlers
+# (lookup, free, store, end), and each problem should be reported once.
+_HINT_WARNER = KVVersionHintWarner(_HINT_WARN_INTERVAL_S)
 
 
 def versioned_chunk_hash(chunk_hash: bytes, version: int) -> bytes:
@@ -306,13 +313,13 @@ def _as_int(value: object) -> int | None:
 def parse_kv_version_hints(
     request_configs: Mapping[str, object] | None,
 ) -> KVVersionHints:
-    """Parse and validate a request's version hints.
+    """Parse and validate a request's version hints, without logging.
 
-    A malformed ``lmcache.kv_version`` disables versioning for the request (it
-    is served as if it sent no hint). A malformed ``lmcache.max_kv_staleness``
-    narrows the window to the exact version, and one above
-    :data:`MAX_KV_STALENESS_LIMIT` is capped: both stay inside what the
-    client asked for.
+    A malformed ``lmcache.kv_version`` makes the request bypass LMCache
+    (:attr:`KVVersionHints.bypasses_lmcache`). A malformed
+    ``lmcache.max_kv_staleness`` narrows the window to the exact version, and
+    one above :data:`MAX_KV_STALENESS_LIMIT` is capped: both stay inside what
+    the client asked for.
 
     Args:
         request_configs: The request's ``lmcache.*`` entries, or None.
@@ -346,3 +353,31 @@ def parse_kv_version_hints(
         window=KVVersionWindow(version=version, max_staleness=staleness),
         problems=found,
     )
+
+
+def read_kv_version_hints(
+    request_configs: Mapping[str, object] | None,
+) -> KVVersionHints:
+    """Parse a request's version hints and report any problem.
+
+    Problems go to the process-wide rate-limited warner.
+
+    Args:
+        request_configs: The request's ``lmcache.*`` entries, or None.
+
+    Returns:
+        The result of :func:`parse_kv_version_hints`.
+    """
+    hints = parse_kv_version_hints(request_configs)
+    if hints.problems:
+        _HINT_WARNER.warn(hints.problems)
+    return hints
+
+
+def warn_kv_version_problem(problem: KVVersionHintProblem) -> None:
+    """Report a hint the server cannot honour as sent (rate limited).
+
+    Args:
+        problem: What was wrong.
+    """
+    _HINT_WARNER.warn((problem,))

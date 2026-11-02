@@ -39,6 +39,7 @@ from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.kv_version import (
     KV_VERSION_CONFIG,
     MAX_KV_STALENESS_CONFIG,
+    KVVersioning,
 )
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 
@@ -157,7 +158,7 @@ def test_versioned_lookup_loads_the_in_window_version_from_l2(
     stale = _store_in_l2_only(ctx, version=2)
     fresh = _store_in_l2_only(ctx, version=5)
     assert ctx.storage_manager.get_l1_usage()[0] == 0
-    module = LookupModule(ctx)
+    module = LookupModule(ctx, kv_versioning=KVVersioning.ENABLED)
 
     module.lookup(_key("r", 6, 1, None), tp_size=1)
     assert module.wait_prefetch_status("r", timeout=10.0) == NUM_CHUNKS
@@ -175,3 +176,4 @@ def test_versioned_lookup_loads_the_in_window_version_from_l2(
     module.lookup(_key("strict", 4, 1, None), tp_size=1)
     assert module.wait_prefetch_status("strict", timeout=10.0) == 0
     assert stale != fresh
+    module.close()

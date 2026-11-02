@@ -20,14 +20,11 @@ from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.kv_version import KVVersionHintWarner
+from lmcache.v1.multiprocess.kv_version import read_kv_version_hints
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
-
-# Seconds between two reports of one malformed KV version hint.
-KV_VERSION_HINT_WARN_INTERVAL_S = 60.0
 
 
 class ShmPoolInfo(TypedDict):
@@ -239,9 +236,6 @@ class MPCacheServerContext:
         )
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
-        self._kv_version_hint_warner = KVVersionHintWarner(
-            KV_VERSION_HINT_WARN_INTERVAL_S
-        )
 
     def close(self) -> None:
         """
@@ -436,12 +430,36 @@ class MPCacheServerContext:
         ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
-        window = self._kv_version_hint_warner.parse(key.request_configs)
+        window = read_kv_version_hints(key.request_configs).window
         if window is not None:
             chunk_hashes = session.kv_version_assignment(window).apply(
                 chunk_hashes, key.start // self.chunk_size
             )
         return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
+
+    def kv_version_allows_store(self, key: IPCCacheServerKey) -> bool:
+        """Return whether a STORE of ``key`` may write any KV.
+
+        False for a request whose ``lmcache.kv_version`` is malformed (it
+        bypasses LMCache), and for a versioned request whose lookup served a
+        run of another version: the KV it computed depends on that older KV,
+        so it belongs to no single version (see
+        :attr:`~lmcache.v1.multiprocess.kv_version.KVVersionAssignment.allows_store`).
+        True for every unversioned request.
+
+        Args:
+            key: The STORE key, carrying the request's configs.
+
+        Returns:
+            Whether the store may proceed.
+        """
+        hints = read_kv_version_hints(key.request_configs)
+        if hints.bypasses_lmcache:
+            return False
+        if hints.window is None:
+            return True
+        session = self.session_manager.get_or_create(key.request_id)
+        return session.kv_version_assignment(hints.window).allows_store
 
     @staticmethod
     def _compute_shm_pool_info(
