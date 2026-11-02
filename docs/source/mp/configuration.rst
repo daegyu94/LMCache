@@ -258,8 +258,8 @@ Source: ``lmcache/v1/multiprocess/config.py``
        objects and leaves L2 untouched. ``generation`` also invalidates every
        stored L1 and L2 object in O(1) and deletes the L2 copies in the
        background. Choices: ``l1``, ``generation``. Not supported with
-       ``--engine-type blend``, P2P or ``--coordinator-url``. See
-       :ref:`mp-generation-clear`.
+       ``--engine-type blend``, P2P or ``--coordinator-url``; only vLLM
+       workers may register. See :ref:`mp-generation-clear`.
 
 .. _mp-generation-clear:
 
@@ -295,9 +295,15 @@ it never waits for L2:
   eviction instead.
 - A request whose session started before the clear never stores into the new
   generation, even after it is re-scheduled: its KV may have been computed
-  with the old weights. A store whose request has no live lookup session (for
-  example after ``--session-ttl-seconds`` reaped it) is also never served.
-  Requests looked up after the clear read and store the new generation.
+  with the old weights. A store whose request never sent a lookup to this
+  server (or already ended) is also never served; a request whose session was
+  reaped by ``--session-ttl-seconds`` keeps storing in its original
+  generation. Requests looked up after the clear read and store the new
+  generation.
+- Only vLLM workers may register: the vLLM connector looks up every request,
+  which is what proves a request's generation. Other connectors (e.g. SGLang,
+  which skips the lookup of prompts shorter than one chunk) are rejected at
+  KV-cache registration.
 - With ``--clear-mode l1`` (the default) hashes and cache contents are
   bit-identical to earlier releases. Generation mode uses different hashes
   from the first request on, so it does not reuse KV stored in ``l1`` mode.

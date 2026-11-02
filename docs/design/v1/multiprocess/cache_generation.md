@@ -76,6 +76,7 @@ h_0 = H(seed, chunk_0);  h_i = H(h_{i-1}, chunk_i)
 | `MPCacheServerContext.resolve_store_obj_keys` | `engine_context.py` | Store-scope keys, used by LMCache-driven STORE, engine-driven PREPARE/COMMIT_STORE, qstore and blend store. `resolve_obj_keys` stays the lookup-scope resolver. |
 | `StaleL2KeyCollector` | `cache_generation.py`, owned by `ManagementModule` in generation mode only | `L2AdapterListener` that tracks stored L2 keys and deletes retired ones on a background `PeriodicThread`. |
 | `MPServerConfig.clear_mode`, `validate_clear_mode` | `config.py`, `--clear-mode {l1,generation}` | Opt-in; rejects blend, P2P and a coordinator (§7). |
+| `LMCacheDrivenTransferModule.register_kv_cache` | `modules/lmcache_driven_transfer.py` | Rejects non-vLLM workers in generation mode (§7). |
 
 ## 5. Clear Flow (generation mode)
 
@@ -113,8 +114,10 @@ pending queue is full never stops tracking new stores. Excess is counted as
 
 **Shutdown.** `ManagementModule.close` (modules close before the context, so
 before `StorageManager.close` closes the adapters) unregisters the listener
-and stops the thread; the thread checks `stop_requested` between batches, so
-at most the batch in progress still reaches an adapter.
+and stops the thread. The thread checks `stop_requested` (under the
+collector lock) before each batch, and `close` then waits without a timeout
+for a batch already inside an adapter `delete`, so no delete overlaps adapter
+shutdown. That wait is bounded only by the adapters' own delete timeouts.
 
 ## 6. Exact Semantics for Requests Spanning a Bump
 
@@ -125,19 +128,26 @@ A request's keys are resolved in one of two scopes:
 | `LookupModule.lookup` | `current_scope`, read **once**; it seeds the lookup hashes and is recorded with `Session.begin_lookup` (and is the store seed of a session the lookup creates). |
 | RETRIEVE, engine-driven PREPARE/COMMIT_RETRIEVE, `end_session` touch | The session's `lookup_scope` (latest lookup). |
 | `free_lookup_locks` current range, failed-RETRIEVE release | The scope recorded with that lookup's lock state (`lookup_scope`, or the snapshot from `prepare_failed_retrieve_release`). |
-| `free_lookup_locks` `extra_ranges` (abandoned lookups) | `Session.abandoned_lookup_scope(hit)`: the scope of the recorded lookup with that hit boundary (bounded history of 16); if none is recorded, the session's only lookup scope. If candidates span several generations the range is **not** released (left to the read-lock TTL) — L1 locks are anonymous refcounts and the wrong generation would decrement other readers' locks. |
+| `free_lookup_locks` `extra_ranges` (abandoned lookups) | `Session.abandoned_lookup_scope(hit)`: the scopes of recorded lookups with that hit boundary (bounded history of 16), plus the scopes of every entry that aged out of the history (any of them may have had that hit); if none is recorded, the session's only lookup scope. If the candidates span several generations the range is **not** released — L1 locks are anonymous refcounts and the wrong generation would decrement other readers' locks. Skipped ranges rely on the L1 read-lock TTL (`read_ttl_seconds`), which must not be disabled. |
 | STORE (all transfer modes), qstore, `MP_TOKENS` parent hash | The session's `store_prefix_hash`, fixed at creation. |
 | Token-addressed prefetch (`PrefetchService`) | `current_scope`. |
 
 Store seed at session creation:
 
 - Created by a **lookup** (`get_or_create_for_lookup`): that lookup's
-  generation seed.
-- Created by **any other path** (`get_or_create`: a store or retrieve with no
-  live session, e.g. after TTL reaping): in generation mode the **untrusted**
-  seed, which no lookup ever computes. Nothing proves which weights computed
-  that KV, so it is stored as garbage (collected at the next clear). In `l1`
-  mode it is `none_hash`, as before.
+  generation seed. This includes lookups that return early with no complete chunk
+  (`empty_chunk_hashes`, e.g. a prompt shorter than one chunk whose decode
+  later crosses a chunk boundary) or with no registered GPU context.
+- Recreated after **TTL reaping** (by any path): in generation mode the
+  reaped session's store seed is remembered (bounded, 64K requests, dropped by
+  `END_SESSION`) and inherited, so a request outliving
+  `--session-ttl-seconds` keeps storing in the scope its lookup proved — the
+  old one if a bump happened meanwhile.
+- Created by **any other path** (`get_or_create` with no live or remembered
+  session): in generation mode the **untrusted** seed, which no lookup ever
+  computes. Nothing proves which weights computed that KV, so it is stored as
+  garbage (collected at the next clear). In `l1` mode it is `none_hash`, as
+  before.
 
 Consequences:
 
@@ -168,6 +178,12 @@ Consequences:
   the index cleared or generation-tagged on bump.
 - **P2P** is rejected (`MPServerConfig.__post_init__`): peers would address
   each other's objects with their own generations.
+- **Non-vLLM workers** are rejected at `REGISTER_KV_CACHE`
+  (`EngineType` other than `VLLM`). Generation mode trusts a request's stores
+  only after its LOOKUP stamped the session, and only the vLLM connector looks
+  up every request; the SGLang connector, for example, sends no LOOKUP for a
+  sub-chunk prompt, so all its stores would be untrusted. Engine-driven
+  (PREPARE/COMMIT) workers carry no engine type and are assumed to be vLLM.
 - **A coordinator** is rejected at startup (`validate_clear_mode`, called by
   `run_cache_server`): its pin, eviction and directory APIs resolve token ids
   to generation-free keys in their own process and would silently address
@@ -192,9 +208,12 @@ Consequences:
   are reclaimed by L1 eviction.
 - Adapters whose `delete` is the base-class no-op keep old objects until their
   own eviction removes them; the collector counts their batches as deleted.
-- Session TTL (`--session-ttl-seconds`, measured from creation) bounds how
-  long a request can keep storing usable KV: a store after its session was
-  reaped is untrusted. Raise the TTL above the longest rollout.
+- A store is untrusted (never served) when its request has no live or
+  remembered session: no LOOKUP ever reached this server for it, END_SESSION
+  already ran, or the reaped-seed record (64K requests) evicted it.
+- Session TTL (`--session-ttl-seconds`, measured from creation) still drops
+  the lookup lock state, as in `l1` mode: a `free_lookup_locks` after reaping
+  releases nothing and the locks wait for the read-lock TTL.
 - Abandoned-lookup releases whose generation is ambiguous are left to the
   read-lock TTL (§6).
 
@@ -222,6 +241,10 @@ Consequences:
   `LookupModule` + `ManagementModule`: default mode serves L2 after clear;
   generation clear misses L1 and L2 and GCs old keys; new-generation round
   trip; pre-bump store committed after the bump; store arriving after a
-  re-lookup; store without a lookup; release after the bump; abandoned range
-  across a bump (only its share released); lookup racing the clear (threads +
-  events); close; CLI parsing and rejected combinations.
+  re-lookup; store without a lookup; sub-chunk lookup then decode store;
+  store after TTL reaping; release after the bump; abandoned range across a
+  bump (only its share released); lookup racing the clear (threads + events);
+  close; non-vLLM registration; CLI parsing and rejected combinations.
+- Unit tests additionally cover aged-out history ambiguity, reaped-session
+  seed inheritance (with and without a bump, and forgetting on END_SESSION)
+  and `close` waiting for an in-flight delete.
