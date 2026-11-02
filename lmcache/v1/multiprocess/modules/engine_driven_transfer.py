@@ -33,6 +33,11 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ModuleBuildContext,
 )
+from lmcache.v1.multiprocess.kv_version import (
+    KV_VERSION_CONFIG,
+    KVVersionHintProblem,
+    warn_kv_version_problem,
+)
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
 from lmcache.v1.periodic_thread import (
@@ -299,6 +304,22 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
     ) -> tuple[int, IPCCacheServerKey]:
         return (instance_id, key)
 
+    @staticmethod
+    def _refuses_versioned_store(key: IPCCacheServerKey) -> bool:
+        """Whether a store carries a KV version hint, valid or not.
+
+        The engine-driven store paths cannot tell KV of one version from KV
+        computed on top of older KV, so the server does not offer KV
+        versioning in this mode (its lookups report a miss for such
+        requests) and stores none of their KV: a malformed version would
+        land in the unversioned key space, a valid one in objects no lookup
+        reads.
+        """
+        if KV_VERSION_CONFIG not in (key.request_configs or {}):
+            return False
+        warn_kv_version_problem(KVVersionHintProblem.UNSUPPORTED_TRANSFER_MODE)
+        return True
+
     def _resolve_single_group_obj_keys(self, key: IPCCacheServerKey) -> list[ObjectKey]:
         """Resolve object keys for the single object group used by
         non-GPU transfers."""
@@ -548,7 +569,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 group. Only grouped-protocol workers send it.
 
         Returns:
-            PrepareStoreResponse with empty slots for inline mode.
+            PrepareStoreResponse with empty slots for inline mode. A key with
+            ``lmcache.kv_version`` reserves nothing (empty slots in SHM
+            mode): KV versioning is not offered in engine-driven mode.
 
         Raises:
             ValueError: If ``skipped_chunks`` does not have one entry per
@@ -571,6 +594,17 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         f"skipped_chunks for group {gid} is outside its "
                         f"{len(g_keys)} chunks (instance_id={instance_id})"
                     )
+        if self._refuses_versioned_store(key):
+            # Skip every chunk: nothing is reserved, so an SHM worker gets no
+            # slots and does not commit.
+            skipped_chunks = tuple(
+                tuple(range(len(g_keys)))
+                for g_keys in (
+                    group_keys
+                    if group_keys is not None
+                    else [self._resolve_single_group_obj_keys(key)]
+                )
+            )
         response = strategy.prepare_store(
             key=key,
             instance_id=instance_id,
@@ -611,7 +645,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             cpu_data: Typed inline CPU tensor payload produced by the worker.
 
         Returns:
-            ``True`` when all reserved objects are written, otherwise ``False``.
+            ``True`` when all reserved objects are written, otherwise ``False``
+            (always ``False`` for a key with ``lmcache.kv_version``, whose KV
+            is not stored in engine-driven mode).
 
         Raises:
             ValueError: If no non-GPU context is registered for the given
@@ -622,14 +658,15 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         st = session.extras.pop("store_start_time", None)
         result = False
         try:
-            result = strategy.commit_store(
-                key=key,
-                instance_id=instance_id,
-                cpu_data=cpu_data,
-                context=entry.metadata,
-                resolve_obj_keys=self._resolve_single_group_obj_keys,
-                group_keys=self._group_keys_for(entry, key),
-            )
+            if not self._refuses_versioned_store(key):
+                result = strategy.commit_store(
+                    key=key,
+                    instance_id=instance_id,
+                    cpu_data=cpu_data,
+                    context=entry.metadata,
+                    resolve_obj_keys=self._resolve_single_group_obj_keys,
+                    group_keys=self._group_keys_for(entry, key),
+                )
         finally:
             self._finish_transfer(key, instance_id, EventType.MP_STORE_START, result)
         if st is not None and result:

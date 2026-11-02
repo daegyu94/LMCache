@@ -20,11 +20,18 @@ from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.kv_version import read_kv_version_hints
+from lmcache.v1.multiprocess.kv_version import (
+    KVVersionAssignment,
+    read_kv_version_hints,
+)
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
+
+# Request-config hint engine integrations attach to a LOOKUP: the tokens the
+# engine already holds in its own prefix cache.
+_ENGINE_COMPUTED_TOKENS_HINT = "lmcache.hint.engine_computed_tokens"
 
 
 class ShmPoolInfo(TypedDict):
@@ -440,12 +447,22 @@ class MPCacheServerContext:
     def kv_version_allows_store(self, key: IPCCacheServerKey) -> bool:
         """Return whether a STORE of ``key`` may write any KV.
 
-        False for a request whose ``lmcache.kv_version`` is malformed (it
-        bypasses LMCache), and for a versioned request whose lookup served a
-        run of another version: the KV it computed depends on that older KV,
-        so it belongs to no single version (see
-        :attr:`~lmcache.v1.multiprocess.kv_version.KVVersionAssignment.allows_store`).
-        True for every unversioned request.
+        True for every unversioned request. A versioned request may store
+        only KV that provably depends on its own ``kv_version`` alone, which
+        needs the session's record of its current lookup:
+
+        - the lookup has finished and recorded the versions it served (not:
+          no lookup, still running, declined, or a session recreated after
+          its TTL);
+        - the lookup started at token 0 and the engine reported a prefix
+          cache hit of exactly 0 tokens (``lmcache.hint.engine_computed_tokens``
+          present and 0): KV the engine holds itself may derive from older
+          versions LMCache cannot see, e.g. blocks another request of the
+          same version filled from older KV;
+        - every served run has the request's version (see
+          :attr:`~lmcache.v1.multiprocess.kv_version.KVVersionAssignment.allows_store`).
+
+        A malformed ``lmcache.kv_version`` is never stored.
 
         Args:
             key: The STORE key, carrying the request's configs.
@@ -459,7 +476,20 @@ class MPCacheServerContext:
         if hints.window is None:
             return True
         session = self.session_manager.get_or_create(key.request_id)
-        return session.kv_version_assignment(hints.window).allows_store
+        record = session.recorded_kv_version_lookup()
+        if record is None:
+            return False
+        lookup_key, runs = record
+        if lookup_key.start > 0:
+            return False
+        # Absent means unknown (e.g. an eager lookup sent before the engine
+        # checked its prefix cache), which fails closed like a hit.
+        engine_hit = (lookup_key.request_configs or {}).get(
+            _ENGINE_COMPUTED_TOKENS_HINT
+        )
+        if engine_hit != 0:
+            return False
+        return KVVersionAssignment(runs=runs, version=hints.window.version).allows_store
 
     @staticmethod
     def _compute_shm_pool_info(

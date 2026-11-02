@@ -57,10 +57,11 @@ class Session:
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
-    # Version runs the current lookup served (empty for an unversioned or
-    # missed lookup), and those of this request's earlier, abandoned lookups,
-    # whose locks a later FREE_LOOKUP_LOCKS may still release.
-    _kv_version_runs: tuple[KVVersionRun, ...] = field(default=(), repr=False)
+    # Version runs the current lookup served; None until a versioned lookup
+    # of the current generation has recorded its result (empty for a miss).
+    # Also those of this request's earlier, abandoned lookups, whose locks a
+    # later FREE_LOOKUP_LOCKS may still release.
+    _kv_version_runs: tuple[KVVersionRun, ...] | None = field(default=None, repr=False)
     _abandoned_kv_version_runs: list[tuple[KVVersionRun, ...]] = field(
         default_factory=list, repr=False
     )
@@ -179,7 +180,7 @@ class Session:
             self._prefetch_owners.clear()
             if self._kv_version_runs:
                 self._abandoned_kv_version_runs.append(self._kv_version_runs)
-            self._kv_version_runs = ()
+            self._kv_version_runs = None
 
     def record_prefetch_result(
         self,
@@ -206,6 +207,25 @@ class Session:
         with self._lock:
             self._kv_version_runs = runs
 
+    def recorded_kv_version_lookup(
+        self,
+    ) -> tuple[IPCCacheServerKey, tuple[KVVersionRun, ...]] | None:
+        """Return the current versioned lookup's key and served runs.
+
+        Both are read under one lock, so they always belong to the same
+        lookup.
+
+        Returns:
+            ``(lookup_key, runs)`` (runs empty for a miss), or None when no
+            versioned lookup result is recorded for the current lookup: none
+            ran, it is still running, it was declined, or the session was
+            recreated.
+        """
+        with self._lock:
+            if self._kv_version_runs is None or self.lookup_ipc_key is None:
+                return None
+            return self.lookup_ipc_key, self._kv_version_runs
+
     def kv_version_assignment(self, window: KVVersionWindow) -> KVVersionAssignment:
         """Return the chunk-to-version map of the current lookup.
 
@@ -217,7 +237,7 @@ class Session:
             before a versioned lookup has finished).
         """
         with self._lock:
-            runs = self._kv_version_runs
+            runs = self._kv_version_runs or ()
         return KVVersionAssignment(runs=runs, version=window.version)
 
     def abandoned_kv_version_assignment(
@@ -254,7 +274,7 @@ class Session:
             order; empty when the lookup served no versioned KV.
         """
         with self._lock:
-            runs = self._kv_version_runs
+            runs = self._kv_version_runs or ()
         return [
             (run.start_chunk * chunk_size, run.end_chunk * chunk_size, run.version)
             for run in runs

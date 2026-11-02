@@ -2,7 +2,6 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from functools import partial
 import threading
@@ -59,10 +58,9 @@ logger = init_logger(__name__)
 # Stateless, so one instance can serve every LookupModule.
 _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
 
-# Concurrent multi-round versioned lookups; more queue for a free worker.
-_KV_PROBE_WORKERS = 4
-# How often a probe worker blocked on a round checks for shutdown.
-_KV_PROBE_POLL_S = 1.0
+# How often the probe dispatcher re-checks in-flight rounds while any
+# multi-round lookup is live; it sleeps on an event while none is.
+_KV_PROBE_POLL_S = 0.002
 
 
 def resolve_prefetched_obj_keys(
@@ -129,16 +127,18 @@ class _KVVersionProbe:
 
     Round ``r`` prefetches chunks ``[p, n)`` under version
     ``window.version - r``, where ``p`` is where the earlier rounds' hits
-    ended. A worker thread (``LookupModule._drive_kv_probe``) submits each
-    round as soon as the previous one finishes, so the rounds do not wait for
-    the engine to poll. A lookup runs at most ``max_staleness + 1`` rounds and
-    the served versions never increase along the prompt.
+    ended. The module's dispatcher thread (``LookupModule._run_kv_probes``)
+    submits each round as soon as the previous one finishes, so the rounds
+    do not wait for the engine to poll, and checks every live probe without
+    blocking, so probes do not wait for each other. A lookup runs at most
+    ``max_staleness + 1`` rounds and the served versions never increase along
+    the prompt.
 
-    Ownership: only the driver submits rounds and writes the round fields.
-    ``cancelled`` and ``recorded`` change only under ``lock``. Once
-    ``finished`` is set the driver no longer touches the probe. A cancelled
-    probe's driver releases every lock its rounds took; a recorded probe has
-    handed its locks to the session like a plain lookup.
+    Ownership: only the dispatcher submits rounds and writes the round
+    fields. ``cancelled`` and ``recorded`` change only under ``lock``. Once
+    ``finished`` is set the dispatcher no longer touches the probe. For a
+    cancelled probe the dispatcher releases every lock its rounds took; a
+    recorded probe has handed its locks to the session like a plain lookup.
     """
 
     window: KVVersionWindow
@@ -263,10 +263,12 @@ class LookupModule(DiscoverableModule):
         self._kv_versioning = kv_versioning
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
-        # Drives multi-round versioned lookups; threads start on first use.
-        self._kv_probe_pool = ThreadPoolExecutor(
-            max_workers=_KV_PROBE_WORKERS, thread_name_prefix="lmcache-kv-probe"
-        )
+        # Live multi-round versioned lookups, advanced by one dispatcher
+        # thread (started on the first probe) that never blocks on a round.
+        self._kv_probes: list[tuple[_PrefetchJob, _KVVersionProbe]] = []
+        self._kv_probes_lock = threading.Lock()
+        self._kv_probes_wake = threading.Event()
+        self._kv_probe_thread: threading.Thread | None = None
         self._closing = threading.Event()
         self._setup_metrics()
 
@@ -286,13 +288,22 @@ class LookupModule(DiscoverableModule):
         }
 
     def close(self) -> None:
-        """Stop the version-probe workers.
+        """Stop the version-probe dispatcher.
 
-        Probes still running stop at their next wait; their read locks are
-        left to the read-lock TTL.
+        Probes still running submit no further round and their waiters are
+        woken; read locks of rounds still in flight are left to the
+        read-lock TTL.
         """
         self._closing.set()
-        self._kv_probe_pool.shutdown(wait=False, cancel_futures=True)
+        self._kv_probes_wake.set()
+        with self._kv_probes_lock:
+            thread = self._kv_probe_thread
+        if thread is not None:
+            thread.join()
+        with self._kv_probes_lock:
+            for _job, probe in self._kv_probes:
+                probe.finished.set()
+            self._kv_probes.clear()
 
     # -----------------------------------------------------------------
     # Handlers
@@ -313,7 +324,7 @@ class LookupModule(DiscoverableModule):
 
         A key whose request configs carry ``lmcache.kv_version`` looks up
         version-qualified keys. With ``lmcache.max_kv_staleness`` 0 that is one
-        ordinary prefetch. Otherwise a worker thread probes newest version
+        ordinary prefetch. Otherwise the probe dispatcher tries newest version
         first: each round continues where the previous hits ended, one version
         older, until the prompt is covered or the window is exhausted. A chunk
         with no version in the window is a miss and ends the prefix. A
@@ -532,7 +543,7 @@ class LookupModule(DiscoverableModule):
             )
             job.kv_probe = probe
             self._register_prefetch_job(job)
-            self._kv_probe_pool.submit(self._drive_kv_probe, job, probe)
+            self._add_kv_probe(job, probe)
             return
 
         kv_version = None if window is None else window.version
@@ -616,7 +627,7 @@ class LookupModule(DiscoverableModule):
             request_id is unknown (already completed and consumed, or invalid).
 
         Note:
-            A multi-round versioned lookup's rounds run on a worker thread;
+            A multi-round versioned lookup's rounds run on the probe dispatcher;
             ``timeout`` bounds the wait for all of them.
         """
         with self._prefetch_job_lock:
@@ -629,7 +640,7 @@ class LookupModule(DiscoverableModule):
             return 0
 
         if job.kv_probe is not None:
-            # The probe's worker drives every round; ``timeout`` bounds all.
+            # The dispatcher drives every round; ``timeout`` bounds all.
             if not job.kv_probe.finished.wait(timeout):
                 return None
         elif not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
@@ -664,7 +675,7 @@ class LookupModule(DiscoverableModule):
         prefetch controller and expire with the read-lock TTL.
 
         A multi-round versioned lookup that is still probing is cancelled
-        instead: its worker releases every lock its rounds took, and this
+        instead: the dispatcher releases every lock its rounds took, and this
         call releases only ``extra_ranges``.
 
         Args:
@@ -682,7 +693,7 @@ class LookupModule(DiscoverableModule):
         session = self._ctx.session_manager.get_or_create(key.request_id)
         window = read_kv_version_hints(key.request_configs).window
         if self._abandon_kv_probe(key.request_id):
-            # A multi-round lookup was still running; its worker releases
+            # A multi-round lookup was still running; the dispatcher releases
             # every lock its rounds took, so only the extra ranges remain.
             self._finish_read_locks(
                 key, self._extra_range_obj_keys(key, session, window, extra_ranges)
@@ -915,7 +926,7 @@ class LookupModule(DiscoverableModule):
         about what a lookup locked.
 
         A multi-round versioned lookup has already recorded its result on
-        the session from its worker (see ``_drive_kv_probe``); this only
+        the session from the dispatcher (see ``_run_kv_probes``); this only
         reports it once the worker has finished.
 
         Returns:
@@ -1076,29 +1087,55 @@ class LookupModule(DiscoverableModule):
             num_kv_readers=num_kv_readers,
         )
 
-    def _drive_kv_probe(self, job: _PrefetchJob, probe: _KVVersionProbe) -> None:
-        """Run a probe's rounds until it is done or cancelled.
+    def _add_kv_probe(self, job: _PrefetchJob, probe: _KVVersionProbe) -> None:
+        """Hand a probe whose first round is submitted to the dispatcher."""
+        with self._kv_probes_lock:
+            self._kv_probes.append((job, probe))
+            if self._kv_probe_thread is None:
+                self._kv_probe_thread = threading.Thread(
+                    target=self._run_kv_probes,
+                    name="lmcache-kv-probe",
+                    daemon=True,
+                )
+                self._kv_probe_thread.start()
+        self._kv_probes_wake.set()
 
-        Runs on a probe worker thread. Each finished round either ends the
-        probe or immediately submits the next one (``_finish_kv_round``). An
-        unexpected error cancels the probe and releases its locks, so the
-        lookup reports a miss.
+    def _run_kv_probes(self) -> None:
+        """Advance every live probe whose round finished (dispatcher thread).
 
-        Args:
-            job: The registered job of the lookup.
-            probe: ``job.kv_probe``.
+        Checks each in-flight round without blocking, so one slow round never
+        delays another probe; sleeps on an event while no probe is live.
         """
-        storage = self._ctx.storage_manager
+        while not self._closing.is_set():
+            with self._kv_probes_lock:
+                live = list(self._kv_probes)
+            if not live:
+                self._kv_probes_wake.wait()
+                self._kv_probes_wake.clear()
+                continue
+            for job, probe in live:
+                if self._advance_kv_probe(job, probe):
+                    with self._kv_probes_lock:
+                        self._kv_probes.remove((job, probe))
+                    probe.finished.set()
+            self._kv_probes_wake.wait(_KV_PROBE_POLL_S)
+            self._kv_probes_wake.clear()
+
+    def _advance_kv_probe(self, job: _PrefetchJob, probe: _KVVersionProbe) -> bool:
+        """Advance one probe if its in-flight round has finished.
+
+        An unexpected error cancels the probe and releases every lock its
+        finished rounds took, so the lookup reports a miss. No round is in
+        flight then: submitting is the last step of a round.
+
+        Returns:
+            True when the probe is over (recorded, cancelled or failed).
+        """
         try:
-            while True:
-                while not storage.wait_prefetch_status(probe.handle, _KV_PROBE_POLL_S):
-                    if self._closing.is_set():
-                        return
-                result = storage.query_prefetch_status(probe.handle)
-                if result is None:
-                    raise RuntimeError("probe round result was taken by another reader")
-                if self._finish_kv_round(job, probe, result):
-                    return
+            result = self._ctx.storage_manager.query_prefetch_status(probe.handle)
+            if result is None:
+                return False
+            return self._finish_kv_round(job, probe, result)
         except Exception:
             logger.exception(
                 "KV version probe for request %s failed; reporting a miss",
@@ -1107,8 +1144,7 @@ class LookupModule(DiscoverableModule):
             with probe.lock:
                 probe.cancelled = True
             self._release_kv_probe_locks(probe)
-        finally:
-            probe.finished.set()
+            return True
 
     def _finish_kv_round(
         self, job: _PrefetchJob, probe: _KVVersionProbe, result: PrefetchResult
@@ -1162,7 +1198,7 @@ class LookupModule(DiscoverableModule):
                     dict(probe.l1_owners),
                 )
                 probe.recorded = True
-        if cancelled:
+        if cancelled or (not done and self._closing.is_set()):
             self._release_kv_probe_locks(probe)
             return True
         if done:
@@ -1187,7 +1223,7 @@ class LookupModule(DiscoverableModule):
     def _abandon_kv_probe(self, request_id: str) -> bool:
         """Cancel the request's multi-round lookup if it has not finished.
 
-        A cancelled probe's job is dropped and its worker releases every
+        A cancelled probe's job is dropped and the dispatcher releases every
         lock its rounds took once its in-flight round ends; nothing else
         submits rounds. A probe that already recorded its result is left as
         a plain lookup result.

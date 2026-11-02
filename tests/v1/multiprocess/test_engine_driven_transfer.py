@@ -2812,3 +2812,46 @@ def test_engine_driven_context_shm_close_is_idempotent() -> None:
     finally:
         shm_munmap(addr, 4096)
         shm_unlink(shm_name)
+
+
+@pytest.mark.parametrize("version", [3, "3"], ids=["valid", "malformed"])
+@pytest.mark.parametrize("shm", [True, False], ids=["shm", "inline"])
+def test_server_stores_no_kv_of_versioned_requests(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+    version: object,
+    shm: bool,
+) -> None:
+    """Engine-driven mode does not offer KV versioning: a store carrying
+    ``lmcache.kv_version`` (valid or malformed) writes nothing, so it can
+    neither land in the unversioned key space nor in objects no lookup reads.
+    """
+    # Standard
+    from dataclasses import replace
+
+    mock_storage = MagicMock()
+    mock_storage.reserve_write.return_value = {}
+    mock_session = MagicMock()
+    mock_session.get_hashes.return_value = [b"h"]
+    module, _, _, _ = server_module_factory(
+        storage_manager_config=(
+            _make_storage_manager_config(shm_name="lmcache_test_pool", pool_size=1024)
+            if shm
+            else None
+        ),
+        mock_storage=mock_storage,
+        mock_session=mock_session,
+    )
+    module.register_kv_cache_engine_driven_context(
+        _default_register_payload(instance_id=4)
+    )
+    key = replace(_default_key(), request_configs={"lmcache.kv_version": version})
+
+    response = module.prepare_store(key, 4)
+    if shm:
+        assert response.context == {"slots": [], "chunk_indices": []}
+    for call in mock_storage.reserve_write.call_args_list:
+        assert call.args[0] == []
+    assert module.commit_store(key, 4, b"") is False
+    mock_storage.finish_write.assert_not_called()
+    module.unregister_kv_cache(4)

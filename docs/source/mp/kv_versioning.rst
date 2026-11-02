@@ -97,6 +97,10 @@ LMCache cannot know (``null``). Tokens not listed were computed by the
 engine. The field is omitted when the spans are not known (for example the
 lookup never finished); it is never fetched with a blocking call.
 
+This format is the contract: a list of ``[start_token, end_token,
+kv_version]`` entries in token order, non-overlapping, with ``kv_version`` an
+integer or ``null`` (unknown).
+
 How it behaves
 --------------
 
@@ -108,11 +112,15 @@ How it behaves
   window ends the hit; the engine recomputes the rest.
 - **Only single-version KV is stored.** A request stores its KV under
   ``kv_version``, and only if everything LMCache served it had that exact
-  version. A request that reused older KV computes the rest of its prompt
-  attending to that older KV, so its new KV belongs to no single version and
-  is not stored. Staleness therefore cannot accumulate across turns that each
-  reuse the previous turn; the next request that misses recomputes and stores
-  fresh KV.
+  version and vLLM's own prefix cache supplied none of its prompt. A request
+  that reused older KV (or vLLM-held KV, whose version LMCache cannot see)
+  computes the rest of its prompt attending to it, so its new KV belongs to
+  no single version and is not stored. Staleness therefore cannot accumulate.
+- **Multi-turn cost.** The flip side: while the turns of a conversation keep
+  reusing an in-window older prefix, each turn's new suffix is not cached,
+  so recompute grows with the conversation until a turn misses the old
+  prefix and stores fresh KV. Keep ``max_kv_staleness`` small for long
+  multi-turn rollouts.
 - **Cost.** ``max_kv_staleness: 0`` costs exactly one lookup, like an
   unversioned request. A window of ``s`` can cost up to ``s + 1`` prefetch
   rounds, which the server runs back to back. Every version keeps its own
@@ -126,13 +134,15 @@ Relation to other features
   salt separates tenants, versions are kept apart inside each tenant.
 - **In-flight weight updates.** Set ``lmcache.kv_version`` to the weight
   version the request is *submitted* under. If the engine switches weights
-  while the request is running, its KV keeps the submitted (older) version,
-  which errs on the stale side.
+  while the request is running, its KV is stored under the submitted version
+  although part of it was computed with newer weights: no KV is older than
+  its label, but the label is not exact.
 - **vLLM's own prefix cache.** LMCache cannot version KV that vLLM keeps
-  itself. Reset vLLM's prefix cache when loading new weights so it never
-  serves older KV outside this accounting. A per-version vLLM ``cache_salt``
-  would also enforce that, but the salt is part of the LMCache key too, so it
-  reduces the window to the exact version.
+  itself; it reports those tokens with version ``null`` and does not store
+  KV computed on top of them. Reset vLLM's prefix cache when loading new
+  weights to limit how much older KV it can hold. A per-version vLLM
+  ``cache_salt`` would also enforce that, but the salt is part of the LMCache
+  key too, so it reduces the window to the exact version.
 - **Importance sampling.** If the sampler records behavior log-probabilities,
   decoupled PPO / importance sampling already corrects for what was actually
   sampled, stale KV included. ``kv_version_spans`` are for diagnostics,
@@ -145,6 +155,9 @@ Limitations
 - ``max_kv_staleness`` needs every attention group to be full attention.
   Models with sliding-window or hybrid layers get exact-version matching
   (a warning is logged).
+- With vLLM prefix caching enabled, a versioned request that hits vLLM's
+  own cache stores nothing in LMCache (see above). Requests still load from
+  LMCache; only the cache's growth is limited.
 - With more than one LMCache server per engine, versioned requests get
   exact-version matching (a warning is logged): each server holds a shard
   of the KV and could otherwise pick different versions for one token.
