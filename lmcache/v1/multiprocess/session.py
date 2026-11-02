@@ -5,7 +5,7 @@ in the multiprocess cache server.
 """
 
 # Standard
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional, overload
@@ -33,6 +33,10 @@ logger = init_logger(__name__)
 _MAX_LOOKUP_HISTORY = 16
 """Earlier lookups per session whose lock scope stays resolvable for
 ``free_lookup_locks`` extra ranges."""
+
+_MAX_REAPED_STORE_SEEDS = 65536
+"""TTL-reaped sessions whose store seed is remembered in generation clear
+mode, so a recreated session keeps storing in its original scope."""
 
 
 @dataclass
@@ -102,6 +106,9 @@ class Session:
     )
     # Every scope a lookup of this session ran under (one per generation).
     _lookup_scopes_seen: set[HashScope] = field(default_factory=set, repr=False)
+    # Scopes of history entries that aged out; any of them may have had the
+    # hit an abandoned range names, so they keep a match ambiguous.
+    _aged_out_scopes: set[HashScope] = field(default_factory=set, repr=False)
     _store_chain: _ChunkHashChain = field(init=False, repr=False)
     _lookup_chain: _ChunkHashChain = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -214,8 +221,10 @@ class Session:
 
         ``free_lookup_locks`` extra ranges name an abandoned lookup only by
         its hit boundary, and that lookup may predate a bump. The scope is
-        taken from recorded lookups with the same hit; if none is recorded
-        (history is bounded), from the session's only lookup scope.
+        taken from recorded lookups with the same hit, together with the
+        scopes of entries that aged out of the bounded history (any of which
+        may have had that hit); if none is recorded, from the session's only
+        lookup scope.
 
         Args:
             hit_chunks: The abandoned lookup's hit boundary, in chunks.
@@ -228,7 +237,9 @@ class Session:
         """
         with self._lock:
             matches = {s for hit, s in self._lookup_history if hit == hit_chunks}
-            if not matches:
+            if matches:
+                matches |= self._aged_out_scopes
+            else:
                 matches = set(self._lookup_scopes_seen)
             return next(iter(matches)) if len(matches) == 1 else None
 
@@ -241,6 +252,8 @@ class Session:
         """Record the lock set acquired by the current lookup."""
         with self._lock:
             if hit_chunks > 0:
+                if len(self._lookup_history) == self._lookup_history.maxlen:
+                    self._aged_out_scopes.add(self._lookup_history[0][1])
                 self._lookup_history.append((hit_chunks, self.lookup_scope))
             self.prefetch_hit_chunks = hit_chunks
             self.prefetch_locked_gids = locked_gids
@@ -401,6 +414,11 @@ class SessionManager:
         """
         self._hasher = hasher
         self._cache_generation = cache_generation
+        # Generation mode only: store seeds of TTL-reaped sessions, oldest
+        # first, bounded by _MAX_REAPED_STORE_SEEDS. A request outliving the
+        # TTL keeps storing in the scope its lookup proved (or stays in its
+        # old generation across a bump) instead of becoming untrusted.
+        self._reaped_store_seeds: OrderedDict[str, ChunkHash] = OrderedDict()
         self._ttl = ttl
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
@@ -421,8 +439,9 @@ class SessionManager:
         KV was computed in (it may be a store arriving after its lookup's
         session was reaped). In generation clear mode its stores are
         therefore seeded with the untrusted-store seed, which no lookup
-        uses; its lookup scope is the current generation. In ``"l1"`` mode
-        both are ``none_hash``.
+        uses -- unless the request's earlier session was reaped by TTL,
+        whose store seed it inherits; its lookup scope is the current
+        generation. In ``"l1"`` mode both are ``none_hash``.
 
         Args:
             request_id: Unique request identifier.
@@ -436,8 +455,11 @@ class SessionManager:
                 session = Session(
                     request_id=request_id,
                     hasher=self._hasher,
-                    store_prefix_hash=(
-                        self._cache_generation.untrusted_store_prefix_hash(self._hasher)
+                    store_prefix_hash=self._reaped_store_seeds.pop(
+                        request_id,
+                        self._cache_generation.untrusted_store_prefix_hash(
+                            self._hasher
+                        ),
                     ),
                     lookup_scope=self._cache_generation.current_scope(self._hasher),
                 )
@@ -449,7 +471,8 @@ class SessionManager:
         """Get existing session or create one for a lookup in ``scope``.
 
         A session created here stores in ``scope`` for its whole life; an
-        existing session keeps its store scope (see :class:`Session`).
+        existing session keeps its store scope (see :class:`Session`), and so
+        does one recreated after TTL reaping in generation clear mode.
 
         Args:
             request_id: Unique request identifier.
@@ -465,7 +488,9 @@ class SessionManager:
                 session = Session(
                     request_id=request_id,
                     hasher=self._hasher,
-                    store_prefix_hash=scope.prefix_hash,
+                    store_prefix_hash=self._reaped_store_seeds.pop(
+                        request_id, scope.prefix_hash
+                    ),
                     lookup_scope=scope,
                 )
                 self._sessions[request_id] = session
@@ -487,6 +512,8 @@ class SessionManager:
             The removed session, or None if no session was found.
         """
         with self._lock:
+            # The request ended: a later session with this id is unrelated.
+            self._reaped_store_seeds.pop(request_id, None)
             if request_id not in self._sessions:
                 return None
             session = self._sessions[request_id]
@@ -509,12 +536,21 @@ class SessionManager:
                     expired.append(session)
             for session in expired:
                 del self._sessions[session.request_id]
+                if self._cache_generation.clear_mode == "generation":
+                    self._remember_store_seed_locked(session)
 
         for session in expired:
             self._notify_destroyed(session)
         if expired:
             logger.info("Cleaned up %d expired sessions", len(expired))
         return len(expired)
+
+    def _remember_store_seed_locked(self, session: Session) -> None:
+        """Record a reaped session's store seed; caller holds the lock."""
+        self._reaped_store_seeds[session.request_id] = session.store_prefix_hash
+        self._reaped_store_seeds.move_to_end(session.request_id)
+        while len(self._reaped_store_seeds) > _MAX_REAPED_STORE_SEEDS:
+            self._reaped_store_seeds.popitem(last=False)
 
     def _notify_destroyed(self, session: Session) -> None:
         """Run every destroy listener for one removed session.

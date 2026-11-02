@@ -229,6 +229,11 @@ class LookupModule(DiscoverableModule):
             )
         )
 
+        # Read the scope once: the hashes, the session's lock state (and the
+        # store scope of a session created here) share it, even if a clear
+        # bumps the generation mid-lookup.
+        scope = self._ctx.cache_generation.current_scope(self._ctx.token_hasher)
+
         layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
         if layout_desc is None:
             logger.error(
@@ -236,19 +241,21 @@ class LookupModule(DiscoverableModule):
                 model_name,
                 world_size,
             )
+            # Even a lookup that cannot hit proves the request's generation;
+            # without a session its later stores would be untrusted.
+            self._ctx.session_manager.get_or_create_for_lookup(key.request_id, scope)
             self._register_empty_prefetch_job(key, early_exit_reason="no_gpu_context")
             return
 
         num_kv_readers = key.require_num_kv_readers()
 
-        # Read the scope once: the hashes, the session's lock state (and the
-        # store scope of a session created here) share it, even if a clear
-        # bumps the generation mid-lookup.
-        scope = self._ctx.cache_generation.current_scope(self._ctx.token_hasher)
         chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
             key.token_bytes, prefix_hash=scope.prefix_hash, end=key.end
         )
         if not chunk_hashes:
+            # A sub-chunk prompt's decode can still cross a chunk boundary
+            # and store; stamp the session so those stores are trusted.
+            self._ctx.session_manager.get_or_create_for_lookup(key.request_id, scope)
             self._register_empty_prefetch_job(
                 key, early_exit_reason="empty_chunk_hashes"
             )

@@ -10,6 +10,7 @@ L1, from where the store controller copies them to L2.
 
 # Standard
 from collections.abc import Callable, Iterator
+from unittest.mock import MagicMock
 import argparse
 import threading
 import time
@@ -19,6 +20,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -43,6 +45,9 @@ from lmcache.v1.multiprocess.config import (
 )
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
+    LMCacheDrivenTransferModule,
+)
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 
@@ -83,14 +88,16 @@ def _storage_config() -> StorageManagerConfig:
     )
 
 
-def _key(request_id: str, worker_id: int | None) -> IPCCacheServerKey:
+def _key(
+    request_id: str, worker_id: int | None, tokens: list[int] = TOKENS
+) -> IPCCacheServerKey:
     return IPCCacheServerKey.from_token_ids(
         model_name=MODEL,
         world_size=1,
         worker_id=worker_id,
-        token_ids=TOKENS,
+        token_ids=tokens,
         start=0,
-        end=len(TOKENS),
+        end=len(tokens),
         request_id=request_id,
     )
 
@@ -98,11 +105,12 @@ def _key(request_id: str, worker_id: int | None) -> IPCCacheServerKey:
 class _Server:
     """The modules under test sharing one context."""
 
-    def __init__(self, clear_mode: str) -> None:
+    def __init__(self, clear_mode: str, session_ttl_seconds: float = 600.0) -> None:
         self.ctx = MPCacheServerContext(
             _storage_config(),
             chunk_size=CHUNK_SIZE,
             clear_mode=clear_mode,  # type: ignore[arg-type]
+            session_ttl_seconds=session_ttl_seconds,
         )
         self.ctx.layout_desc_registry.register(MODEL, 1, LAYOUT)
         self.lookup = LookupModule(self.ctx)
@@ -350,6 +358,47 @@ def test_lookup_racing_the_bump_releases_what_it_locked(generation_server) -> No
     server.free("holder")
     assert all(server.evictable(k) for k in old_keys)
     assert server.read("after") == 0
+
+
+def test_sub_chunk_lookup_then_decode_store_is_served(generation_server) -> None:
+    server = generation_server
+    request_id = "short-prompt"
+    prompt = TOKENS[: CHUNK_SIZE // 2]  # no complete chunk to look up
+    server.lookup.lookup(_key(request_id, None, prompt), 1)
+    assert server.lookup.wait_prefetch_status(request_id, 10.0) == 0
+    # Decode crosses chunk boundaries; the worker stores the full sequence.
+    server.commit(server.store_keys(request_id))
+    server.lookup.end_session(request_id)
+
+    assert server.read("turn-2") == NUM_CHUNKS
+
+
+def test_long_request_outliving_the_session_ttl_still_stores() -> None:
+    server = _Server("generation", session_ttl_seconds=0.05)
+    try:
+        assert server.lookup_hits("long") == 0
+        server.free("long")
+        time.sleep(0.1)
+        assert server.ctx.session_manager.cleanup_expired() == 1
+
+        server.commit(server.store_keys("long"))  # store after reaping
+        assert server.lookup_hits("long") == NUM_CHUNKS  # re-lookup hits
+        server.free("long")
+        server.lookup.end_session("long")
+        assert server.read("turn-2") == NUM_CHUNKS
+    finally:
+        server.close()
+
+
+def test_generation_mode_registers_only_vllm_workers(generation_server) -> None:
+    module = LMCacheDrivenTransferModule(generation_server.ctx)
+    try:
+        with pytest.raises(ValueError, match="only vLLM"):
+            module.register_kv_cache(
+                1, MagicMock(), MODEL, 1, EngineType.SGLANG, MagicMock(), []
+            )
+    finally:
+        module.close()
 
 
 def test_close_stops_tracking_l2_keys(generation_server) -> None:

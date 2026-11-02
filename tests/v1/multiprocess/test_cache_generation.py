@@ -300,6 +300,79 @@ def test_failed_retrieve_snapshot_carries_the_lookup_scope(scoped) -> None:
     assert snapshot[-1] == scope
 
 
+def test_aged_out_history_keeps_an_equal_hit_ambiguous(scoped) -> None:
+    hasher, generation, manager = scoped
+    session = manager.get_or_create_for_lookup("r", generation.current_scope(hasher))
+    session.begin_lookup(_lookup_key("r"), (-1,), generation.current_scope(hasher))
+    session.record_prefetch_result(3, (0,))  # abandoned; will age out
+    generation.bump()
+    for _ in range(16):  # fills the bounded history with newer lookups
+        session.begin_lookup(_lookup_key("r"), (-1,), generation.current_scope(hasher))
+        session.record_prefetch_result(3, (0,))
+
+    assert session.abandoned_lookup_scope(3) is None
+
+
+def _reaping_manager(
+    generation: CacheGeneration, hasher: TokenHasher
+) -> SessionManager:
+    return SessionManager(
+        hasher, cache_generation=generation, ttl=0.01, cleanup_interval=None
+    )
+
+
+def _reap(manager: SessionManager) -> None:
+    time.sleep(0.03)
+    assert manager.cleanup_expired() >= 1
+
+
+def test_session_recreated_after_reaping_keeps_its_store_scope() -> None:
+    hasher, generation = TokenHasher(CHUNK_SIZE), CacheGeneration("generation")
+    manager = _reaping_manager(generation, hasher)
+    scope = generation.current_scope(hasher)
+    manager.get_or_create_for_lookup("long", scope)
+    _reap(manager)
+
+    recreated = manager.get_or_create("long")  # a store after the TTL
+    recreated.set_tokens(PACKED)
+    assert recreated.get_store_hashes(0, len(TOKENS)) == _hashes(
+        hasher, scope.prefix_hash
+    )
+
+
+def test_reaped_session_spanning_a_bump_stays_in_its_old_generation() -> None:
+    hasher, generation = TokenHasher(CHUNK_SIZE), CacheGeneration("generation")
+    manager = _reaping_manager(generation, hasher)
+    old = generation.current_scope(hasher)
+    manager.get_or_create_for_lookup("long", old)
+    _reap(manager)
+    generation.bump()
+
+    # Even a re-lookup under the new generation does not move its stores.
+    recreated = manager.get_or_create_for_lookup(
+        "long", generation.current_scope(hasher)
+    )
+    recreated.set_tokens(PACKED)
+    assert recreated.get_store_hashes(0, len(TOKENS)) == _hashes(
+        hasher, old.prefix_hash
+    )
+
+
+def test_ended_request_forgets_its_reaped_store_scope() -> None:
+    hasher, generation = TokenHasher(CHUNK_SIZE), CacheGeneration("generation")
+    manager = _reaping_manager(generation, hasher)
+    scope = generation.current_scope(hasher)
+    manager.get_or_create_for_lookup("done", scope)
+    _reap(manager)
+    assert manager.remove("done") is None  # END_SESSION after reaping
+
+    recreated = manager.get_or_create("done")
+    recreated.set_tokens(PACKED)
+    assert recreated.get_store_hashes(0, len(TOKENS)) != _hashes(
+        hasher, scope.prefix_hash
+    )
+
+
 # ---------------------------------------------------------------------------
 # StaleL2KeyCollector
 # ---------------------------------------------------------------------------
@@ -313,9 +386,11 @@ class _RecordingAdapter:
         self.deleted_batches: list[list[ObjectKey]] = []
         self.release = threading.Event()
         self.release.set()
+        self.entered = threading.Event()
         self.fail = False
 
     def delete(self, keys: list[ObjectKey]) -> None:
+        self.entered.set()
         self.release.wait()
         if self.fail:
             raise OSError("backend unavailable")
@@ -468,3 +543,21 @@ def test_close_unregisters_and_stops_deleting(collector_parts) -> None:
     collector.retire_tracked_keys()
     time.sleep(0.2)
     assert adapter.deleted == []
+
+
+def test_close_waits_for_a_batch_inside_an_adapter_delete(collector_parts) -> None:
+    collector, _, adapter = collector_parts
+    adapter.release.clear()
+    collector.on_l2_keys_stored([_object_key(1)], [1])
+    collector.retire_tracked_keys()
+    assert adapter.entered.wait(5.0)
+
+    closer = threading.Thread(target=collector.close)
+    closer.start()
+    closer.join(0.3)
+    assert closer.is_alive()  # still waiting for the in-flight delete
+
+    adapter.release.set()
+    closer.join(10.0)
+    assert not closer.is_alive()
+    assert adapter.deleted == [_object_key(1)]

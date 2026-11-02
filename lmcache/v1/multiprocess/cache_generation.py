@@ -224,6 +224,10 @@ class StaleL2KeyCollector(L2AdapterListener):
         self._untracked_total = 0
         self._dropped_total = 0
         self._failed_delete_calls = 0
+        # Set while the collector thread is inside an adapter ``delete``;
+        # ``close`` waits on it so no batch outlives the adapters.
+        self._deleting = False
+        self._idle = threading.Condition(self._lock)
         self._thread: PeriodicThread = create_periodic_thread(
             name=f"lmcache-mp-stale-l2-gc-{id(self):x}",
             interval=_GC_INTERVAL_SECONDS,
@@ -300,22 +304,32 @@ class StaleL2KeyCollector(L2AdapterListener):
         """Stop tracking and stop the collector thread.
 
         Must run before the storage manager closes its adapters. The thread
-        checks for stop between batches, so at most the batch in progress
-        still reaches an adapter after this returns. Keys still pending are
-        left to L2 eviction.
+        checks for stop between batches; this call then waits, without a
+        timeout, for a batch already inside an adapter ``delete`` to return,
+        so no delete reaches an adapter after ``close`` returns. That wait is
+        bounded only by the adapters' own delete timeouts (e.g. 30 s for the
+        FS adapter). Keys still pending are left to L2 eviction.
         """
         self._storage_manager.unregister_l2_listener(self)
         PeriodicThreadRegistry.get_instance().unregister(self._thread.name)
         self._thread.stop()
+        with self._idle:
+            while self._deleting:
+                self._idle.wait()
 
     def _collect_cycle(self) -> ThreadRunSummary:
         """Delete pending keys batch by batch until empty or stopped."""
         deleted = 0
         failed_calls = 0
-        while not self._thread.stop_requested:
+        while True:
             with self._lock:
+                # Checked under the lock ``close`` waits on, so a batch starts
+                # only if ``close`` will see ``_deleting`` and wait for it.
+                if self._thread.stop_requested:
+                    break
                 count = min(L2_DELETE_BATCH_SIZE, len(self._pending))
                 batch = [self._pending.popleft() for _ in range(count)]
+                self._deleting = bool(batch)
             if not batch:
                 break
             batch_failed = False
@@ -330,7 +344,9 @@ class StaleL2KeyCollector(L2AdapterListener):
                     )
                     batch_failed = True
                     failed_calls += 1
-            with self._lock:
+            with self._idle:
+                self._deleting = False
+                self._idle.notify_all()
                 self._failed_delete_calls += failed_calls
                 if not batch_failed:
                     self._deleted_total += len(batch)

@@ -484,7 +484,22 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+
+        Raises:
+            ValueError: If the server runs in generation clear mode and
+                ``engine_type`` is not vLLM. Generation mode trusts a
+                request's stores only after its LOOKUP stamped the session,
+                and only the vLLM connector looks up every request (SGLang,
+                for example, skips the LOOKUP of sub-chunk prompts).
         """
+        if (
+            self._ctx.cache_generation.clear_mode == "generation"
+            and engine_type != EngineType.VLLM
+        ):
+            raise ValueError(
+                f"clear mode 'generation' supports only vLLM workers; got "
+                f"{engine_type.value!r} (instance {instance_id})"
+            )
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
         # worker re-registering on its first ping) refreshes its last-seen

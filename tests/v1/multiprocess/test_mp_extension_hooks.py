@@ -42,6 +42,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPWorkerAdapter,
 )
 from lmcache.v1.multiprocess import object_group_transfer
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as mod
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
@@ -179,6 +180,7 @@ def test_register_builds_the_context_through_the_hook():
             raise _StopHere
 
     module = _Module.__new__(_Module)
+    module._ctx = SimpleNamespace(cache_generation=CacheGeneration("l1"))
     module._lock = threading.Lock()
     module._cache_contexts = {}
     kv_caches, infos = object(), [object()]
