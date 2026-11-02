@@ -251,6 +251,65 @@ Source: ``lmcache/v1/multiprocess/config.py``
        linear-attention hybrids** (it lets their recurrent state be cached
        independently). For a non-hybrid model it makes no difference —
        every layer resolves to one object group. See :doc:`/mp/hybrid_models`.
+   * - ``--clear-mode``
+     - ``l1``
+     - What a cache clear (vLLM ``reset_prefix_cache`` with the connector
+       reset, or ``POST /cache/clear``) does. ``l1`` frees unlocked L1
+       objects and leaves L2 untouched. ``generation`` also invalidates every
+       stored L1 and L2 object in O(1) and deletes the L2 copies in the
+       background. Choices: ``l1``, ``generation``. Not supported with
+       ``--engine-type blend``. See :ref:`mp-generation-clear`.
+
+.. _mp-generation-clear:
+
+Generation-scoped cache reset
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In RL post-training (GRPO, PPO) the rollout engine loads new policy weights
+at every training step, and every KV object computed under the old weights is
+stale. A plain ``--clear-mode l1`` clear frees only unlocked L1 objects: old
+objects in L2 are promoted back by the next lookup (stale hits), and stores
+still in flight commit after the clear. Deleting every L2 key inside the clear
+would fix that, but puts O(number of L2 keys) storage deletes on the
+weight-sync critical path while the GPUs idle.
+
+``--clear-mode generation`` instead mixes a server-side *cache generation*
+counter into the seed of every chunk hash. A clear bumps the counter, frees
+unlocked L1 objects as before, and returns; it never waits for L2:
+
+.. code-block:: bash
+
+   lmcache server --l1-size-gb 64 \
+       --l2-adapter '{"type": "fs", "base_path": "/mnt/l2/run-42"}' \
+       --clear-mode generation
+
+- Every object stored before the clear -- in L1, in L2, or still being
+  written -- now has a hash no later lookup computes, so it can never be
+  served again.
+- Generation ``0`` (before the first clear) hashes exactly like
+  ``--clear-mode l1``, so cache contents and key formats are unchanged.
+- L2 keys stored before the clear are deleted by a background collector in
+  batches through each adapter's ``delete``. Adapters without ``delete``, and
+  keys beyond the collector's one-million-key tracking bound, are reclaimed by
+  normal L2 eviction instead.
+- A request whose session started before the clear keeps hashing under the
+  old generation (its KV was computed with the old weights) until its next
+  lookup, so its stores become garbage rather than polluting the new
+  generation. A request looked up after the clear stores under the new
+  generation.
+
+``GET /status`` reports ``cache_generation.generation`` and the collector
+counters under ``cache_generation.stale_l2_gc`` (``retired_keys``,
+``deleted_keys``, ``pending_delete_keys``, ``untracked_keys``,
+``failed_delete_batches``).
+
+Limits: the counter restarts at ``0`` when the server restarts, so a
+persistent L2 reused across server restarts can see a generation number
+again; give each training run its own L2 location. Every MP server has its own
+counter, so servers sharing one L2 share hits only while their generations
+agree. Token-addressed coordinator APIs (pin, eviction, directory) and
+worker-built KV store events (``--kv-event-log-size 0``) compute
+generation-``0`` hashes, so they stop matching after the first clear.
 
 Lookup Hash Logging
 -------------------
