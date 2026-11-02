@@ -438,6 +438,18 @@ def test_session_ttl_seconds_default_and_flag():
     assert _parse_mp(["--session-ttl-seconds", "7200"]).session_ttl_seconds == 7200.0
 
 
+def test_sequence_tracker_defaults_to_disabled_and_flag_parses():
+    """Tracking is off unless the operator sets a chunk budget."""
+    assert _parse_mp([]).sequence_tracker_max_chunks == 0
+    config = _parse_mp(["--sequence-tracker-max-chunks", "4096"])
+    assert config.sequence_tracker_max_chunks == 4096
+
+
+def test_sequence_tracker_budget_is_validated():
+    with pytest.raises(ValueError, match="sequence tracker"):
+        MPServerConfig(sequence_tracker_max_chunks=-1)
+
+
 def test_kv_load_policy_default_and_flag():
     """The KV load policy defaults to DEFAULT and accepts a module path."""
     assert _parse_mp([]).kv_load_policy == "DEFAULT"

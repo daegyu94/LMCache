@@ -54,6 +54,8 @@ engine.  Load policies receive the request configs as sent.  The vLLM
 adapter add ``lmcache.hint.engine_computed_tokens``, the tokens the engine
 already holds in its own prefix cache, to their lookups.  vLLM omits it on
 eager-prefetch lookups, which run before vLLM checks its prefix cache.
+When ``--sequence-tracker-max-chunks`` is set, the server also acts on
+``lmcache.sequence_id`` (see :doc:`/mp/sequence_history`).
 
 MP Server
 ---------
@@ -230,6 +232,12 @@ Source: ``lmcache/v1/multiprocess/config.py``
        ``package.module:ClassName`` value loads a custom
        ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass from
        the server's environment, constructed with ``--runtime-plugin-config``.
+   * - ``--sequence-tracker-max-chunks``
+     - ``0``
+     - Total chunk hashes the server remembers for requests tagged with
+       ``lmcache.sequence_id``, used to count history appends and rewrites;
+       the least recently seen sequences are forgotten first. ``0`` disables
+       tracking and the hint is ignored. See :doc:`/mp/sequence_history`.
    * - ``--enable-segmented-prefix``
      - ``False``
      - CacheBlend (``--engine-type blend``) only: on a mid-prefix L2 retrieve

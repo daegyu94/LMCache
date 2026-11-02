@@ -300,6 +300,27 @@ sum(rate(lmcache_mp_lookup_early_exit_requests_total[5m])) by (reason)
 
 ---
 
+## Sequence History Metrics
+
+Emitted only for lookups tagged with `lmcache.sequence_id` while
+`--sequence-tracker-max-chunks > 0` (see
+[sequence_lifecycle.md](../multiprocess/sequence_lifecycle.md)). Sequence ids
+are never labels; the only labels are `model_name` and `kind`.
+
+| OTel metric name | Prometheus name | Type | Source event | Calculation |
+|---|---|---|---|---|
+| `lmcache_mp.sequence_transitions` | `lmcache_mp_sequence_transitions_requests_total` | Counter (attrs: `model_name`, `kind` ∈ {`append`, `rewrite`}) | `MP_SEQUENCE_TRANSITION` | `+1` per event |
+| `lmcache_mp.sequence_superseded_chunks` | `lmcache_mp_sequence_superseded_chunks_chunks_total` | Counter (attr: `model_name`) | `MP_SEQUENCE_TRANSITION` | `+superseded_chunks` |
+| `lmcache_mp.sequence_divergence_chunk` | `lmcache_mp_sequence_divergence_chunk_chunks` | Histogram (attr: `model_name`; buckets 0, 1, 2, 4, …, 2048, 4096) | `MP_SEQUENCE_TRANSITION` | records `divergence_chunk` when `kind == "rewrite"` |
+| `lmcache_mp.sequence_tracker_chunks` | `lmcache_mp_sequence_tracker_chunks` | ObservableGauge (registered only when the module is built) | `SequenceTracker.num_tracked_chunks()` | tracker size at scrape time; bounded by `--sequence-tracker-max-chunks` |
+
+**What it answers:** How often do tagged trajectories rewrite their history,
+and where? A rewrite share near 1 with mass in the lowest divergence buckets
+usually means the prompt template or tokenization changed between turns
+rather than an intended context fold.
+
+---
+
 ## L2 Failure Metrics (LM-291 health monitoring)
 
 | OTel metric name | Prometheus name | Type | Source event | Calculation | Tags |

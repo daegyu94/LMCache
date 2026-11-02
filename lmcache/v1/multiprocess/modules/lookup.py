@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Protocol
 import threading
 import time
 
@@ -42,6 +43,34 @@ logger = init_logger(__name__)
 
 # Stateless, so one instance can serve every LookupModule.
 _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
+
+
+class LookupObserver(Protocol):
+    """Receives every lookup the KV load policy admitted.
+
+    Registered with :meth:`LookupModule.add_lookup_observer`. Contract:
+
+    - Called synchronously, before the prefetch is submitted, on whichever
+      thread of the BLOCKING handler pool serves the lookup. Lookups of
+      different requests run concurrently, so implementations must be
+      thread-safe, cheap and non-blocking.
+    - Observers of one lookup are called in registration order, which is the
+      server's module build (dependency) order.
+    - An exception is logged with ``logger.exception`` and ignored: the next
+      observer still runs and the lookup proceeds unchanged. Observers are
+      therefore unsuitable for anything the lookup's correctness depends on.
+    """
+
+    def on_lookup_admitted(
+        self, key: IPCCacheServerKey, chunk_hashes: list[bytes]
+    ) -> None:
+        """Observe one admitted lookup.
+
+        Args:
+            key: The lookup's cache key, including ``request_configs``.
+            chunk_hashes: The lookup's full chunk-hash chain from chunk 0
+                (shared with the lookup; must not be mutated).
+        """
 
 
 def resolve_prefetched_obj_keys(
@@ -163,6 +192,9 @@ class LookupModule(DiscoverableModule):
         self._load_policy = load_policy
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # Filled while modules are built, before the server handles requests;
+        # read-only afterwards.
+        self._lookup_observers: list[LookupObserver] = []
         self._setup_metrics()
 
     @property
@@ -183,6 +215,20 @@ class LookupModule(DiscoverableModule):
     def close(self) -> None:
         """Release resources owned by this module (no-op)."""
         pass
+
+    def add_lookup_observer(self, observer: LookupObserver) -> None:
+        """Register an observer of every lookup the load policy admits.
+
+        Must be called while modules are built (from another module's
+        ``create``), before the server handles requests. A declined lookup
+        or one that exits before hashing is not observed. See
+        :class:`LookupObserver` for threading, ordering and failure
+        semantics.
+
+        Args:
+            observer: The observer to call on each admitted lookup.
+        """
+        self._lookup_observers.append(observer)
 
     # -----------------------------------------------------------------
     # Handlers
@@ -319,6 +365,18 @@ class LookupModule(DiscoverableModule):
                 early_exit_reason="load_policy_recompute",
             )
             return
+
+        for observer in self._lookup_observers:
+            # Observers are optional extensions; one failing must not fail
+            # the lookup or starve the observers after it.
+            try:
+                observer.on_lookup_admitted(key, chunk_hashes)
+            except Exception:
+                logger.exception(
+                    "Lookup observer %s failed on request %s; continuing",
+                    type(observer).__name__,
+                    key.request_id,
+                )
 
         # Keep the covered prefix's recency without locking or prefetching
         # it. After the load policy, so a declined lookup leaves no trace.

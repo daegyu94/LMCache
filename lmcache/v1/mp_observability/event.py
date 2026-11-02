@@ -87,6 +87,10 @@ class EventType(Enum):
     # Chunk hash logging events
     MP_LOOKUP = "mp.lookup"
 
+    # A lookup tagged with ``lmcache.sequence_id`` continued (append) or
+    # rewrote (rewrite) its sequence's previous request; see EVENTS.md.
+    MP_SEQUENCE_TRANSITION = "mp.sequence.transition"
+
     # Per-chunk token bindings. Metadata (parallel lists):
     # chunk_hashes (list[bytes]), token_chunks (list[list[int]]),
     # token_offsets (list[int]: position of each chunk's first token) and

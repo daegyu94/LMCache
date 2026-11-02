@@ -207,6 +207,7 @@ def _stub_metrics_subscriber_modules(monkeypatch):
         "L2ThroughputSubscriber",
         "LookupMetricsSubscriber",
         "MPTransferCountersSubscriber",
+        "SequenceMetricsSubscriber",
         "SMLifecycleSubscriber",
         "TimeoutMetricsSubscriber",
         "TransferPhaseMetricsSubscriber",

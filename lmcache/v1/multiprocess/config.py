@@ -150,6 +150,13 @@ class MPServerConfig:
     ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass. The
     policy is constructed with ``runtime_plugin_config.extra_config``."""
 
+    sequence_tracker_max_chunks: int = 0
+    """Total chunk hashes the sequence tracker keeps across all sequences
+    tagged with ``lmcache.sequence_id``; the least recently seen sequences
+    are forgotten first. 0 (default) disables tracking and the hint is
+    ignored. See ``docs/design/v1/multiprocess/sequence_lifecycle.md`` for
+    the memory cost per chunk and per sequence."""
+
     worker_registration_grace_seconds: float = 3600.0
     """Silence budget (seconds) for a worker that registered but has never
     sent a PING (model warmup, or death before its first request). Must be
@@ -167,13 +174,13 @@ class MPServerConfig:
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
 
     def __post_init__(self) -> None:
-        """Validate the chunk size and worker-reaping timeouts.
+        """Validate the chunk size, worker-reaping timeouts and tracker budget.
 
         Raises:
             ValueError: If the chunk size is not positive, a timeout is
                 non-finite, the reap timeout is negative or a non-zero value
-                below the 30 s floor, or the registration grace is below the
-                reap timeout.
+                below the 30 s floor, the registration grace is below the
+                reap timeout, or the sequence tracker budget is negative.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
@@ -188,6 +195,11 @@ class MPServerConfig:
                 "worker reap timeout must be 0 (disabled) or >= 30s; keep it "
                 ">= 3 x your configured lmcache.mp.heartbeat_interval "
                 f"(default 10s); got {reap}"
+            )
+        if self.sequence_tracker_max_chunks < 0:
+            raise ValueError(
+                "sequence tracker max chunks must be >= 0; got "
+                f"{self.sequence_tracker_max_chunks}"
             )
         if not math.isfinite(grace) or grace < reap:
             raise ValueError(
@@ -562,6 +574,15 @@ def add_mp_server_args(
         "custom KVLoadPolicy, constructed with --runtime-plugin-config.",
     )
     mp_group.add_argument(
+        "--sequence-tracker-max-chunks",
+        type=int,
+        default=MPServerConfig.sequence_tracker_max_chunks,
+        help="Total chunk hashes kept for requests tagged with "
+        "lmcache.sequence_id, used to detect history rewrites; the least "
+        "recently seen sequences are forgotten first. 0 disables tracking. "
+        "Default is %(default)s.",
+    )
+    mp_group.add_argument(
         "--worker-registration-grace-seconds",
         type=float,
         default=3600.0,
@@ -663,6 +684,7 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         session_ttl_seconds=args.session_ttl_seconds,
         kv_load_policy=args.kv_load_policy,
+        sequence_tracker_max_chunks=args.sequence_tracker_max_chunks,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         kv_event_log_size=args.kv_event_log_size,
         server_modules=parse_server_module_specs(args.server_module or []),
