@@ -15,7 +15,12 @@ import time
 import pytest
 
 # First Party
-from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchHandle, PrefetchResult
+from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
+    ObjectKey,
+    PrefetchHandle,
+    PrefetchResult,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.config import CoordinatorConfig, MPServerConfig
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
@@ -51,12 +56,14 @@ def _ctx(num_groups: int = 1, world_size: int = 1) -> MagicMock:
 
 
 def _build(
-    ctx: MagicMock, max_chunks: int = 100
+    ctx: MagicMock, max_chunks: int = 100, demotion: bool = False
 ) -> tuple[LookupModule, SequenceHistoryModule | None]:
     """Build both modules the way the server does: lookup first."""
     build_ctx = ModuleBuildContext(
         ctx,
-        MPServerConfig(sequence_tracker_max_chunks=max_chunks),
+        MPServerConfig(
+            sequence_tracker_max_chunks=max_chunks, sequence_demotion=demotion
+        ),
         CoordinatorConfig(),
     )
     lookup = LookupModule.create(build_ctx)
@@ -116,6 +123,7 @@ def test_rewrite_publishes_transition() -> None:
     _lookup(lookup, ctx, "r1", [b"a", b"b", b"c"], SEQ)
     _lookup(lookup, ctx, "r2", [b"a", b"x"], SEQ)
 
+    ctx.storage_manager.demote_cached_keys.assert_not_called()
     [event] = _transitions(ctx)
     assert event.session_id == "r2"
     assert event.metadata == {
@@ -124,6 +132,7 @@ def test_rewrite_publishes_transition() -> None:
         "previous_chunks": 3,
         "current_chunks": 2,
         "superseded_chunks": 2,
+        "demotion_requested_chunks": 0,
         "model_name": "m",
     }
 
@@ -137,6 +146,7 @@ def test_append_publishes_transition() -> None:
     [event] = _transitions(ctx)
     assert event.metadata["kind"] == "append"
     assert event.metadata["superseded_chunks"] == 0
+    ctx.storage_manager.demote_cached_keys.assert_not_called()
 
 
 def test_first_request_and_repeat_lookup_publish_nothing() -> None:
@@ -208,3 +218,68 @@ def test_malformed_hint_is_ignored_with_one_warning() -> None:
     assert "secret" not in warnings[0]
     # The lookup itself still proceeds.
     assert ctx.storage_manager.submit_prefetch_task.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Demotion
+# ---------------------------------------------------------------------------
+
+
+def _demoted(ctx: MagicMock) -> list[ObjectKey]:
+    ctx.storage_manager.demote_cached_keys.assert_called_once()
+    return ctx.storage_manager.demote_cached_keys.call_args.args[0]
+
+
+def test_rewrite_demotes_superseded_chunks_in_chain_order() -> None:
+    ctx = _ctx()
+    lookup, _ = _build(ctx, demotion=True)
+    _lookup(lookup, ctx, "r1", [b"a", b"b", b"c"], SEQ)
+    _lookup(lookup, ctx, "r2", [b"a", b"x"], SEQ)
+
+    assert [k.chunk_hash for k in _demoted(ctx)] == [b"b", b"c"]
+    [event] = _transitions(ctx)
+    assert event.metadata["demotion_requested_chunks"] == 2
+
+
+def test_demotion_fans_out_chunk_major_over_groups_and_ranks() -> None:
+    """Every (group, kv rank) key of a chunk comes before the next chunk's,
+    so the policies demote whole chunks in chain order."""
+    ctx = _ctx(num_groups=2, world_size=2)
+    lookup, _ = _build(ctx, demotion=True)
+    _lookup(lookup, ctx, "r1", [b"a", b"b", b"c"], SEQ, world_size=2)
+    _lookup(lookup, ctx, "r2", [b"a"], SEQ, world_size=2)
+
+    keys = _demoted(ctx)
+    assert len(keys) == 2 * 2 * 2  # chunks x groups x ranks
+    assert [k.chunk_hash for k in keys] == [b"b"] * 4 + [b"c"] * 4
+    for chunk_keys in (keys[:4], keys[4:]):
+        pairs = {(k.object_group_id, k.kv_rank) for k in chunk_keys}
+        assert len(pairs) == 4
+        assert {group for group, _ in pairs} == {0, 1}
+
+
+def test_chunk_shared_with_another_sequence_is_not_demoted() -> None:
+    ctx = _ctx()
+    lookup, _ = _build(ctx, demotion=True)
+    _lookup(lookup, ctx, "a1", [b"p", b"q", b"a"], {SEQUENCE_ID_HINT: "A"})
+    _lookup(lookup, ctx, "b1", [b"p", b"q", b"b"], {SEQUENCE_ID_HINT: "B"})
+    _lookup(lookup, ctx, "a2", [b"p", b"z"], {SEQUENCE_ID_HINT: "A"})
+
+    assert [k.chunk_hash for k in _demoted(ctx)] == [b"a"]
+    [event] = _transitions(ctx)
+    assert event.metadata["superseded_chunks"] == 2
+    assert event.metadata["demotion_requested_chunks"] == 1
+
+
+def test_no_demotion_without_hint_or_module() -> None:
+    ctx = _ctx()
+    lookup, _ = _build(ctx, max_chunks=0)
+    _lookup(lookup, ctx, "r1", [b"a", b"b"], SEQ)
+    _lookup(lookup, ctx, "r2", [b"x"], SEQ)
+    ctx2 = _ctx()
+    lookup2, _ = _build(ctx2, demotion=True)
+    _lookup(lookup2, ctx2, "r1", [b"a", b"b"], None)
+    _lookup(lookup2, ctx2, "r2", [b"x"], None)
+
+    ctx.storage_manager.demote_cached_keys.assert_not_called()
+    ctx2.storage_manager.demote_cached_keys.assert_not_called()

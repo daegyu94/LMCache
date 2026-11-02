@@ -109,6 +109,23 @@ class LRUEvictionPolicy(EvictionPolicy):
                     # Move to end (most recently used)
                     self._order.move_to_end(key)
 
+    def on_keys_demoted(self, keys: list[ObjectKey]) -> None:
+        """
+        Move tracked keys to the least recently used end.
+
+        Keys are moved in order, so the last key ends up first in line:
+        evicting a chain's tail first keeps its head usable as a prefix.
+
+        Args:
+            keys (list[ObjectKey]): The demoted keys, in chain order
+        """
+        if not keys:
+            return
+        with self._lock:
+            for key in keys:
+                if key in self._order:
+                    self._order.move_to_end(key, last=False)
+
     def on_keys_removed(self, keys: list[ObjectKey]):
         """
         Notify the eviction policy that keys have been deleted.

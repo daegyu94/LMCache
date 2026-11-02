@@ -40,6 +40,12 @@ class SequenceMetricsSubscriber(EventSubscriber):
       their sequence, with extra ``kind`` label (``append`` / ``rewrite``).
     - ``lmcache_mp.sequence_superseded_chunks`` — previous-request chunks
       at or after the divergence chunk.
+    - ``lmcache_mp.sequence_demotion_requested_chunks`` — superseded
+      chunks (hashes) no tracked sequence referenced, for which L1 demotion
+      was requested; 0 unless the server runs with ``--sequence-demotion``.
+      A request, not an outcome: an eviction policy without
+      demotion support (ARC) leaves its order unchanged, and chunks L1 no
+      longer holds are ignored.
     - ``lmcache_mp.sequence_divergence_chunk`` — histogram of the
       divergence chunk index of rewrites.
     """
@@ -62,6 +68,15 @@ class SequenceMetricsSubscriber(EventSubscriber):
             ),
             unit="chunks",
         )
+        self._demotion_requested = meter.create_counter(
+            "lmcache_mp.sequence_demotion_requested_chunks",
+            description=(
+                "Superseded chunks no tracked sequence referenced, for which "
+                "L1 demotion was requested (counted even when the eviction "
+                "policy ignores demotion)."
+            ),
+            unit="chunks",
+        )
         self._divergence = meter.create_histogram(
             "lmcache_mp.sequence_divergence_chunk",
             description="Chunk index at which a rewrite diverged.",
@@ -79,6 +94,9 @@ class SequenceMetricsSubscriber(EventSubscriber):
         kind = event.metadata["kind"]
         self._transitions.add(1, attributes={**attrs, "kind": kind})
         self._superseded.add(event.metadata["superseded_chunks"], attributes=attrs)
+        self._demotion_requested.add(
+            event.metadata["demotion_requested_chunks"], attributes=attrs
+        )
         if kind == "rewrite":
             self._divergence.record(
                 event.metadata["divergence_chunk"], attributes=attrs

@@ -28,13 +28,14 @@ def _deliver(sub: SequenceMetricsSubscriber, **metadata: Any) -> None:
     sub.get_subscriptions()[EventType.MP_SEQUENCE_TRANSITION](event)
 
 
-def _transition(kind: str, divergence: int, previous: int) -> dict:
+def _transition(kind: str, divergence: int, previous: int, demotion: int) -> dict:
     return {
         "kind": kind,
         "divergence_chunk": divergence,
         "previous_chunks": previous,
         "current_chunks": divergence + 1,
         "superseded_chunks": previous - divergence,
+        "demotion_requested_chunks": demotion,
         "model_name": "m",
     }
 
@@ -56,20 +57,21 @@ def test_counts_appends_rewrites_and_chunks() -> None:
     before = read_counters()
     hist_before = histogram_count("lmcache_mp.sequence_divergence_chunk")
 
-    _deliver(sub, **_transition("append", divergence=3, previous=3))
-    _deliver(sub, **_transition("rewrite", divergence=1, previous=4))
+    _deliver(sub, **_transition("append", divergence=3, previous=3, demotion=0))
+    _deliver(sub, **_transition("rewrite", divergence=1, previous=4, demotion=2))
 
     delta = counter_delta(before, read_counters())
     assert delta["lmcache_mp.sequence_transitions"] == 2
     assert delta["lmcache_mp.sequence_superseded_chunks"] == 3
+    assert delta["lmcache_mp.sequence_demotion_requested_chunks"] == 2
     # Only rewrites have a meaningful divergence position.
     assert histogram_count("lmcache_mp.sequence_divergence_chunk") - hist_before == 1
 
 
 def test_labels_are_bounded_to_model_and_kind() -> None:
     sub = SequenceMetricsSubscriber()
-    _deliver(sub, **_transition("rewrite", divergence=0, previous=2))
-    _deliver(sub, **_transition("append", divergence=2, previous=2))
+    _deliver(sub, **_transition("rewrite", divergence=0, previous=2, demotion=2))
+    _deliver(sub, **_transition("append", divergence=2, previous=2, demotion=0))
 
     assert _transition_attrs() <= {
         (("kind", "append"), ("model_name", "m")),

@@ -37,7 +37,7 @@ def _key(sequence_id: str, cache_salt: str = "") -> SequenceKey:
 def test_first_request_of_a_sequence() -> None:
     tracker = SequenceTracker(1000)
     assert tracker.observe(_key("s"), "r1", _chain("a", "b")) == SequenceTransition(
-        TransitionKind.FIRST, 0, 0, ()
+        TransitionKind.FIRST, 0, 0, (), ()
     )
 
 
@@ -46,7 +46,7 @@ def test_pure_append_supersedes_nothing() -> None:
     tracker.observe(_key("s"), "r1", _chain("a", "b"))
     assert tracker.observe(
         _key("s"), "r2", _chain("a", "b", "c", "d")
-    ) == SequenceTransition(TransitionKind.APPEND, 2, 2, ())
+    ) == SequenceTransition(TransitionKind.APPEND, 2, 2, (), ())
 
 
 def test_identical_prompt_is_an_append() -> None:
@@ -62,14 +62,14 @@ def test_mid_rewrite_supersedes_the_tail() -> None:
     tracker.observe(_key("s"), "r1", _chain("a", "b", "c", "d"))
     assert tracker.observe(
         _key("s"), "r2", _chain("a", "b", "x", "y", "z")
-    ) == SequenceTransition(TransitionKind.REWRITE, 2, 4, (b"c", b"d"))
+    ) == SequenceTransition(TransitionKind.REWRITE, 2, 4, (b"c", b"d"), (b"c", b"d"))
 
 
 def test_rewrite_at_chunk_zero_supersedes_everything() -> None:
     tracker = SequenceTracker(1000)
     tracker.observe(_key("s"), "r1", _chain("a", "b"))
     assert tracker.observe(_key("s"), "r2", _chain("x")) == SequenceTransition(
-        TransitionKind.REWRITE, 0, 2, (b"a", b"b")
+        TransitionKind.REWRITE, 0, 2, (b"a", b"b"), (b"a", b"b")
     )
 
 
@@ -77,7 +77,7 @@ def test_shorter_prefix_is_a_rewrite_of_the_dropped_tail() -> None:
     tracker = SequenceTracker(1000)
     tracker.observe(_key("s"), "r1", _chain("a", "b", "c"))
     assert tracker.observe(_key("s"), "r2", _chain("a")) == SequenceTransition(
-        TransitionKind.REWRITE, 1, 3, (b"b", b"c")
+        TransitionKind.REWRITE, 1, 3, (b"b", b"c"), (b"b", b"c")
     )
 
 
@@ -103,6 +103,41 @@ def test_sequences_are_scoped_by_cache_salt() -> None:
     tracker.observe(_key("s", cache_salt="t1"), "r1", _chain("a", "b"))
     transition = tracker.observe(_key("s", cache_salt="t2"), "r2", _chain("x"))
     assert transition.kind is TransitionKind.FIRST
+
+
+# ---------------------------------------------------------------------------
+# Shared-chain guard
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_still_in_another_sequences_chain_is_not_unreferenced() -> None:
+    tracker = SequenceTracker(1000)
+    # Two trajectories share a prompt (e.g. GRPO siblings).
+    tracker.observe(_key("A"), "a1", _chain("p", "q", "a"))
+    tracker.observe(_key("B"), "b1", _chain("p", "q", "b"))
+
+    transition = tracker.observe(_key("A"), "a2", _chain("p", "z"))
+
+    assert transition.superseded_hashes == (b"q", b"a")
+    assert transition.unreferenced_hashes == (b"a",)
+
+
+def test_chunk_becomes_unreferenced_once_no_sequence_holds_it() -> None:
+    tracker = SequenceTracker(1000)
+    tracker.observe(_key("A"), "a1", _chain("p", "q"))
+    tracker.observe(_key("B"), "b1", _chain("p", "q"))
+    tracker.observe(_key("A"), "a2", _chain("x"))
+    transition = tracker.observe(_key("B"), "b2", _chain("y"))
+    assert transition.unreferenced_hashes == (b"p", b"q")
+
+
+def test_forgotten_sequence_no_longer_protects_its_chunks() -> None:
+    tracker = SequenceTracker(4)
+    tracker.observe(_key("A"), "a1", _chain("p", "a"))
+    tracker.observe(_key("B"), "b1", _chain("p", "b"))
+    tracker.observe(_key("C"), "c1", _chain("c", "d"))  # forgets A
+    transition = tracker.observe(_key("B"), "b2", _chain("x"))
+    assert transition.unreferenced_hashes == (b"p", b"b")
 
 
 # ---------------------------------------------------------------------------

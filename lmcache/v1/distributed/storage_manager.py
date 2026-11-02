@@ -647,6 +647,20 @@ class StorageManager:
         for adapter in adapters:
             adapter.submit_touch(keys)
 
+    def demote_cached_keys(self, keys: list[ObjectKey]) -> None:
+        """Move keys toward the front of every L1 eviction order, without I/O.
+
+        For keys a caller knows one consumer will not reuse while other
+        consumers still might (content-addressed keys can be shared), so
+        they are neither deleted nor unlocked. L2 is untouched: L2 adapters
+        have no demotion hook and their copies may serve other requests.
+
+        Args:
+            keys (list[ObjectKey]): The keys to demote, in chain order.
+        """
+        for manager in self._l1_managers_by_id.values():
+            manager.demote_keys(keys)
+
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
     ) -> tuple[int, int]:

@@ -8,6 +8,11 @@ finds the first chunk where the chains differ (the divergence chunk). The
 previous request's chunks at or after that point will not be hit again by
 this sequence: they are *superseded*.
 
+Chunk keys are content-addressed, so a key superseded for one sequence can
+still be the prefix of another request. The tracker therefore also reports
+which superseded hashes no tracked sequence's latest chain contains
+(``SequenceTransition.unreferenced_hashes``).
+
 The module is pure bookkeeping: no I/O and no cache side effects. See
 ``docs/design/v1/multiprocess/sequence_lifecycle.md``.
 """
@@ -109,12 +114,17 @@ class SequenceTransition:
         superseded_hashes: The previous chain's hashes at or after
             ``divergence_chunk``, in chain order, for ``APPEND`` (always
             empty) and ``REWRITE``; empty for ``FIRST`` and ``REPEAT``.
+        unreferenced_hashes: The subset of ``superseded_hashes``, in chain
+            order, that no tracked chain contains after this observation
+            (neither another sequence's latest chain nor this one's new
+            chain).
     """
 
     kind: TransitionKind
     divergence_chunk: int
     previous_chunks: int
     superseded_hashes: tuple[bytes, ...]
+    unreferenced_hashes: tuple[bytes, ...]
 
 
 @dataclass
@@ -152,7 +162,10 @@ class SequenceTracker:
         self._lock = threading.Lock()
         # Ordered by last observation, oldest first.
         self._entries: OrderedDict[SequenceKey, _SequenceEntry] = OrderedDict()
-        # Invariant: sum of len(entry.chunk_hashes) <= _max_chunks.
+        # hash -> number of tracked chains containing it. Invariant: equals
+        # the multiset union of all entries' chunk_hashes, and
+        # sum(values) == _num_chunks <= _max_chunks.
+        self._chunk_refs: dict[bytes, int] = {}
         self._num_chunks = 0
 
     def observe(
@@ -180,28 +193,30 @@ class SequenceTracker:
         with self._lock:
             previous = self._entries.pop(key, None)
             if previous is not None:
-                self._num_chunks -= len(previous.chunk_hashes)
+                self._release_locked(previous.chunk_hashes)
             if new_chain and len(new_chain) <= self._max_chunks:
                 self._entries[key] = _SequenceEntry(request_id, new_chain)
-                self._num_chunks += len(new_chain)
+                self._acquire_locked(new_chain)
                 self._shrink_to_budget_locked()
 
-        if previous is None:
-            return SequenceTransition(TransitionKind.FIRST, 0, 0, ())
-        prev_chain = previous.chunk_hashes
-        divergence = _common_prefix_length(prev_chain, new_chain)
-        if previous.request_id == request_id:
-            return SequenceTransition(
-                TransitionKind.REPEAT, divergence, len(prev_chain), ()
+            if previous is None:
+                return SequenceTransition(TransitionKind.FIRST, 0, 0, (), ())
+            prev_chain = previous.chunk_hashes
+            divergence = _common_prefix_length(prev_chain, new_chain)
+            if previous.request_id == request_id:
+                return SequenceTransition(
+                    TransitionKind.REPEAT, divergence, len(prev_chain), (), ()
+                )
+            kind = (
+                TransitionKind.APPEND
+                if divergence == len(prev_chain)
+                else TransitionKind.REWRITE
             )
-        kind = (
-            TransitionKind.APPEND
-            if divergence == len(prev_chain)
-            else TransitionKind.REWRITE
-        )
-        return SequenceTransition(
-            kind, divergence, len(prev_chain), prev_chain[divergence:]
-        )
+            superseded = prev_chain[divergence:]
+            unreferenced = tuple(h for h in superseded if h not in self._chunk_refs)
+            return SequenceTransition(
+                kind, divergence, len(prev_chain), superseded, unreferenced
+            )
 
     def num_tracked_sequences(self) -> int:
         """Return how many sequences currently have a tracked chain."""
@@ -220,4 +235,18 @@ class SequenceTracker:
         """
         while self._num_chunks > self._max_chunks:
             _, entry = self._entries.popitem(last=False)
-            self._num_chunks -= len(entry.chunk_hashes)
+            self._release_locked(entry.chunk_hashes)
+
+    def _acquire_locked(self, chain: tuple[bytes, ...]) -> None:
+        for h in chain:
+            self._chunk_refs[h] = self._chunk_refs.get(h, 0) + 1
+        self._num_chunks += len(chain)
+
+    def _release_locked(self, chain: tuple[bytes, ...]) -> None:
+        for h in chain:
+            remaining = self._chunk_refs[h] - 1
+            if remaining:
+                self._chunk_refs[h] = remaining
+            else:
+                del self._chunk_refs[h]
+        self._num_chunks -= len(chain)

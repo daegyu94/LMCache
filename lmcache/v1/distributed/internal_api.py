@@ -146,6 +146,19 @@ class L1ManagerListener(EventListener):
         """
         pass
 
+    def on_l1_keys_demoted(self, keys: list[ObjectKey]) -> None:
+        """Notify the listener that a caller expects no further use of keys.
+
+        A demotion is an eviction-order hint, not a deletion: the keys stay
+        resident and readable, and a later access still counts as usual.
+        The default is a no-op, so listeners that do not order keys (and
+        out-of-tree listeners) are unaffected.
+
+        Args:
+            keys: The demoted keys, in the caller's order; may include keys
+                this L1 does not hold.
+        """
+
 
 class L2AdapterListener(EventListener):
     """Listener for L2 adapter events, analogous to L1ManagerListener."""
@@ -332,6 +345,10 @@ class L1ManagerInterface(Protocol):
 
     def touch_keys(self, keys: list[ObjectKey]) -> None:
         """Record an access to the keys; takes no lock."""
+        ...
+
+    def demote_keys(self, keys: list[ObjectKey]) -> None:
+        """Hint that the keys should be evicted first; takes no lock."""
         ...
 
     def clear(self, force: bool = False) -> None:

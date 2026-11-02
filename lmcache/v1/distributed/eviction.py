@@ -121,6 +121,21 @@ class EvictionPolicy:
         """
         pass
 
+    def on_keys_demoted(self, keys: list[ObjectKey]) -> None:
+        """Notify the policy that a caller expects no further use of keys.
+
+        Policies that can express it should rank the tracked keys among the
+        first eviction candidates; untracked keys are ignored. Demotion
+        never removes a key, and a later ``on_keys_touched`` restores normal
+        recency. The default is a no-op: a policy whose ordering cannot
+        express "evict first" without distorting its own signal (e.g. ARC's
+        ghost-list adaptation) keeps its ordering unchanged.
+
+        Args:
+            keys: The demoted keys, in chain order (a request's earlier
+                chunks first).
+        """
+
     @abstractmethod
     def on_keys_removed(self, keys: list[ObjectKey]):
         """
@@ -213,6 +228,9 @@ class L1EvictionPolicy(L1ManagerListener):
 
     def on_l1_keys_accessed(self, keys: list[ObjectKey]):
         self._policy.on_keys_touched(keys)
+
+    def on_l1_keys_demoted(self, keys: list[ObjectKey]) -> None:
+        self._policy.on_keys_demoted(keys)
 
 
 class L2EvictionPolicy(L2AdapterListener):

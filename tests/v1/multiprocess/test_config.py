@@ -445,6 +445,14 @@ def test_sequence_tracker_defaults_to_disabled_and_flag_parses():
     assert config.sequence_tracker_max_chunks == 4096
 
 
+def test_sequence_demotion_is_opt_in_and_needs_a_budget():
+    assert _parse_mp(["--sequence-tracker-max-chunks", "8"]).sequence_demotion is False
+    config = _parse_mp(["--sequence-tracker-max-chunks", "8", "--sequence-demotion"])
+    assert config.sequence_demotion is True
+    with pytest.raises(ValueError, match="sequence demotion requires"):
+        MPServerConfig(sequence_demotion=True)
+
+
 def test_sequence_tracker_budget_is_validated():
     with pytest.raises(ValueError, match="sequence tracker"):
         MPServerConfig(sequence_tracker_max_chunks=-1)

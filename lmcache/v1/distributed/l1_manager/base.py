@@ -873,6 +873,21 @@ class BaseL1Manager(L1ManagerInterface):
                 )
             )
 
+    def demote_keys(self, keys: list[ObjectKey]) -> None:
+        """Hint that the keys should be evicted before other resident keys.
+
+        Forwards to every listener's ``on_l1_keys_demoted``. The keys stay
+        resident, readable and subject to the usual lock checks; only the
+        eviction order of policies that support demotion changes. Like
+        ``touch_keys`` it takes no lock; unlike it, it publishes no event.
+
+        Args:
+            keys: The keys to demote, in chain order; keys this L1 does not
+                hold are ignored by the policies.
+        """
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_demoted(keys)
+
     @l1_mgr_synchronized
     def clear(self, force: bool = False) -> None:
         """Clear objects from L1 cache.

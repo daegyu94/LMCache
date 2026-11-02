@@ -157,6 +157,13 @@ class MPServerConfig:
     ignored. See ``docs/design/v1/multiprocess/sequence_lifecycle.md`` for
     the memory cost per chunk and per sequence."""
 
+    sequence_demotion: bool = False
+    """Experimental: on a tracked history rewrite, demote the superseded
+    chunks that no tracked sequence references to the front of the L1
+    eviction order (never a deletion). Requires
+    ``sequence_tracker_max_chunks > 0``. Off by default, because untagged
+    traffic that re-reads superseded chunks can lose hits."""
+
     worker_registration_grace_seconds: float = 3600.0
     """Silence budget (seconds) for a worker that registered but has never
     sent a PING (model warmup, or death before its first request). Must be
@@ -180,7 +187,8 @@ class MPServerConfig:
             ValueError: If the chunk size is not positive, a timeout is
                 non-finite, the reap timeout is negative or a non-zero value
                 below the 30 s floor, the registration grace is below the
-                reap timeout, or the sequence tracker budget is negative.
+                reap timeout, the sequence tracker budget is negative, or
+                sequence demotion is enabled without a tracker budget.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
@@ -200,6 +208,11 @@ class MPServerConfig:
             raise ValueError(
                 "sequence tracker max chunks must be >= 0; got "
                 f"{self.sequence_tracker_max_chunks}"
+            )
+        if self.sequence_demotion and self.sequence_tracker_max_chunks == 0:
+            raise ValueError(
+                "sequence demotion requires a sequence tracker budget "
+                "(--sequence-tracker-max-chunks > 0)"
             )
         if not math.isfinite(grace) or grace < reap:
             raise ValueError(
@@ -578,9 +591,17 @@ def add_mp_server_args(
         type=int,
         default=MPServerConfig.sequence_tracker_max_chunks,
         help="Total chunk hashes kept for requests tagged with "
-        "lmcache.sequence_id, used to detect history rewrites; the least "
-        "recently seen sequences are forgotten first. 0 disables tracking. "
+        "lmcache.sequence_id, used to detect history rewrites (see also "
+        "--sequence-demotion); the least recently seen sequences are "
+        "forgotten first. 0 disables tracking. "
         "Default is %(default)s.",
+    )
+    mp_group.add_argument(
+        "--sequence-demotion",
+        action="store_true",
+        help="Experimental: on a history rewrite of a tracked sequence, "
+        "demote its superseded chunks in L1 eviction order (never deleted). "
+        "Requires --sequence-tracker-max-chunks > 0.",
     )
     mp_group.add_argument(
         "--worker-registration-grace-seconds",
@@ -685,6 +706,7 @@ def parse_args_to_mp_server_config(
         session_ttl_seconds=args.session_ttl_seconds,
         kv_load_policy=args.kv_load_policy,
         sequence_tracker_max_chunks=args.sequence_tracker_max_chunks,
+        sequence_demotion=args.sequence_demotion,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         kv_event_log_size=args.kv_event_log_size,
         server_modules=parse_server_module_specs(args.server_module or []),

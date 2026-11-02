@@ -16,6 +16,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchHandle,
     PrefetchTaskSpec,
+    ipc_key_to_chunk_major_object_keys,
     ipc_key_to_grouped_object_keys,
     ipc_key_to_object_keys,
 )
@@ -666,8 +667,10 @@ class LookupModule(DiscoverableModule):
         """Resolve every object key of a request across all object groups.
 
         The object-group count is read from the layout registry for
-        ``key``'s ``(model_name, world_size)``. The order of the returned keys
-        is unspecified.
+        ``key``'s ``(model_name, world_size)``. Keys are chunk-major in chain
+        order (see :func:`ipc_key_to_chunk_major_object_keys`), so a
+        recency update over them ranks whole chunks, head first, in every
+        object group alike.
 
         Args:
             key: The IPC key (model/world/worker, salt).
@@ -679,8 +682,9 @@ class LookupModule(DiscoverableModule):
         num_groups = self._ctx.layout_desc_registry.find_attn_desc(
             key.model_name, key.world_size
         ).num_object_groups
-        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
-        return [obj_key for group_keys in per_group for obj_key in group_keys]
+        return ipc_key_to_chunk_major_object_keys(
+            key, chunk_hashes, list(range(num_groups))
+        )
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:

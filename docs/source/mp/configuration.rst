@@ -238,6 +238,12 @@ Source: ``lmcache/v1/multiprocess/config.py``
        ``lmcache.sequence_id``, used to count history appends and rewrites;
        the least recently seen sequences are forgotten first. ``0`` disables
        tracking and the hint is ignored. See :doc:`/mp/sequence_history`.
+   * - ``--sequence-demotion``
+     - ``False``
+     - Experimental. On a tracked history rewrite, demote the superseded
+       chunks no tracked sequence references to the front of the L1
+       eviction order (never deleted). Requires
+       ``--sequence-tracker-max-chunks`` > 0. See :doc:`/mp/sequence_history`.
    * - ``--enable-segmented-prefix``
      - ``False``
      - CacheBlend (``--engine-type blend``) only: on a mid-prefix L2 retrieve

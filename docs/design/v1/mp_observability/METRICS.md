@@ -311,6 +311,7 @@ are never labels; the only labels are `model_name` and `kind`.
 |---|---|---|---|---|
 | `lmcache_mp.sequence_transitions` | `lmcache_mp_sequence_transitions_requests_total` | Counter (attrs: `model_name`, `kind` ∈ {`append`, `rewrite`}) | `MP_SEQUENCE_TRANSITION` | `+1` per event |
 | `lmcache_mp.sequence_superseded_chunks` | `lmcache_mp_sequence_superseded_chunks_chunks_total` | Counter (attr: `model_name`) | `MP_SEQUENCE_TRANSITION` | `+superseded_chunks` |
+| `lmcache_mp.sequence_demotion_requested_chunks` | `lmcache_mp_sequence_demotion_requested_chunks_chunks_total` | Counter (attr: `model_name`) | `MP_SEQUENCE_TRANSITION` | `+demotion_requested_chunks`: superseded hashes no tracked sequence references, passed to `demote_cached_keys`; always 0 without `--sequence-demotion`. A request, not an outcome: non-zero under ARC (which ignores demotion) and for chunks L1 no longer holds |
 | `lmcache_mp.sequence_divergence_chunk` | `lmcache_mp_sequence_divergence_chunk_chunks` | Histogram (attr: `model_name`; buckets 0, 1, 2, 4, …, 2048, 4096) | `MP_SEQUENCE_TRANSITION` | records `divergence_chunk` when `kind == "rewrite"` |
 | `lmcache_mp.sequence_tracker_chunks` | `lmcache_mp_sequence_tracker_chunks` | ObservableGauge (registered only when the module is built) | `SequenceTracker.num_tracked_chunks()` | tracker size at scrape time; bounded by `--sequence-tracker-max-chunks` |
 

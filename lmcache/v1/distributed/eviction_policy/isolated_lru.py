@@ -101,6 +101,22 @@ class IsolatedLRUEvictionPolicy(EvictionPolicy):
                 if order is not None and key in order:
                     order.move_to_end(key)
 
+    def on_keys_demoted(self, keys: list[ObjectKey]) -> None:
+        """Move tracked keys to the front of their salt's LRU order.
+
+        Same tail-first ordering as ``LRUEvictionPolicy.on_keys_demoted``.
+
+        Args:
+            keys: The demoted keys, in chain order.
+        """
+        if not keys:
+            return
+        with self._lock:
+            for key in keys:
+                order = self._per_salt_order.get(key.cache_salt)
+                if order is not None and key in order:
+                    order.move_to_end(key, last=False)
+
     def on_keys_removed(self, keys: list[ObjectKey]) -> None:
         if not keys:
             return

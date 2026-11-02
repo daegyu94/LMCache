@@ -9,7 +9,10 @@ diverge from the previous one at some chunk ``d``.
 
 When a request names the sequence it continues, the MP server compares its
 chunk chain with that sequence's previous request and counts appends and
-rewrites, including *where* a rewrite happened. An unexpected rewrite — a
+rewrites, including *where* a rewrite happened. As a separate, experimental
+opt-in it can also demote the superseded chunks to the front of the L1
+eviction order, so they are evicted before chunks that live trajectories
+still use. An unexpected rewrite — a
 template or tokenization change between turns, a common source of
 train/inference mismatch in agentic RL — then becomes visible on a dashboard.
 
@@ -24,7 +27,7 @@ Enable It
 ---------
 
 Give the server a tracking budget, the total number of chunk hashes kept
-across all sequences (about 73 bytes per chunk plus 450 bytes per sequence;
+across all sequences (about 114 bytes per chunk plus 450 bytes per sequence;
 the least recently seen sequences are forgotten first):
 
 .. code-block:: bash
@@ -79,6 +82,32 @@ chunk prefix with the sequence's previous request. ``d`` equal to the
 previous length is an **append**; anything shorter is a **rewrite**, and the
 previous chunks ``[d, previous_length)`` are *superseded*.
 
+Superseded-Chunk Demotion (Experimental)
+----------------------------------------
+
+Enable it explicitly on top of tracking:
+
+.. code-block:: bash
+
+   lmcache server --sequence-tracker-max-chunks 262144 --sequence-demotion
+
+Without ``--sequence-demotion`` the server only reports rewrites and the
+cache behaves exactly as without tracking. With it, on a rewrite, superseded
+chunks that no other tracked sequence's latest request contains are moved to
+the front of the L1 eviction order. They stay
+resident and readable: another request that uses them hits as usual and
+restores their recency, and a read-locked chunk is never evicted. Nothing is
+deleted from L1 or L2.
+
+In a CPU simulation of a folding workload (8 GRPO groups of 8 trajectories,
+a fold every 4 turns, 20% untagged shared-prefix traffic; see
+``benchmarks/microbenchmark/sequence_demotion_benchmark.py``), demotion
+recomputed 5–11% fewer chunks when L1 held 20–30% of the working set and
+was neutral with much less or much more memory. Untagged traffic that
+re-reads pre-fold histories lost up to 1.4 points of hit rate. Leave it off
+if such traffic matters to you. These are
+simulation numbers, not serving measurements.
+
 Observability
 -------------
 
@@ -87,6 +116,9 @@ With metrics enabled the server exports, labeled only by ``model_name``
 
 - ``lmcache_mp_sequence_transitions_requests_total{kind="append"|"rewrite"}``
 - ``lmcache_mp_sequence_superseded_chunks_chunks_total``
+- ``lmcache_mp_sequence_demotion_requested_chunks_chunks_total`` (chunks for
+  which demotion was requested; 0 without ``--sequence-demotion``, and also
+  counted when the policy ignores it)
 - ``lmcache_mp_sequence_divergence_chunk_chunks`` (histogram of ``d`` for
   rewrites)
 - ``lmcache_mp_sequence_tracker_chunks`` (gauge, bounded by the budget)
@@ -107,6 +139,11 @@ Limitations
   In a plain multi-turn chat the reasoning only ever appeared in the previous
   *response*, so the next prompt still extends the previous prompt and is
   counted as an append.
+- **Demotion is a hint.** Chunk keys are content-addressed and may be shared
+  with requests the tracker does not know about (untagged requests,
+  forgotten sequences); those may pay a recomputation. Demotion takes effect
+  with the ``LRU`` and ``IsolatedLRU`` L1 eviction policies only; ``ARC``
+  ignores it and L2 eviction order is unchanged.
 - **Bounded memory.** When the budget is exhausted the least recently seen
   sequences are forgotten, and a single prompt longer than the whole budget
   is not tracked. A forgotten sequence's next request starts a new chain.

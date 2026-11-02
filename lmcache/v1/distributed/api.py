@@ -808,6 +808,48 @@ def ipc_key_to_object_keys(
     ]
 
 
+def ipc_key_to_chunk_major_object_keys(
+    ipc_key: "IPCCacheServerKey",
+    chunk_hashes: list[bytes],
+    object_group_ids: list[int],
+) -> list[ObjectKey]:
+    """Expand an IPC key and its chunk hashes into one flat, chunk-major list.
+
+    Holds the same keys as :func:`ipc_key_to_object_keys` but ordered by
+    chunk first: every ``(object group, kv rank)`` key of ``chunk_hashes[0]``
+    (groups in ``object_group_ids`` order, ranks in rank order), then of
+    ``chunk_hashes[1]``, and so on. Use it where position in the list carries
+    meaning per chunk, e.g. eviction-order hints.
+
+    Args:
+        ipc_key: The IPC key providing model_name, world_size, worker_id,
+            cache_salt, and request_configs (see
+            :func:`ipc_key_to_object_keys`).
+        chunk_hashes: Chunk hash bytes, one per chunk, in token order.
+        object_group_ids: Object group ids to produce keys for.
+
+    Returns:
+        ``len(chunk_hashes) * len(object_group_ids) * num_kv_ranks`` keys.
+    """
+    extra_attributes = (
+        ipc_key.request_configs if ipc_key.request_configs is not None else {}
+    )
+    kv_ranks = _lookup_kv_ranks(ipc_key)
+    return [
+        ObjectKey(
+            chunk_hash=chunk_hash,
+            model_name=ipc_key.model_name,
+            kv_rank=kv_rank,
+            object_group_id=object_group_id,
+            cache_salt=ipc_key.cache_salt,
+            extra_attributes=extra_attributes,
+        )
+        for chunk_hash in chunk_hashes
+        for object_group_id in object_group_ids
+        for kv_rank in kv_ranks
+    ]
+
+
 def ipc_key_to_grouped_object_keys(
     ipc_key: "IPCCacheServerKey",
     chunk_hashes: list[bytes],
