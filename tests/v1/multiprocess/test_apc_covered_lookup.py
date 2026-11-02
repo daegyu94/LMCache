@@ -24,6 +24,7 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.multiprocess.cache_generation import HashScope
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
@@ -92,7 +93,12 @@ def test_resolve_sliding_window_floored_by_key_start():
     ctx = _ctx_with_hashes(1)  # hashes for [3, 4)
     key = _make_key(4, start_chunks=3)
     obj_keys = resolve_prefetched_obj_keys(
-        ctx, key, hit_chunks=4, locked_gids=(), group_windows=(2,)
+        ctx,
+        key,
+        hit_chunks=4,
+        locked_gids=(),
+        lookup_scope=HashScope(0, b""),
+        group_windows=(2,),
     )
     assert len(obj_keys) == 1
 

@@ -421,7 +421,7 @@ class QStoreModule(DiscoverableModule, InstanceLivenessTarget):
                 "before submitting store requests"
             )
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
-        obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+        obj_keys_per_obj_group = self._ctx.resolve_store_obj_keys(
             key, list(range(num_object_groups))
         )
         num_chunks = len(obj_keys_per_obj_group[0])

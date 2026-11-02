@@ -98,9 +98,7 @@ class PrefetchService:
                 cache_salt,
                 group_layout_descs,
                 attn_desc,
-                prefix_hash=ctx.token_hasher.generation_prefix_hash(
-                    ctx.cache_generation.current
-                ),
+                ctx.cache_generation.current_scope(ctx.token_hasher).prefix_hash,
             )
         except ValueError as exc:
             raise InvalidRequest(str(exc)) from None

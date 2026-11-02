@@ -1797,7 +1797,7 @@ def test_prepare_store_validates_skipped_chunks(
     _register_windowed_three_group_instance(module)
     keys = [[_group_obj_key(g, c) for c in range(4)] for g in range(3)]
     monkeypatch.setattr(
-        module, "_group_keys_for", lambda entry, key: [list(k) for k in keys]
+        module, "_group_store_keys_for", lambda entry, key: [list(k) for k in keys]
     )
     strategy = MagicMock()
     module._strategies[1] = strategy

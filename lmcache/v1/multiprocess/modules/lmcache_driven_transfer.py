@@ -299,14 +299,14 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         lock_state = session.prepare_failed_retrieve_release(key)
         if lock_state is None:
             return
-        hit_chunks, locked_gids, group_windows, lookup_generation = lock_state
+        hit_chunks, locked_gids, group_windows, lookup_generation, scope = lock_state
         obj_keys = resolve_prefetched_obj_keys(
             self._ctx,
             key,
             hit_chunks,
             locked_gids,
+            lookup_scope=scope,
             group_windows=group_windows,
-            cache_generation=session.cache_generation,
         )
         if not session.claim_failed_retrieve_release(
             instance_id, key, lookup_generation
@@ -652,7 +652,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
-        obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+        obj_keys_per_obj_group = self._ctx.resolve_store_obj_keys(
             key, list(range(num_object_groups))
         )
         num_chunks = len(obj_keys_per_obj_group[0])
@@ -1206,7 +1206,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         if key.start >= chunk_size:
             session = self._ctx.session_manager.get(key.request_id)
             if session is not None:
-                previous = session.get_hashes(key.start - chunk_size, key.start)
+                previous = session.get_store_hashes(key.start - chunk_size, key.start)
                 if previous:
                     parent_hashes[0] = TokenHasher.hash_to_bytes(previous[0])
         self._ctx.event_bus.publish(

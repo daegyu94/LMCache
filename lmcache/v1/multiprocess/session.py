@@ -5,6 +5,7 @@ in the multiprocess cache server.
 """
 
 # Standard
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional, overload
@@ -14,10 +15,10 @@ import time
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.multiprocess.cache_generation import CacheGeneration
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration, HashScope
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.token_codec import TOKEN_STRIDE, num_packed_tokens
-from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.token_hasher import ChunkHash, TokenHasher
 from lmcache.v1.periodic_thread import (
     PeriodicThread,
     PeriodicThreadRegistry,
@@ -29,6 +30,30 @@ from lmcache.v1.periodic_thread import (
 logger = init_logger(__name__)
 
 
+_MAX_LOOKUP_HISTORY = 16
+"""Earlier lookups per session whose lock scope stays resolvable for
+``free_lookup_locks`` extra ranges."""
+
+
+@dataclass
+class _ChunkHashChain:
+    """Incrementally computed rolling chunk hashes from one seed."""
+
+    prefix_hash: ChunkHash
+    hashes: list[ChunkHash] = field(default_factory=list)
+
+    def extend_to(self, hasher: TokenHasher, tokens: bytes, end_chunk: int) -> None:
+        """Hash ``tokens`` up to (not including) ``end_chunk``, reusing the
+        chunks already hashed."""
+        stride = hasher.chunk_size * TOKEN_STRIDE
+        # Slicing a memoryview does not copy; slicing the bytes would.
+        view = memoryview(tokens)
+        while len(self.hashes) < end_chunk:
+            cs = len(self.hashes) * stride
+            prefix = self.hashes[-1] if self.hashes else self.prefix_hash
+            self.hashes.append(hasher.hash_packed_chunk(view[cs : cs + stride], prefix))
+
+
 @dataclass
 class Session:
     """Tracks accumulated token IDs and computed chunk hashes for a request.
@@ -37,11 +62,16 @@ class Session:
     :mod:`lmcache.v1.multiprocess.token_codec`, the layout that arrives on
     the wire and that blake3 hashes; only callers needing ints unpack.
 
-    Chunk hashes are scoped to ``cache_generation``: the session is stamped
-    with the server's generation at creation, and :meth:`begin_lookup`
-    re-stamps it (dropping cached hashes) when a later lookup runs under a
-    newer generation. Stores that reuse the session's hashes therefore land
-    in the generation of the request's latest lookup -- never in a newer one.
+    Chunk hashes live in two scopes (identical outside generation clear
+    mode, see ``docs/design/v1/multiprocess/cache_generation.md``):
+
+    - **Lookup scope** (:meth:`get_hashes`): the generation of the latest
+      lookup. RETRIEVE, lock release and touches address it, matching the
+      keys that lookup prefetched and locked.
+    - **Store scope** (:meth:`get_store_hashes`): fixed for the session's
+      life by ``store_prefix_hash``. A session never moves its stores to a
+      newer generation, because a store arriving after a bump may carry KV
+      computed before it.
 
     Thread-safe: all public methods are protected by an internal lock
     to allow concurrent access from multiple TP worker threads.
@@ -49,12 +79,12 @@ class Session:
 
     request_id: str
     hasher: TokenHasher
-    cache_generation: int = 0
-    """Cache generation the cached ``chunk_hashes`` were computed under."""
+    store_prefix_hash: ChunkHash
+    """Seed of every store key this session resolves; never changes."""
+    lookup_scope: HashScope
+    """Generation and seed of the latest lookup (the session's creation
+    scope until one runs)."""
     tokens: bytes = b""
-    chunk_hashes: list = field(default_factory=list)
-    last_prefix_hash: Any = None
-    num_chunks_processed: int = 0
     created_at: float = field(default_factory=time.time)
     lookup_ipc_key: Optional[IPCCacheServerKey] = None
     prefetch_hit_chunks: int = -1
@@ -66,7 +96,25 @@ class Session:
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
         default_factory=set, repr=False
     )
+    # (hit_chunks, scope) of lookups whose result was recorded, newest last.
+    _lookup_history: deque[tuple[int, HashScope]] = field(
+        default_factory=lambda: deque(maxlen=_MAX_LOOKUP_HISTORY), repr=False
+    )
+    # Every scope a lookup of this session ran under (one per generation).
+    _lookup_scopes_seen: set[HashScope] = field(default_factory=set, repr=False)
+    _store_chain: _ChunkHashChain = field(init=False, repr=False)
+    _lookup_chain: _ChunkHashChain = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        self._store_chain = _ChunkHashChain(self.store_prefix_hash)
+        self._lookup_chain = self._chain_for(self.lookup_scope)
+
+    @property
+    def num_chunks_processed(self) -> int:
+        """Lookup-scope chunks hashed and cached so far."""
+        with self._lock:
+            return len(self._lookup_chain.hashes)
 
     def set_tokens(self, packed_token_ids: bytes) -> None:
         """Update the token sequence (idempotent, replaces not extends).
@@ -85,10 +133,11 @@ class Session:
     def get_hashes(self, start: int) -> list: ...
 
     def get_hashes(self, start: int, end: int | None = None) -> list:
-        """Compute and return chunk hashes for the [start, end) token range.
+        """Compute and return lookup-scope chunk hashes for [start, end).
 
         Internally computes rolling hashes up to end_chunk, skipping
-        already-computed chunks.
+        already-computed chunks. These are the keys the latest lookup
+        addressed; store paths must use :meth:`get_store_hashes`.
 
         Two calling conventions are supported (declared via ``@overload``)::
 
@@ -108,81 +157,50 @@ class Session:
             ValueError: If an explicit ``end`` exceeds the current tokens
                 (hashing past them yields valid-looking garbage).
         """
-        chunk_size = self.hasher.chunk_size
-        assert start % chunk_size == 0, (
-            f"start ({start}) must be a multiple of chunk_size ({chunk_size})"
-        )
-        start_chunk = start // chunk_size
-
         with self._lock:
-            held = num_packed_tokens(self.tokens)
-            if end is not None and end > held:
-                raise ValueError(
-                    f"get_hashes end ({end}) exceeds the session's "
-                    f"{held} token(s); the session may have "
-                    "been recreated after request cleanup"
-                )
-            if end is None:
-                # No explicit end: use the last full-chunk boundary.
-                # Lock must be held here because `self.tokens` may be
-                # concurrently replaced by `set_tokens` from another thread.
-                end = held - (held % chunk_size)
-            assert end % chunk_size == 0, (
-                f"end ({end}) must be a multiple of chunk_size ({chunk_size})"
-            )
-            end_chunk = end // chunk_size
-            self._compute_hash(end_chunk)
-            return self.chunk_hashes[start_chunk:end_chunk]
+            return self._hashes_locked(self._lookup_chain, start, end)
 
-    def _compute_hash(self, end_chunk: int) -> None:
-        """Compute rolling hashes up to end_chunk.
+    def get_store_hashes(self, start: int, end: int) -> list:
+        """Compute and return store-scope chunk hashes for [start, end).
 
-        Uses cached state to skip already-computed chunks.
+        Same contract as :meth:`get_hashes` with an explicit ``end``, but
+        seeded with ``store_prefix_hash``, so every store of this session
+        lands in the scope it was created in, however many bumps or lookups
+        happened since.
 
         Args:
-            end_chunk: Compute hashes up to (but not including) this chunk.
+            start: Start token index (must be aligned to chunk_size).
+            end: End token index (must be aligned to chunk_size).
+
+        Returns:
+            List of hash values for chunks in [start_chunk, end_chunk).
+
+        Raises:
+            ValueError: If ``end`` exceeds the current tokens.
         """
-        stride = self.hasher.chunk_size * TOKEN_STRIDE
-        # Slicing a memoryview does not copy; slicing the bytes would.
-        view = memoryview(self.tokens)
-
-        while self.num_chunks_processed < end_chunk:
-            cs = self.num_chunks_processed * stride
-            chunk = view[cs : cs + stride]
-
-            prefix = (
-                self.last_prefix_hash
-                if self.last_prefix_hash is not None
-                else self.hasher.generation_prefix_hash(self.cache_generation)
-            )
-            h = self.hasher.hash_packed_chunk(chunk, prefix)
-            self.last_prefix_hash = h
-            self.chunk_hashes.append(h)
-            self.num_chunks_processed += 1
+        with self._lock:
+            return self._hashes_locked(self._store_chain, start, end)
 
     def begin_lookup(
         self,
         key: IPCCacheServerKey,
         group_windows: tuple[int, ...],
-        cache_generation: int = 0,
+        scope: HashScope,
     ) -> None:
         """Record a new lookup and reset its per-lookup release state.
 
         Args:
             key: The lookup's IPC key.
             group_windows: Sliding window of each object group, in order.
-            cache_generation: Generation the lookup hashed under. When it
-                differs from the session's, cached chunk hashes are dropped
-                and recomputed under it on the next :meth:`get_hashes`, so
-                later stores and lock releases address this lookup's
-                generation.
+            scope: The scope the lookup hashed under. Later RETRIEVEs and
+                lock releases of this lookup resolve keys in it; the store
+                scope is unaffected.
         """
         with self._lock:
-            if cache_generation != self.cache_generation:
-                self.cache_generation = cache_generation
-                self.chunk_hashes = []
-                self.last_prefix_hash = None
-                self.num_chunks_processed = 0
+            if scope != self.lookup_scope:
+                self.lookup_scope = scope
+                self._lookup_chain = self._chain_for(scope)
+            self._lookup_scopes_seen.add(scope)
             self.lookup_ipc_key = key
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
@@ -190,6 +208,29 @@ class Session:
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
             self._prefetch_owners.clear()
+
+    def abandoned_lookup_scope(self, hit_chunks: int) -> HashScope | None:
+        """Return the scope an earlier lookup locked a hit range under.
+
+        ``free_lookup_locks`` extra ranges name an abandoned lookup only by
+        its hit boundary, and that lookup may predate a bump. The scope is
+        taken from recorded lookups with the same hit; if none is recorded
+        (history is bounded), from the session's only lookup scope.
+
+        Args:
+            hit_chunks: The abandoned lookup's hit boundary, in chunks.
+
+        Returns:
+            The unique matching scope, or ``None`` when the candidates span
+            several generations. A caller must then not release the range:
+            L1 locks are anonymous refcounts, and resolving the wrong
+            generation would decrement other readers' locks.
+        """
+        with self._lock:
+            matches = {s for hit, s in self._lookup_history if hit == hit_chunks}
+            if not matches:
+                matches = set(self._lookup_scopes_seen)
+            return next(iter(matches)) if len(matches) == 1 else None
 
     def record_prefetch_result(
         self,
@@ -199,6 +240,8 @@ class Session:
     ) -> None:
         """Record the lock set acquired by the current lookup."""
         with self._lock:
+            if hit_chunks > 0:
+                self._lookup_history.append((hit_chunks, self.lookup_scope))
             self.prefetch_hit_chunks = hit_chunks
             self.prefetch_locked_gids = locked_gids
             self._prefetch_owners = dict(l1_owners) if l1_owners is not None else {}
@@ -211,8 +254,17 @@ class Session:
     def prepare_failed_retrieve_release(
         self,
         key: IPCCacheServerKey,
-    ) -> tuple[int, tuple[int, ...], tuple[int, ...], int] | None:
-        """Return a stable snapshot for a failed worker's lock release."""
+    ) -> tuple[int, tuple[int, ...], tuple[int, ...], int, HashScope] | None:
+        """Return a stable snapshot for a failed worker's lock release.
+
+        Returns:
+            ``(hit_chunks, locked_gids, group_windows, lookup_generation,
+            lookup_scope)`` of the current lookup -- ``lookup_generation``
+            being the per-session lookup counter checked by
+            :meth:`claim_failed_retrieve_release` and ``lookup_scope`` the
+            cache generation the locks were taken under -- or ``None`` when
+            the session cannot prove ownership of ``key``'s range.
+        """
         if key.worker_id is None:
             return None
 
@@ -238,6 +290,7 @@ class Session:
                 self.prefetch_locked_gids,
                 self.prefetch_group_windows,
                 self._lookup_generation,
+                self.lookup_scope,
             )
 
     def claim_failed_retrieve_release(
@@ -290,6 +343,37 @@ class Session:
             self._failed_retrieve_releases.add(owner)
             return True
 
+    def _chain_for(self, scope: HashScope) -> _ChunkHashChain:
+        """Share the store chain when ``scope`` seeds identically to it."""
+        if scope.prefix_hash == self.store_prefix_hash:
+            return self._store_chain
+        return _ChunkHashChain(scope.prefix_hash)
+
+    def _hashes_locked(
+        self, chain: _ChunkHashChain, start: int, end: int | None
+    ) -> list[ChunkHash]:
+        """Return ``chain``'s hashes for [start, end); caller holds the lock."""
+        chunk_size = self.hasher.chunk_size
+        assert start % chunk_size == 0, (
+            f"start ({start}) must be a multiple of chunk_size ({chunk_size})"
+        )
+        held = num_packed_tokens(self.tokens)
+        if end is not None and end > held:
+            raise ValueError(
+                f"get_hashes end ({end}) exceeds the session's "
+                f"{held} token(s); the session may have "
+                "been recreated after request cleanup"
+            )
+        if end is None:
+            # No explicit end: use the last full-chunk boundary.
+            end = held - (held % chunk_size)
+        assert end % chunk_size == 0, (
+            f"end ({end}) must be a multiple of chunk_size ({chunk_size})"
+        )
+        end_chunk = end // chunk_size
+        chain.extend_to(self.hasher, self.tokens, end_chunk)
+        return chain.hashes[start // chunk_size : end_chunk]
+
 
 class SessionManager:
     """Thread-safe manager for per-request sessions."""
@@ -300,25 +384,23 @@ class SessionManager:
     def __init__(
         self,
         hasher: TokenHasher,
+        *,
+        cache_generation: CacheGeneration,
         ttl: float = DEFAULT_SESSION_TTL,
         cleanup_interval: float | None = DEFAULT_CLEANUP_INTERVAL,
-        cache_generation: CacheGeneration | None = None,
     ) -> None:
         """Create a session manager.
 
         Args:
             hasher: Hasher shared by every session.
-            ttl: Idle seconds before a session is reaped.
+            cache_generation: The server's generation counter; scopes the
+                hashes of every session created here.
+            ttl: Seconds after creation before a session is reaped.
             cleanup_interval: Seconds between reaper runs; ``None`` or a
                 non-positive value disables the reaper thread.
-            cache_generation: Server generation counter stamped onto new
-                sessions. ``None`` uses a private counter that stays at 0,
-                i.e. generation-free hashing.
         """
         self._hasher = hasher
-        self._cache_generation = (
-            cache_generation if cache_generation is not None else CacheGeneration()
-        )
+        self._cache_generation = cache_generation
         self._ttl = ttl
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
@@ -333,10 +415,14 @@ class SessionManager:
             self._cleanup_thread.start()
 
     def get_or_create(self, request_id: str) -> Session:
-        """Get existing session or create a new one.
+        """Get existing session or create one outside a lookup.
 
-        A new session is stamped with the current cache generation; an
-        existing one keeps its generation until its next lookup.
+        A session created here has no lookup proving which generation its
+        KV was computed in (it may be a store arriving after its lookup's
+        session was reaped). In generation clear mode its stores are
+        therefore seeded with the untrusted-store seed, which no lookup
+        uses; its lookup scope is the current generation. In ``"l1"`` mode
+        both are ``none_hash``.
 
         Args:
             request_id: Unique request identifier.
@@ -345,14 +431,46 @@ class SessionManager:
             The Session for this request_id.
         """
         with self._lock:
-            if request_id not in self._sessions:
-                self._sessions[request_id] = Session(
+            session = self._sessions.get(request_id)
+            if session is None:
+                session = Session(
                     request_id=request_id,
                     hasher=self._hasher,
-                    cache_generation=self._cache_generation.current,
+                    store_prefix_hash=(
+                        self._cache_generation.untrusted_store_prefix_hash(self._hasher)
+                    ),
+                    lookup_scope=self._cache_generation.current_scope(self._hasher),
                 )
+                self._sessions[request_id] = session
                 logger.debug("Created session for request_id=%s", request_id)
-            return self._sessions[request_id]
+            return session
+
+    def get_or_create_for_lookup(self, request_id: str, scope: HashScope) -> Session:
+        """Get existing session or create one for a lookup in ``scope``.
+
+        A session created here stores in ``scope`` for its whole life; an
+        existing session keeps its store scope (see :class:`Session`).
+
+        Args:
+            request_id: Unique request identifier.
+            scope: The scope the lookup hashed under, read once by the
+                caller before hashing.
+
+        Returns:
+            The Session for this request_id.
+        """
+        with self._lock:
+            session = self._sessions.get(request_id)
+            if session is None:
+                session = Session(
+                    request_id=request_id,
+                    hasher=self._hasher,
+                    store_prefix_hash=scope.prefix_hash,
+                    lookup_scope=scope,
+                )
+                self._sessions[request_id] = session
+                logger.debug("Created session for request_id=%s", request_id)
+            return session
 
     def get(self, request_id: str) -> Optional[Session]:
         """Return an existing session without creating ownership state."""

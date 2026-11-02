@@ -14,6 +14,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     ipc_key_to_object_keys,
 )
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration, HashScope
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
@@ -26,9 +27,7 @@ class _TestTokenHasher:
     """Small deterministic hasher for lock-ownership tests."""
 
     chunk_size = 2
-
-    def generation_prefix_hash(self, generation: int) -> object:
-        return generation
+    none_hash = b"seed"
 
     def compute_chunk_hashes(
         self,
@@ -143,12 +142,14 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
     request_id = "failed-request"
 
     hasher = _TestTokenHasher()
-    sessions = SessionManager(hasher, cleanup_interval=None)  # type: ignore[arg-type]
+    sessions = SessionManager(
+        hasher, cache_generation=CacheGeneration("l1"), cleanup_interval=None
+    )  # type: ignore[arg-type]
     lookup_key = _cache_key(
         world_size=world_size, worker_id=None, request_id=request_id
     )
     session = sessions.get_or_create(request_id)
-    session.begin_lookup(lookup_key, (-1,))
+    session.begin_lookup(lookup_key, (-1,), HashScope(0, hasher.none_hash))
     session.record_prefetch_result(2, (0,))
 
     storage = _CountingStorageManager()

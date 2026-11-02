@@ -48,6 +48,7 @@ from lmcache.v1.multiprocess.config import (
     add_mp_server_args,
     parse_args_to_coordinator_config,
     parse_args_to_mp_server_config,
+    validate_clear_mode,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
@@ -339,6 +340,7 @@ def _start_cache_server(
     start_prometheus_http_server: bool,
     coordinator_config: CoordinatorConfig,
 ) -> tuple[RequestServer, MPCacheServer, EventBus]:
+    validate_clear_mode(mp_config, coordinator_config)
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
     set_isolated_ipc(mp_config.isolated_ipc)
@@ -407,6 +409,7 @@ def _start_cache_server(
         separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
         session_ttl_seconds=mp_config.session_ttl_seconds,
+        clear_mode=mp_config.clear_mode,
     )
 
     components = _build_server_components(ctx, mp_config, coordinator_config)

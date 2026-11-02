@@ -21,6 +21,9 @@ from lmcache.v1.multiprocess.ext_server_module import (
 
 logger = init_logger(__name__)
 
+ClearMode = Literal["l1", "generation"]
+"""What a cache clear does; see ``MPServerConfig.clear_mode``."""
+
 
 @dataclass
 class MPServerConfig:
@@ -166,14 +169,14 @@ class MPServerConfig:
     server_modules: list[ExtServerModuleSpec] = field(default_factory=list)
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
 
-    clear_mode: Literal["l1", "generation"] = "l1"
-    """What a non-forced ``clear`` (e.g. vLLM ``reset_prefix_cache``) does.
+    clear_mode: ClearMode = "l1"
+    """What a ``clear`` (e.g. vLLM ``reset_prefix_cache``) does.
     'l1' (default) frees unlocked L1 objects and leaves L2 untouched.
     'generation' additionally bumps the server's cache generation, which is
     mixed into every chunk hash, so all previously stored L1 and L2 objects
     become unreachable at once; their L2 copies are deleted in the
-    background. Intended for RL rollouts whose weights change at every
-    clear. Not supported with engine_type='blend'."""
+    background. Intended for synchronous RL rollouts (drain, update weights,
+    clear). Not supported with engine_type='blend', P2P, or a coordinator."""
 
     def __post_init__(self) -> None:
         """Validate the chunk size, worker-reaping timeouts and clear mode.
@@ -183,7 +186,7 @@ class MPServerConfig:
                 non-finite, the reap timeout is negative or a non-zero value
                 below the 30 s floor, the registration grace is below the
                 reap timeout, or clear mode 'generation' is combined with
-                engine type 'blend'.
+                engine type 'blend' or P2P.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
@@ -210,6 +213,9 @@ class MPServerConfig:
             raise ValueError(
                 "clear mode 'generation' is not supported with engine type 'blend'"
             )
+        if self.clear_mode == "generation" and self.p2p_config.enabled:
+            # Peers address each other's objects with their own generations.
+            raise ValueError("clear mode 'generation' is not supported with P2P")
 
 
 @dataclass
@@ -367,6 +373,28 @@ class CoordinatorConfig:
 
 
 DEFAULT_COORDINATOR_CONFIG = CoordinatorConfig()
+
+
+def validate_clear_mode(
+    mp_config: MPServerConfig, coordinator_config: CoordinatorConfig
+) -> None:
+    """Reject clear-mode combinations that span the two configs.
+
+    Args:
+        mp_config: The MP server configuration.
+        coordinator_config: The coordinator the server would join.
+
+    Raises:
+        ValueError: If clear mode 'generation' is combined with a
+            coordinator. Coordinator pin, eviction and directory APIs resolve
+            token ids to generation-0 keys in their own process, so after the
+            first bump they would address nothing yet report success.
+    """
+    if mp_config.clear_mode == "generation" and coordinator_config.url:
+        raise ValueError(
+            "clear mode 'generation' is not supported with a coordinator "
+            "(--coordinator-url)"
+        )
 
 
 def add_mp_server_args(
@@ -620,8 +648,8 @@ def add_mp_server_args(
         "frees unlocked L1 objects only. 'generation' also bumps the cache "
         "generation mixed into every chunk hash, making all stored L1 and L2 "
         "objects unreachable in O(1) and deleting their L2 copies in the "
-        "background (for RL weight updates). Not supported with "
-        "--engine-type blend. Default is l1.",
+        "background (for synchronous RL weight updates). Not supported with "
+        "--engine-type blend, P2P or a coordinator. Default is l1.",
     )
     mp_group.add_argument(
         "--server-module",

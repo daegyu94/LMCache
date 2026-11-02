@@ -482,8 +482,7 @@ class _PrefetchStorageManager:
 class _FakeTokenHasher:
     chunk_size: int = 4
 
-    def generation_prefix_hash(self, generation: int) -> None:
-        return None
+    none_hash = b"seed"
 
     def compute_chunk_hashes(
         self, token_ids: list[int], prefix_hash: object = None
@@ -497,7 +496,9 @@ class _FakeContext:
     layout_desc_registry: _FakeLayoutRegistry
     storage_manager: _PrefetchStorageManager
     token_hasher: _FakeTokenHasher = field(default_factory=_FakeTokenHasher)
-    cache_generation: CacheGeneration = field(default_factory=CacheGeneration)
+    cache_generation: CacheGeneration = field(
+        default_factory=lambda: CacheGeneration("l1")
+    )
 
 
 class _PrefetchEngine:

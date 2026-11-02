@@ -21,6 +21,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.multiprocess.cache_generation import HashScope
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
@@ -49,8 +50,9 @@ def resolve_prefetched_obj_keys(
     key: IPCCacheServerKey,
     hit_chunks: int,
     locked_gids: tuple,
+    *,
+    lookup_scope: HashScope,
     group_windows: tuple[int, ...] | None = None,
-    cache_generation: int = 0,
 ) -> list[ObjectKey]:
     """Resolve the subset of a request range that lookup actually locked.
 
@@ -58,13 +60,13 @@ def resolve_prefetched_obj_keys(
     A worker-specific key resolves only that worker's shard (or one MLA reader
     share), which is required for per-instance RETRIEVE failure cleanup.
 
-    ``cache_generation`` must be the generation the locking lookup hashed
-    under (the session's ``cache_generation``), not the server's current
-    one: after a bump, the locked objects still carry the old hashes.
+    ``lookup_scope`` must be the scope the locking lookup hashed under (as
+    recorded on its session), not the server's current one: after a bump,
+    the locked objects still carry the old hashes.
     """
     chunk_hashes = ctx.token_hasher.compute_packed_chunk_hashes(
         key.token_bytes,
-        prefix_hash=ctx.token_hasher.generation_prefix_hash(cache_generation),
+        prefix_hash=lookup_scope.prefix_hash,
         start=key.start,
         end=key.end,
     )
@@ -239,14 +241,12 @@ class LookupModule(DiscoverableModule):
 
         num_kv_readers = key.require_num_kv_readers()
 
-        # Read the generation once: the hashes, the session stamp and so every
-        # later store and lock release of this lookup share it, even if a
-        # clear bumps the generation mid-lookup.
-        cache_generation = self._ctx.cache_generation.current
+        # Read the scope once: the hashes, the session's lock state (and the
+        # store scope of a session created here) share it, even if a clear
+        # bumps the generation mid-lookup.
+        scope = self._ctx.cache_generation.current_scope(self._ctx.token_hasher)
         chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes,
-            prefix_hash=self._ctx.token_hasher.generation_prefix_hash(cache_generation),
-            end=key.end,
+            key.token_bytes, prefix_hash=scope.prefix_hash, end=key.end
         )
         if not chunk_hashes:
             self._register_empty_prefetch_job(
@@ -287,16 +287,16 @@ class LookupModule(DiscoverableModule):
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
+        session = self._ctx.session_manager.get_or_create_for_lookup(
+            key.request_id, scope
+        )
         session.set_tokens(key.token_bytes)
 
         start_chunk = min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
         # The engine-covered prefix is never looked up, so it is excluded from
         # the hit-rate denominator and reported separately.
         looked_up_tokens = requested_tokens - start_chunk * self._ctx.chunk_size
-        session.begin_lookup(
-            key, tuple(attn_desc.num_chunks_in_sw), cache_generation=cache_generation
-        )
+        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw), scope)
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -549,22 +549,34 @@ class LookupModule(DiscoverableModule):
                     replace(key, start=max(key.start, lock_floor)),
                     hit_chunks,
                     session.prefetch_locked_gids,
-                    cache_generation=session.cache_generation,
+                    lookup_scope=session.lookup_scope,
                 )
             )
         for range_start, range_end in extra_ranges:
             if range_start >= range_end:
                 continue
             # An abandoned lookup's range ends at its hit boundary, so the
-            # range is its own lock model: resolve with that hit, not the
-            # current lookup's.
+            # range is its own lock model: resolve with that hit, and in the
+            # scope that lookup locked under, not the current lookup's.
+            range_hit = range_end // self._ctx.chunk_size
+            range_scope = session.abandoned_lookup_scope(range_hit)
+            if range_scope is None:
+                logger.warning(
+                    "free_lookup_locks for request %s: abandoned range "
+                    "[%d, %d) matches lookups from several cache "
+                    "generations; leaving its locks to the read-lock TTL",
+                    key.request_id,
+                    range_start,
+                    range_end,
+                )
+                continue
             obj_keys.extend(
                 resolve_prefetched_obj_keys(
                     self._ctx,
                     replace(key, start=range_start, end=range_end),
-                    range_end // self._ctx.chunk_size,
+                    range_hit,
                     session.prefetch_locked_gids,
-                    cache_generation=session.cache_generation,
+                    lookup_scope=range_scope,
                 )
             )
         if not obj_keys:

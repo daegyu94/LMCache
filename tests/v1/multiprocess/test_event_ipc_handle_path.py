@@ -249,6 +249,7 @@ def test_server_store_and_retrieve_delegate_event_ordering(
             has_subscribers=lambda event_type: False,
         ),
         resolve_obj_keys=lambda key, group_ids: [[]],
+        resolve_store_obj_keys=lambda key, group_ids: [[]],
     )
     module = lmcache_driven_transfer.LMCacheDrivenTransferModule(
         cast(Any, server_context)

@@ -609,7 +609,7 @@ def _store_hook_engine(stored_mask):
     eng._ctx = MagicMock()
     eng._ctx.chunk_size = 4
     session = MagicMock()
-    session.get_hashes.return_value = list(range(100, 100 + len(stored_mask)))
+    session.get_store_hashes.return_value = list(range(100, 100 + len(stored_mask)))
     eng._ctx.session_manager.get_or_create.return_value = session
     eng._pending_fp_lock = threading.Lock()
     eng._pending_fp_hashes = set()

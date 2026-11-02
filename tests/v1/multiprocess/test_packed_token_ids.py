@@ -13,6 +13,7 @@ import struct
 import pytest
 
 # First Party
+from lmcache.v1.multiprocess.cache_generation import HashScope
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.multiprocess.token_codec import (
@@ -126,7 +127,12 @@ class TestSessionHashesMatchTokenListPath:
     def test_incremental_growth_matches_one_shot(self, hasher: TokenHasher) -> None:
         """A session grown over several steps hashes like one that saw it all."""
         tokens = list(range(500, 532))
-        session = Session(request_id="req-growing", hasher=hasher)
+        session = Session(
+            request_id="req-growing",
+            hasher=hasher,
+            store_prefix_hash=hasher.none_hash,
+            lookup_scope=HashScope(0, hasher.none_hash),
+        )
         for end in range(CHUNK_SIZE, len(tokens) + 1, CHUNK_SIZE):
             session.set_tokens(pack_token_ids(tokens[:end]))
             session.get_hashes(0, end)

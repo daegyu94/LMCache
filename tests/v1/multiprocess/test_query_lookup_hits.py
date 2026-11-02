@@ -132,6 +132,6 @@ def test_lookup_hashing_stops_at_key_end() -> None:
 
     ctx.token_hasher.compute_packed_chunk_hashes.assert_called_once_with(
         pack_token_ids(range(32)),
-        prefix_hash=ctx.token_hasher.generation_prefix_hash.return_value,
+        prefix_hash=ctx.cache_generation.current_scope.return_value.prefix_hash,
         end=16,
     )

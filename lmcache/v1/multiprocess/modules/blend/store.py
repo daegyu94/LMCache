@@ -99,7 +99,7 @@ class StoreMixin:
             session.set_tokens(key.token_bytes)
             chunk_hashes = [
                 TokenHasher.hash_to_bytes(h)
-                for h in session.get_hashes(key.start, key.end)
+                for h in session.get_store_hashes(key.start, key.end)
             ]
             if not chunk_hashes:
                 return result
@@ -169,7 +169,8 @@ class StoreMixin:
         Never raises: reorder planning is best-effort."""
         try:
             chain = [
-                TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, key.end)
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_store_hashes(0, key.end)
             ]
             self._prompt_store.record(
                 (key.model_name, key.world_size, key.cache_salt),

@@ -240,7 +240,7 @@ def test_store_q_block_id_underflow_fails_closed(stub_device) -> None:
     the whole store is skipped: nothing reserved, failure reported, event still
     recorded so the waiting worker is released."""
     ctx = _ctx()
-    ctx.resolve_obj_keys.return_value = [["obj-0", "obj-1"]]  # 2 chunks
+    ctx.resolve_store_obj_keys.return_value = [["obj-0", "obj-1"]]  # 2 chunks
     module = _module(ctx)
     cache_context = MagicMock()
     cache_context.kv_layer_groups_manager.num_object_groups = 1

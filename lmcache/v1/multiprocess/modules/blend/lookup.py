@@ -363,8 +363,11 @@ class LookupMixin:
         read, layouts, attn_desc = resolved
         layout_desc = layouts[read.attn_gid]
 
+        # Blend is rejected in generation clear mode, so this is always the
+        # generation-0 scope; read once like the standard lookup.
+        scope = self._ctx.cache_generation.current_scope(self._ctx.token_hasher)
         chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes
+            key.token_bytes, prefix_hash=scope.prefix_hash
         )
         if not chunk_hashes:
             return None, (), (), 0, False
@@ -399,9 +402,9 @@ class LookupMixin:
             fetching_policy="prefix",
         )
         row_windows = tuple(row.sliding_window_size for row in spec.key_groups)
-        session = self._ctx.session_manager.get_or_create(rid)
+        session = self._ctx.session_manager.get_or_create_for_lookup(rid, scope)
         session.set_tokens(key.token_bytes)
-        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
+        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw), scope)
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
             external_request_id=rid,

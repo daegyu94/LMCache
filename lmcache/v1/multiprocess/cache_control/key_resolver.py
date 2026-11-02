@@ -15,7 +15,7 @@ attention window.
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 # First Party
 from lmcache.v1.distributed.api import (
@@ -30,7 +30,7 @@ from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.multiprocess.token_hasher import TokenHasher
+    from lmcache.v1.multiprocess.token_hasher import ChunkHash, TokenHasher
 
 # Hard cap on how many token ids a single token-addressed request may carry.
 # Keeps the request body bounded and the synchronous hashing / key-construction
@@ -44,11 +44,11 @@ def _resolve_ipc_key_and_hashes(
     world_size: int,
     token_ids: list[int],
     cache_salt: str,
-    prefix_hash: Any = None,
+    prefix_hash: ChunkHash,
 ) -> tuple[IPCCacheServerKey, list[bytes]]:
     """Build the lookup-side IPC key and hash the complete chunks.
 
-    ``prefix_hash`` seeds the rolling hash (``None``: generation 0).
+    ``prefix_hash`` seeds the rolling hash.
 
     Raises:
         ValueError: ``token_ids`` exceeds the per-request cap.
@@ -87,8 +87,8 @@ def resolve_object_keys(
     in object group ``0``. The ``token_hasher``
     must be configured to match the fleet's ``chunk_size`` / ``hash_algorithm``
     or the resolved keys will not match what the servers stored. Keys are
-    resolved under cache generation 0, so they do not address objects a
-    server stored after a generation-mode clear.
+    resolved without a cache generation; servers in generation clear mode,
+    whose keys these would not match, refuse to start with a coordinator.
 
     Args:
         token_hasher: Hasher configured to match the fleet's chunk size and
@@ -108,7 +108,12 @@ def resolve_object_keys(
             (e.g. ``cache_salt``) is invalid.
     """
     ipc_key, chunk_hashes = _resolve_ipc_key_and_hashes(
-        token_hasher, model_name, world_size, token_ids, cache_salt
+        token_hasher,
+        model_name,
+        world_size,
+        token_ids,
+        cache_salt,
+        token_hasher.none_hash,
     )
     if not chunk_hashes:
         return [], 0
@@ -124,7 +129,7 @@ def resolve_grouped_object_keys(
     cache_salt: str,
     group_layout_descs: dict[int, MemoryLayoutDesc],
     attn_desc: AttnWindowDesc,
-    prefix_hash: Any = None,
+    prefix_hash: ChunkHash,
 ) -> tuple[list[GroupedObjectKeys], int]:
     """Resolve a token sequence to prefetch key rows for every object group.
 
@@ -142,8 +147,8 @@ def resolve_grouped_object_keys(
         group_layout_descs: Each object group's memory layout.
         attn_desc: The model's per-group attention windows.
         prefix_hash: Initial prefix hash scoping the keys to a cache
-            generation (``TokenHasher.generation_prefix_hash``); ``None``
-            resolves generation-0 keys.
+            generation (``CacheGeneration.current_scope(...).prefix_hash``;
+            ``token_hasher.none_hash`` outside generation clear mode).
 
     Returns:
         ``(key_groups, chunk_count)``; ``([], 0)`` for a sub-chunk sequence.

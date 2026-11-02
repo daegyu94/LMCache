@@ -12,6 +12,7 @@ vLLM compatibility notes:
 """
 
 # Standard
+from collections.abc import Sequence
 from typing import Any, Callable
 import os
 
@@ -29,6 +30,12 @@ from lmcache.v1.multiprocess.token_codec import (
 )
 
 logger = init_logger(__name__)
+
+ChunkHash = bytes | int
+"""A chunk hash as the configured algorithm returns it: ``bytes`` for blake3
+and ``sha256_cbor``, ``int`` for ``builtin``."""
+
+_UINT32_MAX = 0xFFFFFFFF
 
 
 def _make_blake3_packed_hash_func() -> Callable:
@@ -94,10 +101,6 @@ class TokenHasher:
             else self._hash_by_unpacking
         )
         self.none_hash = self._init_none_hash()
-        #: ``(generation, prefix hash)`` of the last non-zero generation
-        #: resolved by :meth:`generation_prefix_hash`; replaced as one tuple
-        #: so concurrent readers never pair a generation with another's hash.
-        self._last_generation_prefix: tuple[int, Any] = (0, self.none_hash)
         logger.info(
             "TokenHasher initialized: chunk_size=%d, hash_algorithm=%s",
             chunk_size,
@@ -214,46 +217,33 @@ class TokenHasher:
         logger.info("Computed NONE_HASH=%s using hash function", none_hash)
         return none_hash
 
-    def generation_prefix_hash(self, generation: int) -> Any:
-        """Return the initial prefix hash that scopes chunk hashes to a
-        cache generation.
+    def domain_prefix_hash(self, words: Sequence[int]) -> ChunkHash:
+        """Return an initial prefix hash derived from ``words`` instead of
+        from tokens.
 
         Passing the result as ``prefix_hash`` to the ``compute_*`` methods
-        makes every chunk hash depend on ``generation``, so content hashed
-        under one generation never addresses objects stored under another.
-
-        Generation 0 returns ``none_hash`` -- exactly the seed used when no
-        ``prefix_hash`` is given -- so generation-0 hashes are bit-identical
-        to hashes computed without a generation. A non-zero generation hashes
-        a ``chunk_size + 1``-token pseudo-chunk; real chunks always hold
-        exactly ``chunk_size`` tokens, so a generation seed never equals the
-        hash of any real token prefix (which would alias generation ``g``
-        content onto a longer generation-0 prefix).
-
-        Thread-safe. The most recent non-zero generation is memoized, since
-        callers resolve the same generation on every lookup until a bump.
+        scopes every chunk hash to ``words`` (e.g. a cache generation), so
+        content hashed in one scope never addresses objects stored in
+        another. The words are hashed as a pseudo-chunk, zero-padded to at
+        least ``chunk_size + 1`` tokens. Real chunks always hold exactly
+        ``chunk_size`` tokens, so a domain prefix never equals the hash of a
+        real token prefix -- otherwise scoped hashes of ``T`` would alias
+        unscoped hashes of a longer sequence ``P + T``. Callers must keep
+        distinct scopes distinct in ``words`` (e.g. a leading tag word).
 
         Args:
-            generation: A non-negative cache generation that fits in a
-                ``uint32``.
+            words: The scope, as ``uint32`` values.
 
         Returns:
             The prefix hash, in the configured algorithm's hash type.
 
         Raises:
-            ValueError: If ``generation`` is negative.
+            ValueError: If a word does not fit in a ``uint32``.
         """
-        if generation < 0:
-            raise ValueError(f"cache generation must be >= 0; got {generation}")
-        if generation == 0:
-            return self.none_hash
-        cached_generation, cached_hash = self._last_generation_prefix
-        if cached_generation == generation:
-            return cached_hash
-        pseudo_chunk = [generation] + [0] * self.chunk_size
-        prefix_hash = self.hash_tokens(pseudo_chunk, self.none_hash)
-        self._last_generation_prefix = (generation, prefix_hash)
-        return prefix_hash
+        if any(not 0 <= word <= _UINT32_MAX for word in words):
+            raise ValueError(f"domain prefix words must be uint32; got {words}")
+        pad = max(0, self.chunk_size + 1 - len(words))
+        return self.hash_tokens([*words, *([0] * pad)], self.none_hash)
 
     def hash_tokens(self, tokens: list[int], prefix_hash: Any = None) -> Any:
         """Hash one chunk with rolling prefix.

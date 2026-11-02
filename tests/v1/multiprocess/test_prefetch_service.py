@@ -69,7 +69,9 @@ class _Registry:
 class _Context:
     layout_desc_registry: _Registry
     token_hasher: TokenHasher
-    cache_generation: CacheGeneration = field(default_factory=CacheGeneration)
+    cache_generation: CacheGeneration = field(
+        default_factory=lambda: CacheGeneration("l1")
+    )
 
 
 @dataclass

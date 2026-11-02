@@ -39,7 +39,7 @@ def test_prefetch_rows_cover_every_group_with_its_own_layout_and_window():
     windows = AttnWindowDesc(num_chunks_in_sw=[-1, 3, 1], world_size=2)
 
     rows, chunks = resolve_grouped_object_keys(
-        _hasher(), "m", 2, TOKENS, "alice", layouts, windows
+        _hasher(), "m", 2, TOKENS, "alice", layouts, windows, _hasher().none_hash
     )
 
     assert chunks == CHUNKS
@@ -56,7 +56,14 @@ def test_a_group_with_no_layout_is_refused():
 
     with pytest.raises(ValueError):
         resolve_grouped_object_keys(
-            _hasher(), "m", 1, TOKENS, "alice", {0: _layout(8)}, windows
+            _hasher(),
+            "m",
+            1,
+            TOKENS,
+            "alice",
+            {0: _layout(8)},
+            windows,
+            _hasher().none_hash,
         )
 
 
@@ -65,5 +72,5 @@ def test_a_sub_chunk_sequence_resolves_to_nothing_in_any_group():
     layouts = {0: _layout(8), 1: _layout(16)}
 
     assert resolve_grouped_object_keys(
-        _hasher(), "m", 1, TOKENS[:2], "alice", layouts, windows
+        _hasher(), "m", 1, TOKENS[:2], "alice", layouts, windows, _hasher().none_hash
     ) == ([], 0)

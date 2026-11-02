@@ -287,7 +287,8 @@ class TestFingerprintJobTuple:
         eng._coordinator = None
         eng._ctx = MagicMock()
         eng._ctx.chunk_size = 256
-        eng._ctx.session_manager.get_or_create.return_value.get_hashes.return_value = [
+        session = eng._ctx.session_manager.get_or_create.return_value
+        session.get_store_hashes.return_value = [
             123,
             456,
         ]

@@ -328,6 +328,25 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             return None
         return self._resolve_obj_keys_by_group(key, len(layouts))
 
+    def _resolve_single_group_store_obj_keys(
+        self, key: IPCCacheServerKey
+    ) -> list[ObjectKey]:
+        """Store-scope counterpart of :meth:`_resolve_single_group_obj_keys`.
+
+        PREPARE_STORE and COMMIT_STORE resolve separately; the store scope
+        is fixed per session, so both always see the same keys.
+        """
+        return self._ctx.resolve_store_obj_keys(key, [0])[0]
+
+    def _group_store_keys_for(
+        self, entry: "EngineDrivenContextEntry", key: IPCCacheServerKey
+    ) -> "list[list[ObjectKey]] | None":
+        """Store-scope counterpart of :meth:`_group_keys_for`."""
+        layouts = entry.metadata.group_layouts
+        if not layouts:
+            return None
+        return self._ctx.resolve_store_obj_keys(key, list(range(len(layouts))))
+
     @request_handler()
     def register_kv_cache_engine_driven_context(
         self,
@@ -555,7 +574,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 registered group or names a chunk outside the key's range.
         """
         entry, strategy = self._resolve_for_transfer(instance_id)
-        group_keys = self._group_keys_for(entry, key)
+        group_keys = self._group_store_keys_for(entry, key)
         if skipped_chunks:
             if group_keys is None or len(skipped_chunks) != len(group_keys):
                 raise ValueError(
@@ -575,7 +594,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             key=key,
             instance_id=instance_id,
             context=entry.metadata,
-            resolve_obj_keys=self._resolve_single_group_obj_keys,
+            resolve_obj_keys=self._resolve_single_group_store_obj_keys,
             group_keys=group_keys,
             skipped_chunks=skipped_chunks,
         )
@@ -627,14 +646,15 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 instance_id=instance_id,
                 cpu_data=cpu_data,
                 context=entry.metadata,
-                resolve_obj_keys=self._resolve_single_group_obj_keys,
-                group_keys=self._group_keys_for(entry, key),
+                resolve_obj_keys=self._resolve_single_group_store_obj_keys,
+                group_keys=self._group_store_keys_for(entry, key),
             )
         finally:
             self._finish_transfer(key, instance_id, EventType.MP_STORE_START, result)
         if st is not None and result:
             num_tokens = (
-                len(self._resolve_single_group_obj_keys(key)) * self._ctx.chunk_size
+                len(self._resolve_single_group_store_obj_keys(key))
+                * self._ctx.chunk_size
             )
             logger.info(
                 "Stored %d tokens in %.3f seconds",

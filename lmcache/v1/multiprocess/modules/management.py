@@ -3,7 +3,6 @@
 
 # Standard
 from collections.abc import Sequence
-from typing import Literal
 import threading
 
 # First Party
@@ -37,6 +36,12 @@ class ManagementModule(DiscoverableModule):
     Also owns the periodic reaper that evicts workers which have gone
     silent, driving the injected liveness targets.
 
+    The clear mode is the context's (``ctx.cache_generation.clear_mode``):
+    ``"l1"`` makes ``clear`` free unlocked L1 objects only; ``"generation"``
+    also bumps the cache generation and deletes the now-unreachable L2
+    objects in the background (see
+    ``docs/design/v1/multiprocess/cache_generation.md``).
+
     Args:
         ctx: The shared engine context.
         liveness_targets: Modules the reaper drives -- the transfer modules
@@ -49,10 +54,6 @@ class ManagementModule(DiscoverableModule):
             registered but never pinged.
         experimental: Experimental features advertised to clients through
             ``get_experimental`` (e.g. ``transfer_query``).
-        clear_mode: ``"l1"`` makes ``clear`` free unlocked L1 objects only.
-            ``"generation"`` also bumps the context's cache generation and
-            deletes the now-unreachable L2 objects in the background; see
-            ``docs/design/v1/multiprocess/cache_generation.md``.
     """
 
     module_name = "management"
@@ -72,7 +73,6 @@ class ManagementModule(DiscoverableModule):
                 mp_config.worker_registration_grace_seconds
             ),
             experimental=build_ctx.experimental,
-            clear_mode=mp_config.clear_mode,
         )
 
     def __init__(
@@ -82,16 +82,14 @@ class ManagementModule(DiscoverableModule):
         worker_reap_timeout_seconds: float = 0.0,
         worker_registration_grace_seconds: float = 0.0,
         experimental: Sequence[str] = (),
-        clear_mode: Literal["l1", "generation"] = "l1",
     ) -> None:
         self._ctx = ctx
         self._clear_lock = threading.Lock()
-        self._clear_mode = clear_mode
         # Present only in generation mode: tracking L2 keys costs memory and
         # a thread, and only a generation bump makes them safe to delete.
         self._stale_l2_keys: StaleL2KeyCollector | None = (
             StaleL2KeyCollector(ctx.storage_manager)
-            if clear_mode == "generation"
+            if ctx.cache_generation.clear_mode == "generation"
             else None
         )
         self._liveness_targets = tuple(liveness_targets)
@@ -118,7 +116,7 @@ class ManagementModule(DiscoverableModule):
         """Return the shared engine context. Exposed for testing only."""
         return self._ctx
 
-    def report_status(self) -> dict:
+    def report_status(self) -> dict[str, object]:
         """Return module-specific status information.
 
         Returns:
@@ -128,7 +126,7 @@ class ManagementModule(DiscoverableModule):
             counters of ``StaleL2KeyCollector.report_status``); otherwise
             empty.
         """
-        status: dict = {}
+        status: dict[str, object] = {}
         if self._liveness_targets:
             tracked = sum(t.tracked_instance_count() for t in self._liveness_targets)
             status["worker_liveness"] = {
@@ -229,9 +227,10 @@ class ManagementModule(DiscoverableModule):
         every object stored before the call -- in L1 or L2, including stores
         still in flight -- becomes unreachable to later lookups, then does
         the same L1 clear to free memory. L2 copies are deleted by a
-        background collector; the call never waits for L2. Requests whose
-        session predates the bump keep hashing under their old generation
-        until their next lookup (see the design doc for exact semantics).
+        background collector; the call never waits for L2. Later lookups
+        address the new generation, while a session that predates the bump
+        keeps storing in its old one (see the design doc for exact
+        semantics).
 
         Args:
             force: Also remove locked L1 objects, which may corrupt in-flight

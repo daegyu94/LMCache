@@ -1317,6 +1317,20 @@ class StorageManager:
             for adapter in self._l2_adapters.values():
                 adapter.register_listener(listener)
 
+    def unregister_l2_listener(self, listener: L2AdapterListener) -> None:
+        """Remove a listener added by :meth:`register_l2_listener` from all
+        current adapters and from future ones.
+
+        Args:
+            listener: The listener to remove; unknown listeners are ignored.
+        """
+        with self._lifecycle_lock:
+            self._registered_l2_listeners = [
+                x for x in self._registered_l2_listeners if x is not listener
+            ]
+            for adapter in self._l2_adapters.values():
+                adapter.unregister_listener(listener)
+
     # Functions for debugging and testing
     def memcheck(self) -> bool:
         """

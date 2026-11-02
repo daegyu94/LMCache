@@ -385,6 +385,19 @@ class L2AdapterInterface(ABC):
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
 
+    def unregister_listener(self, listener: L2AdapterListener) -> None:
+        """Stop delivering L2 adapter events to ``listener``.
+
+        The list is replaced rather than mutated, so a notification already
+        iterating the old list finishes without skipping other listeners
+        (it may still reach ``listener`` once). Unknown listeners are
+        ignored.
+
+        Args:
+            listener: A listener previously passed to ``register_listener``.
+        """
+        self._listeners = [x for x in self._listeners if x is not listener]
+
     def set_backend_identity(self, name: str, shared: bool = False) -> None:
         """Set the identity used to tag this adapter's cache events.
 

@@ -14,6 +14,7 @@ import pytest
 
 # First Party
 from lmcache import device_ops  # noqa: F401
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration, HashScope
 from lmcache.v1.multiprocess.modules.blend import retrieve as retrieve_mod
 from lmcache.v1.multiprocess.modules.blend.module import BlendModule
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState
@@ -429,7 +430,12 @@ def test_obj_keys_cache_round_trip_tp1():
     # First Party
     from lmcache.v1.multiprocess.session import Session
 
-    session = Session(request_id="req-1", hasher=MagicMock())
+    session = Session(
+        request_id="req-1",
+        hasher=MagicMock(),
+        store_prefix_hash=b"",
+        lookup_scope=HashScope(0, b""),
+    )
 
     # Simulate what the lookup's classify stores.
     chunk_hashes = [b"h1", b"h2", b"h3"]
@@ -462,7 +468,12 @@ def test_obj_keys_cache_round_trip_tp_expanded():
     # First Party
     from lmcache.v1.multiprocess.session import Session
 
-    session = Session(request_id="req-tp", hasher=MagicMock())
+    session = Session(
+        request_id="req-tp",
+        hasher=MagicMock(),
+        store_prefix_hash=b"",
+        lookup_scope=HashScope(0, b""),
+    )
 
     ws = 4
     chunk_hashes = [b"h1", b"h2"]
@@ -667,7 +678,10 @@ def _unretrieved_ctx(
         num_chunks_in_sw=[-1], world_size=1, group_kinds=("attention",)
     )
     ctx.session_manager = SessionManager(
-        hasher=MagicMock(), ttl=ttl, cleanup_interval=None
+        hasher=MagicMock(),
+        cache_generation=CacheGeneration("l1"),
+        ttl=ttl,
+        cleanup_interval=None,
     )
     return ctx
 
@@ -828,7 +842,11 @@ def test_destroy_listener_failure_does_not_break_removal():
     def _boom(session: Session) -> None:
         raise RuntimeError("listener failure")
 
-    manager = SessionManager(hasher=MagicMock(), cleanup_interval=None)
+    manager = SessionManager(
+        hasher=MagicMock(),
+        cache_generation=CacheGeneration("l1"),
+        cleanup_interval=None,
+    )
     manager.destroy_listeners.append(_boom)
     manager.get_or_create("req-x")
     assert manager.remove("req-x") is not None

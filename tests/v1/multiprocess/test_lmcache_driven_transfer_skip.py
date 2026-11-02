@@ -165,6 +165,7 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
     ctx.chunk_size = 256
     ctx.null_block_id = 0
     ctx.resolve_obj_keys.return_value = obj_keys
+    ctx.resolve_store_obj_keys.return_value = obj_keys
 
     read_calls: list[list[str]] = []
 

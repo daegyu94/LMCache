@@ -20,8 +20,9 @@ from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.cache_generation import CacheGeneration
+from lmcache.v1.multiprocess.config import ClearMode
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.session import Session, SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
@@ -199,6 +200,8 @@ class MPCacheServerContext:
             False.
         null_block_id: Engine block ID that denotes absent KV data.
         session_ttl_seconds: Idle seconds before a request session is reaped.
+        clear_mode: Scopes chunk hashes to a cache generation when
+            ``"generation"``; ``"l1"`` keeps generation-free hashing.
     """
 
     def __init__(
@@ -210,6 +213,7 @@ class MPCacheServerContext:
         full_sw_kv: bool = False,
         null_block_id: int = 0,
         session_ttl_seconds: float = SessionManager.DEFAULT_SESSION_TTL,
+        clear_mode: ClearMode = "l1",
     ) -> None:
         self._configured_chunk_size = chunk_size
         self._chunk_size = chunk_size
@@ -228,7 +232,7 @@ class MPCacheServerContext:
             storage_manager_config
         )
         self._storage_manager = StorageManager(storage_manager_config)
-        self._cache_generation = CacheGeneration()
+        self._cache_generation = CacheGeneration(clear_mode)
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
@@ -390,10 +394,9 @@ class MPCacheServerContext:
     def cache_generation(self) -> CacheGeneration:
         """The generation counter that scopes every server-side chunk hash.
 
-        Hash call sites seed with
-        ``token_hasher.generation_prefix_hash(cache_generation.current)``
-        (or a session's recorded generation); it stays at 0 unless the
-        server runs with ``clear_mode="generation"``.
+        Hash call sites seed with ``cache_generation.current_scope(...)``
+        (or a session's recorded scope); it stays at 0, seeding with
+        ``none_hash``, unless the server runs with ``clear_mode="generation"``.
         """
         return self._cache_generation
 
@@ -415,10 +418,11 @@ class MPCacheServerContext:
     def resolve_obj_keys(
         self, key: IPCCacheServerKey, object_group_ids: list[int]
     ) -> list[list[ObjectKey]]:
-        """Resolve per-object-group object keys from an IPC cache key.
+        """Resolve per-object-group lookup-scope object keys from an IPC key.
 
-        Uses the session manager to track token state and the token hasher
-        to compute chunk hashes for the requested range.
+        These are the keys the request's latest lookup prefetched and
+        locked (see :meth:`Session.get_hashes`); use them for RETRIEVE and
+        lock release. Store paths must use :meth:`resolve_store_obj_keys`.
 
         Args:
             key: IPC cache key describing model/session/token range.
@@ -431,12 +435,40 @@ class MPCacheServerContext:
         Raises:
             ValueError: If ``key.worker_id`` is ``None``.
         """
-        session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
-        if session.lookup_ipc_key is None:
-            session.lookup_ipc_key = key.no_worker_id_version()
+        session = self._session_for(key)
         chunk_hashes = [
             TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
+        ]
+        if key.worker_id is None:
+            raise ValueError("Must resolve keys with worker_id != None")
+        return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
+
+    def resolve_store_obj_keys(
+        self, key: IPCCacheServerKey, object_group_ids: list[int]
+    ) -> list[list[ObjectKey]]:
+        """Resolve per-object-group store-scope object keys from an IPC key.
+
+        Every store of a session lands in the scope it was created in (see
+        :meth:`Session.get_store_hashes`), so a store issued before a
+        generation bump never lands under the new generation's hashes, and
+        resolving the same key twice (e.g. engine-driven PREPARE and COMMIT)
+        always yields the same keys.
+
+        Args:
+            key: IPC cache key describing model/session/token range.
+            object_group_ids: Object group ids to produce keys for.
+
+        Returns:
+            The i-th element is the list of ObjectKeys for
+            ``object_group_ids[i]``.
+
+        Raises:
+            ValueError: If ``key.worker_id`` is ``None``.
+        """
+        session = self._session_for(key)
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_store_hashes(key.start, key.end)
         ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
@@ -462,6 +494,14 @@ class MPCacheServerContext:
         if not bare.startswith("lmcache_l1_pool_"):
             shm_name = f"lmcache_l1_pool_{bare}"
         return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+
+    def _session_for(self, key: IPCCacheServerKey) -> Session:
+        """Return ``key``'s session, holding ``key``'s tokens."""
+        session = self.session_manager.get_or_create(key.request_id)
+        session.set_tokens(key.token_bytes)
+        if session.lookup_ipc_key is None:
+            session.lookup_ipc_key = key.no_worker_id_version()
+        return session
 
     def _bind_chunk_size_locked(self, chunk_size: int) -> None:
         """Initialize runtime state that depends on a concrete chunk size."""
