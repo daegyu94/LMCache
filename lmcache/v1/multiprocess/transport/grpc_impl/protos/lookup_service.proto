@@ -52,6 +52,26 @@ message EndSessionRequest {
 
 message EndSessionResponse {}
 
+message QueryKvVersionSpansRequest {
+  string request_id = 1;
+}
+
+// Served tokens [start, end) and the KV version they were cached under.
+message KvVersionSpan {
+  int64 start = 1;
+  int64 end = 2;
+  int64 version = 3;
+}
+
+message KvVersionSpanList {
+  repeated KvVersionSpan spans = 1;
+}
+
+message QueryKvVersionSpansResponse {
+  // Unset when the server has no session for the request.
+  optional KvVersionSpanList spans = 1;
+}
+
 service LookupService {
   rpc Lookup(LookupRequest) returns (LookupResponse);
   rpc QueryPrefetchStatus(QueryPrefetchStatusRequest)
@@ -60,4 +80,6 @@ service LookupService {
       returns (WaitPrefetchStatusResponse);
   rpc FreeLookupLocks(FreeLookupLocksRequest) returns (FreeLookupLocksResponse);
   rpc EndSession(EndSessionRequest) returns (EndSessionResponse);
+  rpc QueryKvVersionSpans(QueryKvVersionSpansRequest)
+      returns (QueryKvVersionSpansResponse);
 }

@@ -92,7 +92,12 @@ def test_resolve_sliding_window_floored_by_key_start():
     ctx = _ctx_with_hashes(1)  # hashes for [3, 4)
     key = _make_key(4, start_chunks=3)
     obj_keys = resolve_prefetched_obj_keys(
-        ctx, key, hit_chunks=4, locked_gids=(), group_windows=(2,)
+        ctx,
+        key,
+        hit_chunks=4,
+        locked_gids=(),
+        kv_versions=None,
+        group_windows=(2,),
     )
     assert len(obj_keys) == 1
 

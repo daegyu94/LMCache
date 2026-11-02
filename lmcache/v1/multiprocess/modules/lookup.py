@@ -2,7 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 import threading
 import time
@@ -11,9 +11,12 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
+    FULL_ATTENTION_WINDOW_CHUNKS,
     AttnWindowDesc,
+    MemoryLayoutDesc,
     ObjectKey,
     PrefetchHandle,
+    PrefetchResult,
     PrefetchTaskSpec,
     ipc_key_to_grouped_object_keys,
     ipc_key_to_object_keys,
@@ -22,7 +25,10 @@ from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+from lmcache.v1.multiprocess.engine_context import (
+    KV_VERSION_HINT_WARN_INTERVAL_S,
+    MPCacheServerContext,
+)
 from lmcache.v1.multiprocess.engine_module import (
     DiscoverableModule,
     EngineModule,
@@ -33,6 +39,15 @@ from lmcache.v1.multiprocess.kv_load_policy import (
     KVLoadContext,
     KVLoadPolicy,
     create_kv_load_policy,
+)
+from lmcache.v1.multiprocess.kv_version import (
+    KVVersionAssignment,
+    KVVersionHintProblem,
+    KVVersionHintWarner,
+    KVVersionRun,
+    KVVersionWindow,
+    parse_kv_version_hints,
+    versioned_chunk_hash,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens, unpack_token_ids
@@ -49,6 +64,8 @@ def resolve_prefetched_obj_keys(
     key: IPCCacheServerKey,
     hit_chunks: int,
     locked_gids: tuple,
+    *,
+    kv_versions: KVVersionAssignment | None,
     group_windows: tuple[int, ...] | None = None,
 ) -> list[ObjectKey]:
     """Resolve the subset of a request range that lookup actually locked.
@@ -56,6 +73,11 @@ def resolve_prefetched_obj_keys(
     ``key.worker_id=None`` resolves every KV rank for scheduler-owned cleanup.
     A worker-specific key resolves only that worker's shard (or one MLA reader
     share), which is required for per-instance RETRIEVE failure cleanup.
+
+    ``kv_versions`` must describe the lookup that took the locks: None for an
+    unversioned request, else the version runs that lookup served (see
+    :meth:`Session.kv_version_assignment`), so the released keys are exactly
+    the version-qualified keys it locked.
     """
     chunk_hashes = ctx.token_hasher.compute_packed_chunk_hashes(
         key.token_bytes, start=key.start, end=key.end
@@ -64,6 +86,8 @@ def resolve_prefetched_obj_keys(
         return []
 
     start_chunk = key.start // ctx.chunk_size
+    if kv_versions is not None:
+        chunk_hashes = kv_versions.apply(chunk_hashes, start_chunk)
     end_chunk = start_chunk + len(chunk_hashes)
     if group_windows is None:
         group_windows = tuple(
@@ -91,6 +115,53 @@ def resolve_prefetched_obj_keys(
         group_hashes = chunk_hashes[lo - start_chunk : hi - start_chunk]
         obj_keys.extend(ipc_key_to_object_keys(key, group_hashes, [group_idx])[0])
     return obj_keys
+
+
+@dataclass
+class _KVVersionProbe:
+    """A versioned lookup that probes its window newest-first.
+
+    Each prefetch round looks up chunks ``[p, n)`` under one version, where
+    ``p`` is where the earlier rounds' hits ended, and the next round lowers
+    the version by one. A lookup therefore runs at most
+    ``max_staleness + 1`` rounds, and the served versions never increase
+    along the prompt. Only one round is in flight at a time; the thread that
+    consumes a round's result is the only one that mutates the probe.
+    """
+
+    window: KVVersionWindow
+    key: IPCCacheServerKey
+    # Unversioned chunk hashes of the whole lookup, from chunk 0.
+    chunk_hashes: list[bytes]
+    group_layout_descs: dict[int, MemoryLayoutDesc]
+    attn_desc: AttnWindowDesc
+    num_kv_readers: int
+    # Version the in-flight round looks up.
+    version: int
+    # Accumulated over finished rounds.
+    runs: list[KVVersionRun] = field(default_factory=list)
+    l1_chunks: int = 0
+    l2_chunks: int = 0
+    l1_hit_keys: int = 0
+    l2_hit_keys: int = 0
+    l1_owners: dict[ObjectKey, int] = field(default_factory=dict)
+
+    def add_round(
+        self,
+        start_chunk: int,
+        end_chunk: int,
+        l1_chunks: int,
+        l2_chunks: int,
+        result: PrefetchResult,
+    ) -> None:
+        """Account one finished round that hit ``[start_chunk, end_chunk)``."""
+        if end_chunk > start_chunk:
+            self.runs.append(KVVersionRun(start_chunk, end_chunk, self.version))
+        self.l1_chunks += l1_chunks
+        self.l2_chunks += l2_chunks
+        self.l1_hit_keys += result.l1_hit_count
+        self.l2_hit_keys += result.l2_hit_count
+        self.l1_owners.update(result.l1_owners)
 
 
 @dataclass
@@ -124,6 +195,9 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # Set for a request with ``lmcache.kv_version``; ``handle`` is then the
+    # in-flight round and ``start_chunk`` that round's first chunk.
+    kv_probe: _KVVersionProbe | None = None
 
 
 class LookupModule(DiscoverableModule):
@@ -163,6 +237,9 @@ class LookupModule(DiscoverableModule):
         self._load_policy = load_policy
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._kv_version_hint_warner = KVVersionHintWarner(
+            KV_VERSION_HINT_WARN_INTERVAL_S
+        )
         self._setup_metrics()
 
     @property
@@ -200,6 +277,13 @@ class LookupModule(DiscoverableModule):
         and registers the job under ``key.request_id`` for later polling
         via query_prefetch_status. When the KV load policy declines the
         request, no prefetch is submitted and the job reports zero hits.
+
+        A key whose request configs carry ``lmcache.kv_version`` looks up
+        version-qualified keys, newest version first: each further prefetch
+        round (submitted when the previous one is consumed) continues where
+        the previous hits ended, one version older, until the prompt is
+        covered or the window ``lmcache.max_kv_staleness`` is exhausted. A
+        chunk with no version in the window is a miss and ends the prefix.
 
         Args:
             key: Cache key with request_id embedded.
@@ -320,15 +404,32 @@ class LookupModule(DiscoverableModule):
             )
             return
 
+        window = self._kv_version_hint_warner.parse(key.request_configs)
+        if window is not None and window.max_staleness > 0:
+            # A later round's sliding-window check would need the trailing
+            # chunks of an earlier round, which its rows do not contain.
+            if any(
+                w != FULL_ATTENTION_WINDOW_CHUNKS for w in attn_desc.num_chunks_in_sw
+            ):
+                self._kv_version_hint_warner.warn(
+                    (KVVersionHintProblem.STALENESS_UNSUPPORTED_LAYOUT,)
+                )
+                window = replace(window, max_staleness=0)
+
         # Keep the covered prefix's recency without locking or prefetching
         # it. After the load policy, so a declined lookup leaves no trace.
         if start_chunk:
+            covered_hashes = chunk_hashes[:start_chunk]
+            if window is not None:
+                covered_hashes = [
+                    versioned_chunk_hash(h, window.version) for h in covered_hashes
+                ]
             self._ctx.storage_manager.touch_cached_keys(
                 [
                     obj_key
                     for group_keys in ipc_key_to_object_keys(
                         key,
-                        chunk_hashes[:start_chunk],
+                        covered_hashes,
                         list(range(attn_desc.num_object_groups)),
                     )
                     for obj_key in group_keys
@@ -350,16 +451,29 @@ class LookupModule(DiscoverableModule):
             )
             return
 
-        spec = PrefetchTaskSpec(
-            key_groups=ipc_key_to_grouped_object_keys(
-                key,
-                suffix_hashes,
-                list(range(attn_desc.num_object_groups)),
-                group_layout_descs,
-                attn_desc,
-            ),
-            num_kv_readers=num_kv_readers,
-        )
+        kv_probe = None
+        if window is None:
+            spec = PrefetchTaskSpec(
+                key_groups=ipc_key_to_grouped_object_keys(
+                    key,
+                    suffix_hashes,
+                    list(range(attn_desc.num_object_groups)),
+                    group_layout_descs,
+                    attn_desc,
+                ),
+                num_kv_readers=num_kv_readers,
+            )
+        else:
+            kv_probe = _KVVersionProbe(
+                window=window,
+                key=key,
+                chunk_hashes=chunk_hashes,
+                group_layout_descs=group_layout_descs,
+                attn_desc=attn_desc,
+                num_kv_readers=num_kv_readers,
+                version=window.version,
+            )
+            spec = self._kv_round_spec(kv_probe, start_chunk)
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
             external_request_id=key.request_id,
@@ -382,6 +496,7 @@ class LookupModule(DiscoverableModule):
                 ),
                 model_name=model_name,
                 cache_salt=key.cache_salt,
+                kv_probe=kv_probe,
             )
         )
 
@@ -436,6 +551,10 @@ class LookupModule(DiscoverableModule):
         Returns:
             Chunk count (int) when done, None if the wait timed out, 0 if the
             request_id is unknown (already completed and consumed, or invalid).
+
+        Note:
+            A versioned lookup may need several prefetch rounds; ``timeout``
+            bounds the wait for all of them.
         """
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
@@ -446,9 +565,21 @@ class LookupModule(DiscoverableModule):
             )
             return 0
 
-        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
-            return None
-        return self.query_prefetch_status(request_id)
+        deadline = time.monotonic() + timeout
+        wait_s = timeout
+        while True:
+            if not self._ctx.storage_manager.wait_prefetch_status(job.handle, wait_s):
+                return None
+            hit_chunks = self.query_prefetch_status(request_id)
+            if hit_chunks is not None or job.kv_probe is None:
+                return hit_chunks
+            # The finished round submitted the next one; wait for that.
+            with self._prefetch_job_lock:
+                next_job = self._prefetch_jobs.get(request_id)
+            if next_job is None:
+                return 0
+            job = next_job
+            wait_s = max(0.0, deadline - time.monotonic())
 
     @request_handler(HandlerType.BLOCKING)
     def free_lookup_locks(
@@ -524,6 +655,7 @@ class LookupModule(DiscoverableModule):
         # would drop another request's lock on the shared object key.
         lookup_key = session.lookup_ipc_key
         lock_floor = lookup_key.start if lookup_key is not None else 0
+        window = parse_kv_version_hints(key.request_configs).window
         obj_keys: list[ObjectKey] = []
         if key.start < key.end:
             # The lookup never locked below its own ``start``.
@@ -533,11 +665,33 @@ class LookupModule(DiscoverableModule):
                     replace(key, start=max(key.start, lock_floor)),
                     hit_chunks,
                     session.prefetch_locked_gids,
+                    kv_versions=(
+                        session.kv_version_assignment(window)
+                        if window is not None
+                        else None
+                    ),
                 )
             )
+        chunk_size = self._ctx.chunk_size
         for range_start, range_end in extra_ranges:
             if range_start >= range_end:
                 continue
+            abandoned_versions = None
+            if window is not None:
+                abandoned_versions = session.abandoned_kv_version_assignment(
+                    window, range_start // chunk_size, range_end // chunk_size
+                )
+                if abandoned_versions is None:
+                    # Unknown versions mean unknown keys; guessing could strip
+                    # another request's anonymous lock, so leave it to the TTL.
+                    logger.warning(
+                        "free_lookup_locks for request %s: no earlier lookup "
+                        "served [%d, %d); leaving its locks to the read-lock TTL",
+                        key.request_id,
+                        range_start,
+                        range_end,
+                    )
+                    continue
             # An abandoned lookup's range ends at its hit boundary, so the
             # range is its own lock model: resolve with that hit, not the
             # current lookup's.
@@ -545,8 +699,9 @@ class LookupModule(DiscoverableModule):
                 resolve_prefetched_obj_keys(
                     self._ctx,
                     replace(key, start=range_start, end=range_end),
-                    range_end // self._ctx.chunk_size,
+                    range_end // chunk_size,
                     session.prefetch_locked_gids,
+                    kv_versions=abandoned_versions,
                 )
             )
         if not obj_keys:
@@ -589,12 +744,41 @@ class LookupModule(DiscoverableModule):
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
+        window = parse_kv_version_hints(session.lookup_ipc_key.request_configs).window
+        if window is not None:
+            chunk_hashes = session.kv_version_assignment(window).apply(chunk_hashes, 0)
         obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
         self._ctx.storage_manager.touch_cached_keys(obj_keys)
+
+    @request_handler(HandlerType.BLOCKING)
+    def query_kv_version_spans(
+        self, request_id: str
+    ) -> list[tuple[int, int, int]] | None:
+        """Return the KV versions the request's current lookup served.
+
+        Only requests with ``lmcache.kv_version`` record versions. Must be
+        called before END_SESSION, which drops the record.
+
+        Args:
+            request_id: The request ID passed in the lookup key.
+
+        Returns:
+            ``[start_token, end_token, version]`` per served run, in token
+            order, chunk-aligned and starting at the lookup's ``start``.
+            Several versions mean a mixed prefix; versions never increase
+            along it. Empty when the lookup served no versioned KV (no hint,
+            a miss, or the lookup has not finished). None when the server has
+            no session for ``request_id`` (never looked up, ended, or reaped
+            after its TTL).
+        """
+        session = self._ctx.session_manager.get(request_id)
+        if session is None:
+            return None
+        return session.kv_version_spans(self._ctx.chunk_size)
 
     # -----------------------------------------------------------------
     # Internal helpers
@@ -690,6 +874,10 @@ class LookupModule(DiscoverableModule):
         so ``query_prefetch_status`` and ``free_lookup_locks`` cannot disagree
         about what a lookup locked.
 
+        For a versioned lookup, a finished round that leaves chunks and
+        versions to probe submits the next round instead and returns None;
+        only the last round hands the combined result over.
+
         Returns:
             The hit chunk count, or None while the prefetch is still running
             (the job is kept so a later call can resolve it).
@@ -715,16 +903,36 @@ class LookupModule(DiscoverableModule):
         l2_chunks = found_count - l1_chunks
         # The engine resolves the hit in absolute chunks; shift it back.
         found_count += job.start_chunk
+        l1_owners = result.l1_owners
+        l1_hit_keys = result.l1_hit_count
+        l2_hit_keys = result.l2_hit_count
+
+        session = self._ctx.session_manager.get_or_create(job.request_id)
+        probe = job.kv_probe
+        if probe is not None:
+            probe.add_round(job.start_chunk, found_count, l1_chunks, l2_chunks, result)
+            if self._submit_next_kv_round(job, found_count):
+                return None
+            l1_chunks, l2_chunks = probe.l1_chunks, probe.l2_chunks
+            l1_owners = probe.l1_owners
+            l1_hit_keys, l2_hit_keys = probe.l1_hit_keys, probe.l2_hit_keys
+            if len(probe.runs) > 1:
+                logger.debug(
+                    "Request %s served a mixed-version prefix: %s",
+                    job.request_id,
+                    probe.runs,
+                )
+            # Before the hit length, so a reader seeing the hit sees its runs.
+            session.record_kv_version_runs(tuple(probe.runs))
 
         # Record the model-wide hit length on the session so a later
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
-        session = self._ctx.session_manager.get_or_create(job.request_id)
         session.record_prefetch_result(
             found_count,
             tuple(range(job.attn_desc.num_object_groups)),
-            result.l1_owners,
+            l1_owners,
         )
 
         chunk_size = self._ctx.chunk_size
@@ -751,8 +959,8 @@ class LookupModule(DiscoverableModule):
                     "prompt_tokens": job.prompt_tokens,
                     "engine_hit_tokens": job.engine_hit_tokens,
                     "request_hit_tokens": request_hit_tokens,
-                    "l1_hit_keys": result.l1_hit_count,
-                    "l2_hit_keys": result.l2_hit_count,
+                    "l1_hit_keys": l1_hit_keys,
+                    "l2_hit_keys": l2_hit_keys,
                     "early_exit_reason": job.early_exit_reason,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,
@@ -764,6 +972,57 @@ class LookupModule(DiscoverableModule):
             self._prefetch_jobs.pop(job.request_id, None)
 
         return found_count
+
+    def _kv_round_spec(
+        self, probe: _KVVersionProbe, start_chunk: int
+    ) -> PrefetchTaskSpec:
+        """Build the prefetch of chunks ``[start_chunk, n)`` at ``probe.version``."""
+        return PrefetchTaskSpec(
+            key_groups=ipc_key_to_grouped_object_keys(
+                probe.key,
+                [
+                    versioned_chunk_hash(h, probe.version)
+                    for h in probe.chunk_hashes[start_chunk:]
+                ],
+                list(range(probe.attn_desc.num_object_groups)),
+                probe.group_layout_descs,
+                probe.attn_desc,
+            ),
+            num_kv_readers=probe.num_kv_readers,
+        )
+
+    def _submit_next_kv_round(self, job: _PrefetchJob, hit_chunks: int) -> bool:
+        """Submit the next, one version older, round of a versioned lookup.
+
+        Args:
+            job: The job whose round just finished; its ``kv_probe`` is set.
+            hit_chunks: Absolute hit boundary after that round.
+
+        Returns:
+            True if a round was submitted (the job now tracks it), False when
+            the prompt is covered or the window is exhausted.
+        """
+        probe = job.kv_probe
+        assert probe is not None
+        if (
+            hit_chunks >= len(probe.chunk_hashes)
+            or probe.version <= probe.window.oldest
+        ):
+            return False
+        probe.version -= 1
+        spec = self._kv_round_spec(probe, hit_chunks)
+        handle = self._ctx.storage_manager.submit_prefetch_task(
+            spec, external_request_id=job.request_id
+        )
+        self._register_prefetch_job(
+            replace(
+                job,
+                handle=handle,
+                row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
+                start_chunk=hit_chunks,
+            )
+        )
+        return True
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""

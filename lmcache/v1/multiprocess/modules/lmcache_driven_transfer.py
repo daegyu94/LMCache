@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.engine_module import (
     ModuleBuildContext,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.kv_version import parse_kv_version_hints
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
@@ -300,11 +301,17 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         if lock_state is None:
             return
         hit_chunks, locked_gids, group_windows, lookup_generation = lock_state
+        # Read apart from the snapshot; a newer lookup in between changes the
+        # generation, so the claim below refuses the release.
+        window = parse_kv_version_hints(key.request_configs).window
         obj_keys = resolve_prefetched_obj_keys(
             self._ctx,
             key,
             hit_chunks,
             locked_gids,
+            kv_versions=(
+                session.kv_version_assignment(window) if window is not None else None
+            ),
             group_windows=group_windows,
         )
         if not session.claim_failed_retrieve_release(
@@ -1207,7 +1214,15 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             if session is not None:
                 previous = session.get_hashes(key.start - chunk_size, key.start)
                 if previous:
-                    parent_hashes[0] = TokenHasher.hash_to_bytes(previous[0])
+                    parent = TokenHasher.hash_to_bytes(previous[0])
+                    # Chain to the parent's object key, version-qualified like
+                    # ``obj_keys`` when the request carries a KV version.
+                    window = parse_kv_version_hints(key.request_configs).window
+                    if window is not None:
+                        parent = session.kv_version_assignment(window).apply(
+                            [parent], key.start // chunk_size - 1
+                        )[0]
+                    parent_hashes[0] = parent
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_TOKENS,

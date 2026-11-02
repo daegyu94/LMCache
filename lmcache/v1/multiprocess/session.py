@@ -15,6 +15,11 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.kv_version import (
+    KVVersionAssignment,
+    KVVersionRun,
+    KVVersionWindow,
+)
 from lmcache.v1.multiprocess.token_codec import TOKEN_STRIDE, num_packed_tokens
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import (
@@ -52,6 +57,13 @@ class Session:
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
+    # Version runs the current lookup served (empty for an unversioned or
+    # missed lookup), and those of this request's earlier, abandoned lookups,
+    # whose locks a later FREE_LOOKUP_LOCKS may still release.
+    _kv_version_runs: tuple[KVVersionRun, ...] = field(default=(), repr=False)
+    _abandoned_kv_version_runs: list[tuple[KVVersionRun, ...]] = field(
+        default_factory=list, repr=False
+    )
     extras: dict[str, Any] = field(default_factory=dict)
     _lookup_generation: int = field(default=0, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
@@ -165,6 +177,9 @@ class Session:
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
             self._prefetch_owners.clear()
+            if self._kv_version_runs:
+                self._abandoned_kv_version_runs.append(self._kv_version_runs)
+            self._kv_version_runs = ()
 
     def record_prefetch_result(
         self,
@@ -177,6 +192,73 @@ class Session:
             self.prefetch_hit_chunks = hit_chunks
             self.prefetch_locked_gids = locked_gids
             self._prefetch_owners = dict(l1_owners) if l1_owners is not None else {}
+
+    def record_kv_version_runs(self, runs: tuple[KVVersionRun, ...]) -> None:
+        """Record the version runs the current lookup served.
+
+        Must be called before :meth:`record_prefetch_result` for the same
+        lookup, so a reader that sees the hit length also sees its runs.
+
+        Args:
+            runs: Served runs in chunk order, covering the lookup's hit from
+                its start chunk.
+        """
+        with self._lock:
+            self._kv_version_runs = runs
+
+    def kv_version_assignment(self, window: KVVersionWindow) -> KVVersionAssignment:
+        """Return the chunk-to-version map of the current lookup.
+
+        Args:
+            window: The request's accepted versions.
+
+        Returns:
+            The assignment over the current lookup's served runs (no runs
+            before a versioned lookup has finished).
+        """
+        with self._lock:
+            runs = self._kv_version_runs
+        return KVVersionAssignment.for_window(window, runs)
+
+    def abandoned_kv_version_assignment(
+        self, window: KVVersionWindow, start_chunk: int, end_chunk: int
+    ) -> KVVersionAssignment | None:
+        """Return the chunk-to-version map of an abandoned lookup's hit range.
+
+        Args:
+            window: The request's accepted versions.
+            start_chunk: First chunk of the abandoned lookup's range.
+            end_chunk: Its hit boundary, in chunks.
+
+        Returns:
+            The assignment of the earlier lookup whose served runs cover
+            exactly ``[start_chunk, end_chunk)``, or None if no earlier lookup
+            of this session served that range.
+        """
+        with self._lock:
+            for runs in self._abandoned_kv_version_runs:
+                if runs[0].start_chunk == start_chunk and runs[-1].end_chunk == (
+                    end_chunk
+                ):
+                    return KVVersionAssignment.for_window(window, runs)
+        return None
+
+    def kv_version_spans(self, chunk_size: int) -> list[tuple[int, int, int]]:
+        """Return the current lookup's served runs as token spans.
+
+        Args:
+            chunk_size: Tokens per chunk.
+
+        Returns:
+            ``[start_token, end_token, version]`` per served run, in token
+            order; empty when the lookup served no versioned KV.
+        """
+        with self._lock:
+            runs = self._kv_version_runs
+        return [
+            (run.start_chunk * chunk_size, run.end_chunk * chunk_size, run.version)
+            for run in runs
+        ]
 
     def get_prefetch_owners(self) -> dict[ObjectKey, int]:
         """Snapshot the L1 owners whose read locks this session's lookup retained."""

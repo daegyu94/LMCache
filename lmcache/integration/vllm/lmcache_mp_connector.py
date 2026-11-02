@@ -84,6 +84,7 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import CacheRemoveEvent
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.kv_version import KV_VERSION_CONFIG
 
 try:
     # First Party
@@ -1677,7 +1678,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             should not be freed until the request_id is returned from
             get_finished().
             Optional KVTransferParams to be included in the request outputs
-            returned by the engine.
+            returned by the engine. A request whose ``kv_transfer_params`` set
+            ``lmcache.kv_version`` gets ``kv_version_spans``:
+            ``[[start_token, end_token, kv_version], ...]`` for the prompt
+            tokens loaded from LMCache, omitted when the servers cannot
+            answer.
         """
 
         params: dict[str, Any] | None = getattr(request, "kv_transfer_params", None)
@@ -1696,6 +1701,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_cached_tokens": num_lmcache,
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
+
+        tracker = self.request_trackers.get(request.request_id)
+        if (
+            return_params is not None
+            and tracker is not None
+            and KV_VERSION_CONFIG in (tracker.request_configs or {})
+        ):
+            # Before end_session below, which drops the servers' record. KV
+            # below the vLLM hit came from vLLM's own prefix cache.
+            spans = self.scheduler_adapter.query_kv_version_spans(
+                request.request_id,
+                tracker.num_vllm_hit_tokens,
+                tracker.num_lmcache_hit_tokens,
+            )
+            if spans is not None:
+                return_params["kv_version_spans"] = [list(span) for span in spans]
 
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)

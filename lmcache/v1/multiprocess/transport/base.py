@@ -126,6 +126,11 @@ class RequestClient(Protocol):
     def end_session(self, request_id: str) -> MessagingFuture[None]: ...
 
     @rpc_method
+    def query_kv_version_spans(
+        self, request_id: str
+    ) -> MessagingFuture[list[tuple[int, int, int]] | None]: ...
+
+    @rpc_method
     def register_kv_cache_engine_driven_context(
         self, payload: RegisterEngineDrivenContextPayload
     ) -> MessagingFuture[RegisterEngineDrivenContextResponse]: ...

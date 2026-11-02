@@ -835,3 +835,41 @@ def test_full_prompt_hit_stays_chunk_aligned_under_prefix_replay(
             assert kwargs["extra_ranges"] == ((8, 12),)
     finally:
         scheduler.shutdown()
+
+
+def test_request_finished_returns_kv_version_spans(
+    connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
+    mock_io: SimpleNamespace,
+) -> None:
+    """A request with ``lmcache.kv_version`` gets the served version spans,
+    clipped to what LMCache loaded, queried before the session ends."""
+    scheduler, _ = connectors
+    request = _request()
+    params = {"lmcache.kv_version": 3, "lmcache.max_kv_staleness": 1}
+    request.kv_transfer_params = params
+    request.sampling_params = SimpleNamespace(extra_args={"kv_transfer_params": params})
+    mock_io.scheduler.check_lookup_result.side_effect = [8]
+    mock_io.scheduler.query_kv_version_spans.return_value = [(4, 8, 2)]
+    calls = MagicMock()
+    calls.attach_mock(mock_io.scheduler.query_kv_version_spans, "query")
+    calls.attach_mock(mock_io.scheduler.end_session, "end_session")
+
+    assert scheduler.get_num_new_matched_tokens(request, 4) == (4, True)
+    _, returned = scheduler.request_finished(request, [])
+
+    assert returned == {"kv_version_spans": [[4, 8, 2]]}
+    assert [c[0] for c in calls.mock_calls][:2] == ["query", "end_session"]
+    mock_io.scheduler.query_kv_version_spans.assert_called_once_with("request", 4, 8)
+
+
+def test_request_finished_without_kv_version_does_not_query_spans(
+    connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
+    mock_io: SimpleNamespace,
+) -> None:
+    scheduler, _ = connectors
+    request = _request()
+    request.kv_transfer_params = {"cached_token_stats": True}
+    scheduler.get_num_new_matched_tokens(request, 0)
+    _, returned = scheduler.request_finished(request, [])
+    assert returned is not None and "kv_version_spans" not in returned
+    mock_io.scheduler.query_kv_version_spans.assert_not_called()

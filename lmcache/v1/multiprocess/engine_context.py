@@ -20,10 +20,14 @@ from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.kv_version import KVVersionHintWarner
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
+
+# Seconds between two reports of one malformed KV version hint.
+KV_VERSION_HINT_WARN_INTERVAL_S = 60.0
 
 
 class ShmPoolInfo(TypedDict):
@@ -235,6 +239,9 @@ class MPCacheServerContext:
         )
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
+        self._kv_version_hint_warner = KVVersionHintWarner(
+            KV_VERSION_HINT_WARN_INTERVAL_S
+        )
 
     def close(self) -> None:
         """
@@ -403,7 +410,11 @@ class MPCacheServerContext:
         """Resolve per-object-group object keys from an IPC cache key.
 
         Uses the session manager to track token state and the token hasher
-        to compute chunk hashes for the requested range.
+        to compute chunk hashes for the requested range. A key whose request
+        configs carry ``lmcache.kv_version`` resolves version-qualified keys:
+        chunks the session's lookup served keep their served version, every
+        other chunk gets the session's write version (see
+        :class:`~lmcache.v1.multiprocess.kv_version.KVVersionAssignment`).
 
         Args:
             key: IPC cache key describing model/session/token range.
@@ -425,6 +436,11 @@ class MPCacheServerContext:
         ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
+        window = self._kv_version_hint_warner.parse(key.request_configs)
+        if window is not None:
+            chunk_hashes = session.kv_version_assignment(window).apply(
+                chunk_hashes, key.start // self.chunk_size
+            )
         return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
 
     @staticmethod

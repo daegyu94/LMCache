@@ -331,6 +331,52 @@ def get_experimental(
         return set()
 
 
+KVVersionSpan = tuple[int, int, int]
+"""``(start_token, end_token, kv_version)``: tokens ``[start, end)`` were
+served from KV cached under ``kv_version``."""
+
+
+def merge_kv_version_spans(
+    per_server: Sequence[Sequence[KVVersionSpan]],
+) -> list[KVVersionSpan]:
+    """Combine the version spans several LMCache servers served one request.
+
+    Each server holds a shard of the KV ranks and resolves versions on its
+    own, so one token may come from different versions on different shards.
+    The merged span keeps only tokens every server served (the request's hit
+    is the minimum across servers) and reports the oldest version among
+    them, so staleness is never under-reported.
+
+    Args:
+        per_server: One span list per server, each in token order and
+            non-overlapping (as ``QUERY_KV_VERSION_SPANS`` returns them).
+
+    Returns:
+        Non-overlapping spans in token order, adjacent spans of equal version
+        coalesced; empty when no token was served by every server.
+    """
+    if not per_server:
+        return []
+    boundaries = sorted(
+        {pos for spans in per_server for start, end, _ in spans for pos in (start, end)}
+    )
+    merged: list[KVVersionSpan] = []
+    for start, end in zip(boundaries, boundaries[1:], strict=False):
+        versions = []
+        for spans in per_server:
+            covering = [v for s, e, v in spans if s <= start and end <= e]
+            if not covering:
+                break
+            versions.append(covering[0])
+        else:
+            version = min(versions)
+            if merged and merged[-1][1] == start and merged[-1][2] == version:
+                merged[-1] = (merged[-1][0], end, version)
+            else:
+                merged.append((start, end, version))
+    return merged
+
+
 def _raise_server_unreachable(server_url: str, timeout: float) -> NoReturn:
     """Raise a verbose ConnectionError when the LMCache MP server is
     unreachable.
@@ -1145,6 +1191,61 @@ class LMCacheMPSchedulerAdapter:
 
         for url in self._server_urls:
             self.req_clients[url].end_session(request_id)
+
+    def query_kv_version_spans(
+        self, request_id: str, loaded_start: int, loaded_end: int
+    ) -> list[KVVersionSpan] | None:
+        """Ask every server which KV versions it served a request.
+
+        Blocks for at most the MQ timeout. Must be called before
+        :meth:`end_session`, which drops the servers' record.
+
+        Args:
+            request_id: The ID of the request.
+            loaded_start: First token the engine loaded from LMCache; tokens
+                below it came from the engine's own prefix cache.
+            loaded_end: One past the last token loaded from LMCache (the
+                lookup hit).
+
+        Returns:
+            The spans merged across servers (see
+            :func:`merge_kv_version_spans`) and clipped to
+            ``[loaded_start, loaded_end)``, in absolute token positions;
+            empty when no versioned KV was loaded. None when the answer is
+            unknown: a server is unhealthy, does not answer in time, fails,
+            or has no session for the request.
+        """
+        if not self.is_healthy:
+            return None
+        deadline = time.monotonic() + self._mq_timeout
+        futures = {
+            url: self.req_clients[url].query_kv_version_spans(request_id)
+            for url in self._server_urls
+        }
+        per_server: list[list[KVVersionSpan]] = []
+        for url, future in futures.items():
+            try:
+                spans = future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                logger.warning(
+                    "QUERY_KV_VERSION_SPANS to %s did not complete within %ss.",
+                    url,
+                    self._mq_timeout,
+                )
+                return None
+            except Exception:
+                logger.warning(
+                    "QUERY_KV_VERSION_SPANS to %s failed.", url, exc_info=True
+                )
+                return None
+            if spans is None:
+                return None
+            per_server.append(spans)
+        clipped = [
+            (max(start, loaded_start), min(end, loaded_end), version)
+            for start, end, version in merge_kv_version_spans(per_server)
+        ]
+        return [span for span in clipped if span[0] < span[1]]
 
     def report_block_allocations(
         self,
