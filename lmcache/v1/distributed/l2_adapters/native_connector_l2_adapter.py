@@ -22,6 +22,7 @@ from __future__ import annotations
 
 # Standard
 from collections import defaultdict
+from collections.abc import Callable
 from functools import cache
 from typing import Any
 import ctypes
@@ -131,6 +132,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     _OP_LOOKUP = "lookup"
     _OP_LOAD = "load"
     _OP_DELETE = "delete"
+    _OP_EXISTS = "exists"
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         pad_buffers_to_alignment: bool = False,
+        supports_clear: bool = False,
     ) -> None:
         """Initialize the adapter over a native connector client.
 
@@ -160,6 +163,10 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 native connectors whose I/O path requires aligned buffer
                 lengths (e.g. O_DIRECT file storage). See
                 ``_obj_to_memoryview``.
+            supports_clear: When true, :meth:`clear` deletes every key this
+                adapter stored through ``submit_batch_delete``. Backends opt
+                in once their delete is known to remove the stored objects;
+                otherwise :meth:`clear` raises ``NotImplementedError``.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         self._client = native_client
@@ -167,6 +174,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
         self._pad_buffers_to_alignment = pad_buffers_to_alignment
+        self._supports_clear = supports_clear
         self._memory_tags = memory_tags
 
         # 3 distinct cross-platform notifiers for the L2 adapter
@@ -195,8 +203,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Delete capability detection
         self._has_delete = callable(getattr(native_client, "submit_batch_delete", None))
 
-        # Pending delete events for synchronous delete() calls
-        self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
+        # Events and per-key results for blocking delete/exists calls
+        self._pending_sync_events: dict[L2TaskId, threading.Event] = {}
+        self._sync_results: dict[L2TaskId, list[bool]] = {}
 
         # Per-key size tracking. ``_key_sizes`` lets us look up byte sizes
         # at delete time (the native completion only carries booleans, not
@@ -362,41 +371,68 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """
         if not keys or not self._has_delete:
             return
-
-        key_strings = [_object_key_to_string(k) for k in keys]
-        done_event = threading.Event()
-
-        with self._lock:
-            task_id = self._get_next_task_id()
-            future_id = int(self._client.submit_batch_delete(key_strings))
-            self._pending_ops[future_id] = (
-                self._OP_DELETE,
-                task_id,
-                len(keys),
-                list(keys),
-            )
-            self._pending_delete_events[task_id] = done_event
-
-        # Block until demux thread signals completion
-        if not done_event.wait(timeout=30.0):
-            with self._lock:
-                self._pending_delete_events.pop(task_id, None)
-                # Note: _pending_ops entry may already be consumed
-                # by the demux thread; pop is safe either way.
-                for fid, entry in list(self._pending_ops.items()):
-                    if entry[1] == task_id:
-                        self._pending_ops.pop(fid, None)
-                        break
-            logger.warning(
-                "delete() timed out after 30s for %d keys",
-                len(keys),
-            )
-            return
+        self._run_blocking(self._OP_DELETE, keys, self._client.submit_batch_delete)
 
         # ``_notify_keys_deleted`` is fired by the demux thread (with
         # accurate per-key sizes drawn from ``_key_sizes``) when the
         # backend reports per-key deletion results, so we don't notify
         # again here.
+
+    def clear(self) -> None:
+        """Delete every key this adapter stored, with one batch delete.
+
+        Only keys stored by this instance are tracked, so objects written by
+        another process or an earlier run are left in place. A key the delete
+        does not report as removed is looked up; if the backend no longer has
+        it (for example another server sharing the storage removed it), it
+        counts as cleared. Cleared keys are reported through
+        ``on_l2_keys_deleted`` and leave usage accounting.
+
+        Stores completing during the clear are not fenced and may
+        re-populate the backend.
+
+        Raises:
+            NotImplementedError: the adapter was built without
+                ``supports_clear``.
+            RuntimeError: the delete or lookup timed out (30 s each), or some
+                keys still exist; those stay tracked and may still be loaded.
+        """
+        if not self._supports_clear:
+            raise NotImplementedError(f"{self._type_name} does not support clear")
+        with self._lock:
+            keys = list(self._key_sizes)
+        if not keys:
+            return
+        deleted = self._run_blocking(
+            self._OP_DELETE, keys, self._client.submit_batch_delete
+        )
+        if deleted is None:
+            raise RuntimeError(f"{self._type_name} clear timed out deleting keys")
+        undeleted = [key for key, ok in zip(keys, deleted, strict=True) if not ok]
+        if not undeleted:
+            return
+        # A delete that finds no object reports False too, e.g. after another
+        # server sharing the storage removed it, so ask which ones remain.
+        present = self._run_blocking(
+            self._OP_EXISTS, undeleted, self._client.submit_batch_exists
+        )
+        if present is None:
+            raise RuntimeError(f"{self._type_name} clear timed out checking keys")
+        gone_keys: list[ObjectKey] = []
+        gone_sizes: list[int] = []
+        with self._lock:
+            for key, exists in zip(undeleted, present, strict=True):
+                if not exists and key in self._key_sizes:
+                    gone_keys.append(key)
+                    gone_sizes.append(self._key_sizes.pop(key))
+        if gone_keys:
+            self._notify_keys_deleted(gone_keys, gone_sizes)
+        remaining = sum(present)
+        if remaining:
+            raise RuntimeError(
+                f"{self._type_name} clear left {remaining} of {len(keys)} "
+                "keys undeleted"
+            )
 
     # ``get_usage()`` is inherited from ``L2AdapterInterface``. The base
     # class tracks aggregate + per-user totals via ``_notify_keys_*``;
@@ -454,6 +490,71 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._next_task_id += 1
         return task_id
 
+    def _run_blocking(
+        self,
+        op_type: str,
+        keys: list[ObjectKey],
+        submit: Callable[[list[str]], int],
+    ) -> list[bool] | None:
+        """Submit a batch op and wait for its per-key results.
+
+        Args:
+            op_type: ``_OP_DELETE`` or ``_OP_EXISTS``.
+            keys: Keys of the batch.
+            submit: Native submit method taking the encoded keys.
+
+        Returns:
+            One result per key, or ``None`` after the 30 s timeout. A
+            connector that reports no per-key results yields all ``False``.
+        """
+        key_strings = [_object_key_to_string(k) for k in keys]
+        done_event = threading.Event()
+
+        with self._lock:
+            task_id = self._get_next_task_id()
+            future_id = int(submit(key_strings))
+            self._pending_ops[future_id] = (op_type, task_id, len(keys), list(keys))
+            self._pending_sync_events[task_id] = done_event
+
+        if not done_event.wait(timeout=30.0):
+            with self._lock:
+                self._pending_sync_events.pop(task_id, None)
+                self._sync_results.pop(task_id, None)
+                # Note: _pending_ops entry may already be consumed
+                # by the demux thread; pop is safe either way.
+                for fid, entry in list(self._pending_ops.items()):
+                    if entry[1] == task_id:
+                        self._pending_ops.pop(fid, None)
+                        break
+            logger.warning(
+                "%s timed out after 30s for %d keys",
+                op_type,
+                len(keys),
+            )
+            return None
+
+        with self._lock:
+            return self._sync_results.pop(task_id)
+
+    def _finish_sync(
+        self,
+        task_id: L2TaskId,
+        result_bools: list[bool] | None,
+        num_keys: int,
+        done_events: list[threading.Event],
+    ) -> None:
+        """Record a blocking call's results and queue its wake-up.
+
+        Must be called under _lock, from the demux thread.
+        """
+        evt = self._pending_sync_events.pop(task_id, None)
+        if evt is None:
+            return
+        self._sync_results[task_id] = (
+            list(result_bools) if result_bools is not None else [False] * num_keys
+        )
+        done_events.append(evt)
+
     def _demux_loop(self) -> None:
         """Background thread that polls the native
         connector's eventfd, drains completions, and
@@ -485,11 +586,11 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             keys_accessed: list[ObjectKey] = []
             keys_deleted: list[ObjectKey] = []
             sizes_deleted: list[int] = []
-            # Events for synchronous ``delete()`` callers. We set these
+            # Events for blocking delete/exists callers. We set these
             # AFTER firing ``_notify_keys_deleted`` below so that when
             # the caller unblocks and calls ``get_usage()``, the base
             # class's byte counters already reflect the deletion.
-            delete_done_events: list[threading.Event] = []
+            sync_done_events: list[threading.Event] = []
 
             with self._lock:
                 for (
@@ -580,9 +681,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                 if key in self._key_sizes:
                                     sizes_deleted.append(self._key_sizes.pop(key))
                                     keys_deleted.append(key)
-                        evt = self._pending_delete_events.pop(task_id, None)
-                        if evt is not None:
-                            delete_done_events.append(evt)
+                        self._finish_sync(
+                            task_id, result_bools, num_keys, sync_done_events
+                        )
+
+                    elif op_type == self._OP_EXISTS:
+                        self._finish_sync(
+                            task_id, result_bools, num_keys, sync_done_events
+                        )
 
             # Fire listener notifications outside the lock so a slow
             # listener cannot stall further demux iterations.
@@ -597,5 +703,5 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # accounting, so ``get_usage()`` never briefly reports stale
             # (too-high) usage in the window between ``delete()``
             # returning and the notify running.
-            for evt in delete_done_events:
+            for evt in sync_done_events:
                 evt.set()

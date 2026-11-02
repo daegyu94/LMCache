@@ -23,6 +23,23 @@ class L1ReconfigureError(RuntimeError):
         self.payload: dict[str, object] = {"error": message}
 
 
+class L2ClearError(RuntimeError):
+    """Raised when one or more L2 adapters failed to clear (backend error).
+
+    Attributes:
+        failures: Maps the adapter id of each adapter that failed to clear to
+            the exception it raised. Adapters not listed were cleared.
+    """
+
+    def __init__(self, failures: dict[int, Exception]) -> None:
+        self.failures = dict(failures)
+        details = "; ".join(
+            f"adapter {adapter_id}: {type(exc).__name__}: {exc}"
+            for adapter_id, exc in sorted(self.failures.items())
+        )
+        super().__init__(f"Failed to clear L2 adapter(s): {details}")
+
+
 class L1Error(enum.Enum):
     """Errors for L1Manager class APIs."""
 

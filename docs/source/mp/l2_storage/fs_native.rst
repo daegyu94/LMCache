@@ -92,3 +92,21 @@ drains them to disk; nothing is retained in L1 once a store completes:
         --eviction-policy noop \
         --l2-store-policy skip_l1 \
         --l2-adapter '{"type": "fs_native", "base_path": "/data/lmcache/l2", "num_workers": 32, "use_odirect": true}'
+
+Cache reset
+~~~~~~~~~~~
+
+When the serving engine resets its cache (for example vLLM ``sleep()``,
+``pause_scheduler(clear_cache=True)`` or ``reset_prefix_cache(reset_connector=True)``
+after an RL weight update), the LMCache MP server clears this adapter too: every
+KV file this server stored since it started is deleted. Files written by an
+earlier run, or only by other servers sharing the ``base_path``, are left in
+place. A file that two servers stored under the same key is a single file, so
+whichever server resets first removes it for both.
+``POST /cache/clear`` and the CLI still clear L1 only.
+
+.. note::
+
+   Stores that are in flight during a reset are not fenced and can leave
+   pre-reset data behind. If the clear cannot delete every file, the MP server
+   logs an error and the remaining files can still be loaded.

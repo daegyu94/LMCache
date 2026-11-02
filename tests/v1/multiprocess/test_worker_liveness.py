@@ -19,7 +19,8 @@ import pytest
 import zmq
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, Tier
+from lmcache.v1.distributed.error import L2ClearError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 from lmcache.v1.multiprocess.config import CoordinatorConfig, MPServerConfig
@@ -27,6 +28,7 @@ from lmcache.v1.multiprocess.engine_module import ModuleBuildContext
 from lmcache.v1.multiprocess.modules import engine_driven_transfer as non_gpu_mod
 from lmcache.v1.multiprocess.modules import kv_events as kv_events_mod
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as gpu_mod
+from lmcache.v1.multiprocess.modules import management as management_mod
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
 )
@@ -291,13 +293,14 @@ def test_management_ping_touches_targets() -> None:
     assert target.touched == [42]
 
 
-def test_management_clear_defaults_to_non_force() -> None:
+def test_management_clear_defaults_to_non_force_all_tiers() -> None:
+    """The RPC handler (reset_cache) clears every tier, not just L1."""
     ctx = MagicMock()
     mgmt = ManagementModule(ctx)
 
     mgmt.clear()
 
-    ctx.storage_manager.clear.assert_called_once_with(force=False)
+    ctx.storage_manager.clear.assert_called_once_with(force=False, tier=Tier.ALL)
 
 
 def test_management_clear_accepts_force() -> None:
@@ -306,7 +309,25 @@ def test_management_clear_accepts_force() -> None:
 
     mgmt.clear(force=True)
 
-    ctx.storage_manager.clear.assert_called_once_with(force=True)
+    ctx.storage_manager.clear.assert_called_once_with(force=True, tier=Tier.ALL)
+
+
+def test_management_clear_does_not_raise_on_l2_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising BLOCKING handler gets no ZMQ reply and stalls the caller."""
+    ctx = MagicMock()
+    ctx.storage_manager.clear.side_effect = L2ClearError({0: RuntimeError("disk")})
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        management_mod.logger, "error", lambda *args, **kwargs: errors.append(args)
+    )
+    mgmt = ManagementModule(ctx)
+
+    mgmt.clear()  # must not raise
+
+    assert ctx.storage_manager.memcheck.call_count == 2
+    assert len(errors) == 1 and "stale data in L2" in errors[0][0]
 
 
 def test_management_reaper_reaps_and_drops() -> None:

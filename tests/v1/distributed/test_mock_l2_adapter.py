@@ -666,6 +666,26 @@ def _store_and_wait(adapter, key, obj):
     adapter.pop_completed_store_tasks()
 
 
+class TestClear:
+    def test_clear_removes_all_keys_and_resets_usage(self, adapter):
+        keys = [create_object_key(i) for i in range(3)]
+        for key in keys:
+            _store_and_wait(adapter, key, create_memory_obj(size=1024))
+        assert adapter.get_usage().total_bytes_used > 0
+
+        adapter.clear()
+
+        assert adapter.get_usage().total_bytes_used == 0
+        assert not any(adapter.debug_has_key(k) for k in keys)
+
+    def test_clear_allows_restore_up_to_capacity(self, adapter):
+        """The capacity accumulator is reset, not just the key map."""
+        _store_and_wait(adapter, create_object_key(1), create_memory_obj(size=1024))
+        adapter.clear()
+        _store_and_wait(adapter, create_object_key(1), create_memory_obj(size=1024))
+        assert adapter.debug_has_key(create_object_key(1))
+
+
 class TestEvictionInterface:
     """Tests for delete(), get_usage(), and listener notifications."""
 

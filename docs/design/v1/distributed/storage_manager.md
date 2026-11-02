@@ -97,6 +97,45 @@ controller's decision.
 - `tests/v1/mp_observability/trace/test_codecs.py`: trace round-trips of the
   request types and of `PrefetchHandle.sliding_windows`.
 
+## Clearing
+
+`StorageManager.clear(force=False, tier=Tier.L1)` drops cached data.
+
+| `tier` | Effect |
+|---|---|
+| `Tier.L1` (default) | Clear every L1 manager; L2 untouched (historical behavior). |
+| `Tier.L2` | Call `L2AdapterInterface.clear()` on every active L2 adapter. |
+| `Tier.ALL` | L2 first, then L1 (also when L2 clearing fails). |
+
+L2 is cleared first so that a prefetch running between the two steps cannot
+promote stale L2 data into an already-cleared L1. `force` applies to L1 locks
+only. All L2 adapters are attempted. An adapter
+that raises `NotImplementedError` is skipped with a warning logged once per
+adapter (stale KV may remain there). Real backend failures are collected and
+raised as `L2ClearError` (`failures` maps adapter id to the exception).
+
+The MP `clear` RPC (sent by `reset_cache`) has no tier field and
+`ManagementModule.clear` clears `Tier.ALL`, because its only production caller
+resets caches when every stored KV is stale. This means vLLM's `sleep()`,
+`pause_scheduler(clear_cache=True)` and `reset_prefix_cache(reset_connector=True)`
+now also remove the **persistent L2 data** of adapters that support clearing
+(currently `fs_native`). The CLI and `POST /cache/clear` remain L1-only.
+
+The RPC handler never raises for L2 problems: a `L2ClearError` is logged at
+ERROR. The ZMQ transport sends no reply when a BLOCKING handler raises, so
+raising would stall `reset_cache` until its timeout. Making the transport reply
+with an error is a follow-up; until then `reset_cache` reports success even if
+an L2 clear failed, and the server log is the signal.
+
+What each adapter removes is defined by its `clear()`; see
+`l2_adapters/overall.md`. `fs_native` removes only the keys this server
+stored; with a shared `base_path`, a key two servers stored is one file,
+removed by whichever server clears first.
+
+Known race: in-flight L1 to L2 stores are not fenced against a clear. A store
+that completes after the L2 clear can re-insert pre-clear data. Quiesce
+traffic before the weight update, or wait for the planned epoch fence.
+
 ## Write placement and object ownership
 
 The CLI configures one or more L1 managers; `StorageManager.__init__` builds

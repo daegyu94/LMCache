@@ -92,6 +92,17 @@ def _make_adapter(rate: float = 0.0, seed: int = 0, gap_indices=(), gap_tail_rat
     return wrapper, inner
 
 
+def test_clear_delegates_to_inner():
+    wrapper, inner = _make_adapter()
+    keys = [_object_key(i) for i in range(2)]
+    _store_all(wrapper, keys)
+    assert inner.get_usage().total_bytes_used > 0
+
+    wrapper.clear()
+
+    assert inner.get_usage().total_bytes_used == 0
+
+
 def _store_all(adapter, keys):
     """Store one memory object per key and drain the completion event."""
     fd = adapter.get_store_event_fd()

@@ -562,6 +562,37 @@ class L2AdapterInterface(ABC):
         """
         return None
 
+    def clear(self) -> None:
+        """Remove every object this adapter stored, resetting its accounting.
+
+        Used when all stored KV becomes stale at once (e.g. an RL weight
+        update), so prefetch cannot promote it back into L1. Unlike
+        :meth:`delete`, the caller does not enumerate keys.
+
+        Contract:
+            * Removes at least every key this adapter reported through
+              ``_notify_keys_stored`` and has not since deleted. An
+              implementation may remove more, such as objects left by an
+              earlier run; it documents which.
+            * Blocks until the backend has acknowledged the removal.
+            * Fires ``on_l2_keys_deleted`` / updates usage accounting exactly
+              as :meth:`delete` would, so eviction policies and
+              :meth:`get_usage` agree with the backend.
+            * Must be safe to call while store/lookup/load tasks run.
+              Stores that complete after the removal is issued are not
+              fenced and may re-populate the adapter.
+
+        The default implementation raises rather than silently doing
+        nothing, so callers never believe stale data was dropped when it
+        was not.
+
+        Raises:
+            NotImplementedError: the adapter cannot clear itself.
+            RuntimeError: the backend failed or timed out; the adapter may
+                still hold data.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement clear")
+
     def list_l2_keys(
         self,
         model_name: str | None = None,

@@ -1025,12 +1025,16 @@ class LMCacheMPSchedulerAdapter:
         """Ask every backing LMCache server to best-effort clear idle cache.
 
         Sends non-forced CLEAR to every backing LMCache server and waits for
-        the RPCs to complete. Locked in-flight objects and scheduler-side
-        lookup bookkeeping are preserved.
+        the RPCs to complete. The server clears all tiers (L1 and every L2
+        adapter that supports it), so after e.g. an RL weight update those
+        adapters do not serve old KV back through prefetch. L1 objects
+        protected by in-flight locks and scheduler-side lookup bookkeeping
+        are preserved.
 
         Returns:
             True when every server answers CLEAR, False on timeout or RPC
-            failure.
+            failure. An L2 clear failure is logged by the server but does
+            not change the answer.
         """
         deadline = time.monotonic() + self._mq_timeout
         futures: dict[str, MessagingFuture[Any]] = {}

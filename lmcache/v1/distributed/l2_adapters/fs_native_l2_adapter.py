@@ -247,6 +247,7 @@ def _create_fs_native_l2_adapter(
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
         pad_buffers_to_alignment=config.use_odirect,
+        supports_clear=True,
         extra_status={
             "base_path": config.base_path,
             "use_odirect": config.use_odirect,

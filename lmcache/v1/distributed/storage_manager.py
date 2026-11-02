@@ -35,7 +35,12 @@ from lmcache.v1.distributed.config import (
     requires_single_l1_memory_region,
     unwrap_l2_adapter_config,
 )
-from lmcache.v1.distributed.error import L1Error, L1ReconfigureError, strerror
+from lmcache.v1.distributed.error import (
+    L1Error,
+    L1ReconfigureError,
+    L2ClearError,
+    strerror,
+)
 from lmcache.v1.distributed.internal_api import (
     L1ManagerInterface,
     L1OperationResult,
@@ -178,6 +183,8 @@ class StorageManager:
             # L2 adapters:
             self._next_adapter_id = 0
             self._registered_l2_listeners: list[L2AdapterListener] = []
+            # Adapter ids already warned about lacking clear() support.
+            self._clear_unsupported_warned: set[int] = set()
             self._l2_adapters: dict[int, L2AdapterInterface] = {}
             self._adapter_descriptors: dict[int, L2AdapterDescriptor] = {}
 
@@ -1213,7 +1220,7 @@ class StorageManager:
         ]
 
     # Management APIs
-    def clear(self, force: bool = False):
+    def clear(self, force: bool = False, tier: Tier = Tier.L1) -> None:
         """
         Clear data in the storage manager.
 
@@ -1221,10 +1228,71 @@ class StorageManager:
             force: If True, clear ALL objects including locked ones.
                 This may corrupt in-flight store/prefetch operations.
                 If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+                write-locked and read-locked objects intact. Applies to L1
+                only; L2 adapters have no lock-skipping mode and always drop
+                everything they hold.
+            tier: Which tier(s) to clear. ``Tier.L1`` (default) keeps the
+                historical behavior and leaves L2 data intact; ``Tier.L2``
+                clears every L2 adapter; ``Tier.ALL`` clears L2 first and
+                then L1, which is cleared even if L2 clearing fails. Use it
+                when all stored KV is stale (e.g. after a model weight
+                update).
+
+        Raises:
+            L2ClearError: One or more L2 adapters failed to clear (backend
+                error, timeout). All adapters are attempted; the error lists
+                the ones that failed. Adapters that do not support clearing
+                are skipped with a one-time warning instead, since nothing
+                was attempted and failing would block every reset.
+
+        Note:
+            In-flight L1->L2 stores are not fenced against L2 clearing: a
+            store that completes after the L2 clear can re-populate L2 with
+            data written before the clear. Callers that need a hard
+            invalidation barrier must quiesce stores first.
         """
-        for manager in self._l1_managers:
-            manager.clear(force=force)
+        # L2 first: a prefetch landing between the two steps then reads an
+        # already-cleared L2 instead of promoting stale KV into a cleared L1.
+        try:
+            if tier in (Tier.L2, Tier.ALL):
+                self._clear_l2_adapters()
+        finally:
+            if tier in (Tier.L1, Tier.ALL):
+                for manager in self._l1_managers:
+                    manager.clear(force=force)
+
+    def _clear_l2_adapters(self) -> None:
+        """Clear every active L2 adapter, attempting all before raising.
+
+        Adapters raising ``NotImplementedError`` are skipped with a warning
+        logged once per adapter (stale KV may remain there).
+
+        Raises:
+            L2ClearError: At least one adapter failed to clear.
+        """
+        failures: dict[int, Exception] = {}
+        for adapter_id, _desc, adapter in self._snapshot_adapters():
+            try:
+                adapter.clear()
+            except NotImplementedError:
+                if adapter_id not in self._clear_unsupported_warned:
+                    self._clear_unsupported_warned.add(adapter_id)
+                    logger.warning(
+                        "L2 adapter %d (%s) does not support clear(); skipped. "
+                        "Stale KV may remain in it.",
+                        adapter_id,
+                        type(adapter).__name__,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Failed to clear L2 adapter %d (%s): %s",
+                    adapter_id,
+                    type(adapter).__name__,
+                    exc,
+                )
+                failures[adapter_id] = exc
+        if failures:
+            raise L2ClearError(failures)
 
     def close(self):
         """

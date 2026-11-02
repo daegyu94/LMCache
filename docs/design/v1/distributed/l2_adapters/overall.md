@@ -121,6 +121,37 @@ and the PrefetchController thread. In practice, the store operations and
 lookup/load operations use separate internal state, so this is usually
 straightforward with per-operation locks or lock-free queues.
 
+### Clearing (`clear()`)
+
+`L2AdapterInterface.clear()` removes the objects an adapter stored. It exists
+because L2 outlives L1: when all stored KV becomes stale (e.g. an RL weight
+update triggers `reset_cache`), clearing only L1 would let prefetch promote
+old-weight KV back from L2.
+
+- **Not key-addressed:** unlike `delete(keys)`, the caller does not enumerate
+  keys.
+- **Scope:** at least every key the adapter reported through
+  `_notify_keys_stored` and has not deleted since. An implementation may remove
+  more (for example objects left by an earlier run) and documents which.
+- **Blocking:** returns after the backend acknowledged the removal, and fires
+  `on_l2_keys_deleted` / updates `get_usage()` as `delete` would, so eviction
+  policies and usage accounting match the backend.
+- **No silent no-op:** the default implementation raises
+  `NotImplementedError`; a backend failure or timeout raises `RuntimeError`.
+- **Implemented by:** `fs_native`, through `NativeConnectorL2Adapter`. It
+  passes the keys it tracks to one batch delete, so only objects this server
+  stored are removed; files from an earlier run stay. A key the delete does not
+  report as removed is looked up, and counts as cleared if it no longer exists:
+  with a shared `base_path`, a key two servers stored is one file, removed by
+  whichever server clears first. Keys that still exist, or a delete or lookup
+  that times out (30 s each), raise `RuntimeError`; those keys stay tracked.
+  Other native backends opt in with `supports_clear=True` once their delete is
+  verified. `MockL2Adapter` and the `SerdeL2AdapterWrapper` /
+  `FaultInjectL2Adapter` wrappers (delegating) also implement it. Every other
+  adapter raises `NotImplementedError`.
+- **Known gap:** stores that complete after a clear are not fenced and can
+  re-populate the adapter (an epoch fence is a separate follow-up).
+
 ### Task ID Scope
 
 `L2TaskId` values are only unique **within a single adapter**. When tracking

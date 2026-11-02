@@ -7,6 +7,8 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import Tier
+from lmcache.v1.distributed.error import L2ClearError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import BlockAllocationRecord
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -195,10 +197,31 @@ class ManagementModule(DiscoverableModule):
 
     @request_handler(HandlerType.BLOCKING)
     def clear(self, force: bool = False) -> None:
-        """Clear all stored KV cache data from the storage manager."""
+        """Clear all stored KV cache data from every tier (RPC entry point).
+
+        This is the handler behind the ``clear`` RPC, whose only production
+        caller is the connector's ``reset_cache`` (``sleep``,
+        ``pause_scheduler(clear_cache=True)``,
+        ``reset_prefix_cache(reset_connector=True)``, e.g. after an RL weight
+        update). All stored KV is stale then, so persistent L2 data is dropped
+        along with L1; otherwise prefetch would serve it back. The RPC has no
+        tier field; ``/cache/clear`` and the CLI remain L1-only.
+
+        L2 adapters that cannot clear (``NotImplementedError``) are skipped
+        with a warning, and a backend failure is logged at ERROR. Neither is
+        raised: the ZMQ transport sends no reply when a blocking handler
+        raises, which would leave the caller waiting for its full timeout.
+
+        Args:
+            force: Also clear L1 objects that are locked. See
+                :meth:`StorageManager.clear`.
+        """
         with self._clear_lock:
             self._ctx.storage_manager.memcheck()
-            self._ctx.storage_manager.clear(force=force)
+            try:
+                self._ctx.storage_manager.clear(force=force, tier=Tier.ALL)
+            except L2ClearError as exc:
+                logger.error("Cache clear left stale data in L2 adapter(s): %s", exc)
             self._ctx.storage_manager.memcheck()
 
     @request_handler(operation="noop")

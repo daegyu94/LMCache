@@ -1262,7 +1262,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     def reset_cache(self) -> bool | None:
         """Request a best-effort LMCache MP cache clear from the scheduler.
 
-        Active request trackers are preserved. Backing servers retain objects
+        Active request trackers are preserved. Backing servers clear L1 and
+        every L2 adapter that supports clearing, but retain L1 objects
         protected by in-flight read or write locks.
 
         Returns:

@@ -26,6 +26,12 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
+from lmcache.v1.distributed.key_codec import encode_storage_key
+from lmcache.v1.distributed.l2_adapters import create_l2_adapter
+from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+    FSNativeL2AdapterConfig,
+)
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
     _obj_to_memoryview,
@@ -750,6 +756,177 @@ class TestEndToEndWorkflow:
 # =============================================================================
 # Close Tests
 # =============================================================================
+
+
+class _UndeletableConnector(MockNativeConnector):
+    """Mock connector whose deletes report every key as not deleted."""
+
+    def submit_batch_delete(self, keys: list[str]) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+        self._push_completion(fid, True, "", [False] * len(keys))
+        return fid
+
+
+def _store_keys(adapter: L2AdapterInterface, keys: list[ObjectKey]) -> None:
+    store_fd = adapter.get_store_event_fd()
+    adapter.submit_store_task(keys, [create_memory_obj() for _ in keys])
+    assert wait_for_event_fd(store_fd, timeout=5.0)
+    adapter.pop_completed_store_tasks()
+
+
+def _lookup_hits(adapter: L2AdapterInterface, keys: list[ObjectKey]) -> int:
+    lookup_fd = adapter.get_lookup_and_lock_event_fd()
+    task_id = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
+    assert wait_for_event_fd(lookup_fd, timeout=5.0)
+    bitmap = adapter.query_lookup_and_lock_result(task_id)
+    assert bitmap is not None
+    adapter.submit_unlock(keys)
+    return sum(bitmap.test(i) for i in range(len(keys)))
+
+
+class TestClear:
+    """``clear()`` deletes the keys the adapter stored, when opted in."""
+
+    @pytest.fixture
+    def clearable(self):
+        adp = NativeConnectorL2Adapter(
+            MockNativeConnector(), _MEMORY_TAGS, supports_clear=True
+        )
+        yield adp
+        adp.close()
+
+    def test_clear_deletes_stored_keys_and_resets_usage(self, clearable):
+        keys = [create_object_key(i) for i in range(5)]
+        _store_keys(clearable, keys)
+        assert clearable.get_usage().total_bytes_used > 0
+
+        clearable.clear()
+
+        assert _lookup_hits(clearable, keys) == 0
+        assert clearable.get_usage().total_bytes_used == 0
+
+    def test_clear_keeps_objects_this_instance_did_not_store(self):
+        """Objects already in the backend (e.g. from an earlier run) stay."""
+        earlier = create_object_key(99)
+        connector = MockNativeConnector()
+        connector.submit_batch_set([encode_storage_key(earlier)], [memoryview(b"old")])
+        connector.drain_completions()
+        adp = NativeConnectorL2Adapter(connector, _MEMORY_TAGS, supports_clear=True)
+        try:
+            _store_keys(adp, [create_object_key(1)])
+
+            adp.clear()
+
+            assert _lookup_hits(adp, [earlier]) == 1
+            assert _lookup_hits(adp, [create_object_key(1)]) == 0
+        finally:
+            adp.close()
+
+    def test_clear_notifies_listeners_for_every_stored_key(self, clearable):
+        deleted: list[ObjectKey] = []
+
+        class _Listener:
+            def on_l2_keys_stored(self, keys, sizes):
+                pass
+
+            def on_l2_keys_accessed(self, keys):
+                pass
+
+            def on_l2_keys_deleted(self, keys):
+                deleted.extend(keys)
+
+        clearable.register_listener(_Listener())
+        keys = [create_object_key(i) for i in range(3)]
+        _store_keys(clearable, keys)
+
+        clearable.clear()
+
+        assert set(deleted) == set(keys)
+
+    def test_clear_of_empty_adapter_is_a_noop(self, clearable):
+        clearable.clear()
+        assert clearable.get_usage().total_bytes_used == 0
+
+    def test_clear_raises_unless_opted_in(self, adapter):
+        with pytest.raises(NotImplementedError):
+            adapter.clear()
+
+    def test_clear_raises_when_keys_remain(self):
+        adp = NativeConnectorL2Adapter(
+            _UndeletableConnector(), _MEMORY_TAGS, supports_clear=True
+        )
+        try:
+            _store_keys(adp, [create_object_key(1)])
+            with pytest.raises(RuntimeError, match="1 of 1 keys undeleted"):
+                adp.clear()
+            # The object may still be loaded, so accounting keeps it.
+            assert adp.get_usage().total_bytes_used > 0
+        finally:
+            adp.close()
+
+
+class TestFSNativeClear:
+    """``clear()`` through the real C++ filesystem connector."""
+
+    @staticmethod
+    def _adapter(base_path: str) -> L2AdapterInterface:
+        pytest.importorskip("lmcache.lmcache_fs")
+        return create_l2_adapter(FSNativeL2AdapterConfig(base_path=base_path))
+
+    def test_clear_deletes_this_servers_files_only(self, tmp_path):
+        earlier_run = self._adapter(str(tmp_path))
+        try:
+            _store_keys(earlier_run, [create_object_key(1)])
+        finally:
+            earlier_run.close()
+        earlier_files = set(tmp_path.glob("*.data"))
+        assert len(earlier_files) == 1
+
+        adp = self._adapter(str(tmp_path))
+        try:
+            _store_keys(adp, [create_object_key(2), create_object_key(3)])
+            assert len(list(tmp_path.glob("*.data"))) == 3
+
+            adp.clear()
+
+            assert set(tmp_path.glob("*.data")) == earlier_files
+            assert adp.get_usage().total_bytes_used == 0
+        finally:
+            adp.close()
+
+    def test_clear_after_another_server_removed_a_shared_key(self, tmp_path):
+        """Two servers storing one key share one file; both clears succeed."""
+        first = self._adapter(str(tmp_path))
+        second = self._adapter(str(tmp_path))
+        try:
+            key = create_object_key(1)
+            _store_keys(first, [key])
+            _store_keys(second, [key])
+
+            first.clear()
+            second.clear()
+
+            assert not list(tmp_path.glob("*.data"))
+            assert second.get_usage().total_bytes_used == 0
+            second.clear()  # nothing left to clear
+        finally:
+            first.close()
+            second.close()
+
+    def test_clear_after_the_file_was_removed_externally(self, tmp_path):
+        adp = self._adapter(str(tmp_path))
+        try:
+            _store_keys(adp, [create_object_key(1), create_object_key(2)])
+            next(tmp_path.glob("*.data")).unlink()
+
+            adp.clear()
+
+            assert not list(tmp_path.glob("*.data"))
+            assert adp.get_usage().total_bytes_used == 0
+        finally:
+            adp.close()
 
 
 class TestClose:

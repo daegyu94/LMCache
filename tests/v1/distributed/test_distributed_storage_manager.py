@@ -12,12 +12,14 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.v1.distributed import storage_manager as storage_manager_module
 from lmcache.v1.distributed.api import (
     GroupedObjectKeys,
     MemoryLayoutDesc,
     ObjectKey,
     PrefetchLockMode,
     PrefetchTaskSpec,
+    Tier,
 )
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -25,6 +27,7 @@ from lmcache.v1.distributed.config import (
     L1MemoryManagerConfig,
     StorageManagerConfig,
 )
+from lmcache.v1.distributed.error import L2ClearError
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdaptersConfig,
 )
@@ -568,17 +571,44 @@ def l2_storage_manager_config(basic_l1_config):
     )
 
 
+def _fs_native_config(l1_config, base_path):
+    """StorageManagerConfig with one real fs_native L2 adapter."""
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+        FSNativeL2AdapterConfig,
+    )
+
+    return StorageManagerConfig(
+        l1_manager_config=l1_config,
+        eviction_config=EvictionConfig(eviction_policy="LRU"),
+        l2_adapter_config=L2AdaptersConfig(
+            adapters=[FSNativeL2AdapterConfig(base_path=str(base_path))],
+        ),
+    )
+
+
+def _write_and_wait_for_fs_native(sm, keys, layout) -> None:
+    ret = sm.reserve_write(keys, layout)
+    sm.finish_write(list(ret), l1_owners_of(ret))
+    adapter = sm.l2_adapters()[0][1]
+    assert wait_for_condition(
+        lambda: adapter.get_usage().total_bytes_used > 0
+        and all(sm.l1_managers()[0].is_key_evictable(k) for k in keys),
+        timeout=10.0,
+    )
+
+
 class TestStorageManagerL2Prefetch:
     """Tests for prefetching from L2 through StorageManager."""
 
     def test_prefetch_from_l2(self, l2_storage_manager_config, basic_layout):
-        """Write to L1 → store to L2 → clear L1 → prefetch from L2."""
+        """Write to L1 → store to L2 → clear L1 only → prefetch from L2."""
         sm = StorageManager(l2_storage_manager_config)
         keys = [make_object_key(i) for i in range(5)]
 
         write_keys_and_wait_for_l2(sm, keys, basic_layout)
 
-        sm.clear()
+        sm.clear(tier=Tier.L1)
         used, _ = sm.l1_managers()[0].get_memory_usage()
         assert used == 0, f"L1 should be empty after clear, but {used} bytes used"
 
@@ -595,6 +625,112 @@ class TestStorageManagerL2Prefetch:
             assert len(objs) == len(keys)
 
         sm.finish_read_prefetched(keys)
+        sm.close()
+
+    @pytest.mark.parametrize("tier", [Tier.L2, Tier.ALL])
+    def test_clear_l2_drops_stale_prefetch_hits(
+        self, l2_storage_manager_config, basic_layout, tier
+    ):
+        """After an L2-inclusive clear, prefetch must not serve old KV."""
+        sm = StorageManager(l2_storage_manager_config)
+        keys = [make_object_key(i) for i in range(5)]
+        write_keys_and_wait_for_l2(sm, keys, basic_layout)
+        sm.l1_managers()[0].delete(keys)  # leave the data only in L2
+
+        sm.clear(tier=tier)
+
+        handle = sm.submit_prefetch_task(single_row_spec(keys, basic_layout))
+        assert wait_for_prefetch_status(sm, handle) == 0
+        assert sm.l2_adapters()[0][1].get_usage().total_bytes_used == 0
+        sm.close()
+
+    def test_clear_all_empties_l1_and_l2(self, l2_storage_manager_config, basic_layout):
+        sm = StorageManager(l2_storage_manager_config)
+        keys = [make_object_key(i) for i in range(5)]
+        write_keys_and_wait_for_l2(sm, keys, basic_layout)
+
+        sm.clear(tier=Tier.ALL)
+
+        used, _ = sm.l1_managers()[0].get_memory_usage()
+        assert used == 0
+        assert sm.l2_adapters()[0][1].get_usage().total_bytes_used == 0
+        handle = sm.submit_prefetch_task(single_row_spec(keys, basic_layout))
+        assert wait_for_prefetch_status(sm, handle) == 0
+        sm.close()
+
+    def test_clear_default_tier_keeps_l2(self, l2_storage_manager_config, basic_layout):
+        """Default scope is L1 so existing callers keep their semantics."""
+        sm = StorageManager(l2_storage_manager_config)
+        keys = [make_object_key(i) for i in range(5)]
+        write_keys_and_wait_for_l2(sm, keys, basic_layout)
+
+        sm.clear()
+
+        assert sm.l2_adapters()[0][1].get_usage().total_bytes_used > 0
+        sm.close()
+
+    def test_clear_l2_backend_failure_raises(
+        self, l2_storage_manager_config, basic_layout, monkeypatch
+    ):
+        sm = StorageManager(l2_storage_manager_config)
+        keys = [make_object_key(i) for i in range(2)]
+        write_keys_and_wait_for_l2(sm, keys, basic_layout)
+
+        def _broken() -> None:
+            raise RuntimeError("disk gone")
+
+        monkeypatch.setattr(sm.l2_adapters()[0][1], "clear", _broken)
+
+        with pytest.raises(L2ClearError) as exc_info:
+            sm.clear(tier=Tier.ALL)
+        assert set(exc_info.value.failures) == {0}
+        # L1 was still cleared even though L2 could not be.
+        used, _ = sm.l1_managers()[0].get_memory_usage()
+        assert used == 0
+        sm.close()
+
+    def test_clear_skips_unsupported_adapter_and_warns_once(
+        self, l2_storage_manager_config, basic_layout, monkeypatch
+    ):
+        sm = StorageManager(l2_storage_manager_config)
+        calls = []
+
+        def _unsupported() -> None:
+            calls.append(1)
+            raise NotImplementedError("no clear")
+
+        monkeypatch.setattr(sm.l2_adapters()[0][1], "clear", _unsupported)
+        warnings = []
+        monkeypatch.setattr(
+            storage_manager_module.logger,
+            "warning",
+            lambda *a, **k: warnings.append(a),
+        )
+
+        sm.clear(tier=Tier.ALL)  # must not raise
+        sm.clear(tier=Tier.ALL)
+
+        assert len(calls) == 2
+        clear_warnings = [w for w in warnings if "does not support clear" in w[0]]
+        assert len(clear_warnings) == 1
+        sm.close()
+
+    def test_clear_all_with_fs_native_adapter(
+        self, basic_l1_config, basic_layout, tmp_path
+    ):
+        """End to end on the real native filesystem connector."""
+        pytest.importorskip("lmcache.lmcache_fs")
+        sm = StorageManager(_fs_native_config(basic_l1_config, tmp_path))
+        keys = [make_object_key(i) for i in range(5)]
+        _write_and_wait_for_fs_native(sm, keys, basic_layout)
+        assert any(f.is_file() for f in tmp_path.rglob("*"))
+
+        sm.clear(tier=Tier.ALL)
+
+        assert sm.l2_adapters()[0][1].get_usage().total_bytes_used == 0
+        assert not any(f.is_file() for f in tmp_path.rglob("*"))
+        handle = sm.submit_prefetch_task(single_row_spec(keys, basic_layout))
+        assert wait_for_prefetch_status(sm, handle) == 0
         sm.close()
 
     def test_prefetch_mixed_l1_l2(self, l2_storage_manager_config, basic_layout):
