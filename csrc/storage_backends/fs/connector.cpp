@@ -155,6 +155,19 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   }
 
   try {
+    // Keys do not encode the KV dtype or layout, so a reused cache directory
+    // can hold a larger object under the same key; reading just its prefix
+    // would load corrupted KV.
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      throw std::runtime_error("fstat failed: " + file_path.string() + ": " +
+                               strerror(errno));
+    }
+    if (static_cast<uintmax_t>(st.st_size) != len) {
+      throw std::runtime_error("size mismatch for " + file_path.string() +
+                               ": expected " + std::to_string(len) +
+                               ", file has " + std::to_string(st.st_size));
+    }
     size_t n;
     bool use_read_ahead =
         !do_odirect && conn.read_ahead_size > 0 && len > conn.read_ahead_size;

@@ -751,6 +751,19 @@ class FSL2Adapter(L2AdapterInterface):
                 expected = len(dst_buf)
                 num_read: Optional[int] = None
 
+                # Keys do not encode the KV dtype or layout, so a reused cache
+                # directory can hold a larger object under the same key;
+                # reading just its prefix would load corrupted KV.
+                file_size = (await aiofiles.os.stat(file_path)).st_size
+                if file_size != expected:
+                    logger.warning(
+                        "Size mismatch for %s: expected %d, file has %d",
+                        file_path.name,
+                        expected,
+                        file_size,
+                    )
+                    continue
+
                 # O_DIRECT path (sync, via executor)
                 if self._use_odirect:
                     num_read = await self._loop.run_in_executor(

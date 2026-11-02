@@ -266,6 +266,42 @@ def test_pooled_read_tolerates_one_missing_object(tmp_path: Path) -> None:
         reader.close()
 
 
+@pytest.mark.parametrize("num_read_workers", [0, 4])
+@pytest.mark.parametrize("stored_blocks", [3, 5])
+def test_object_of_another_size_is_not_loaded(
+    tmp_path: Path, num_read_workers: int, stored_blocks: int
+) -> None:
+    """An object stored under the key with a different size is a miss.
+
+    A larger object must not be served by its prefix.
+    """
+    LMCacheFSClient = _import_fs_client()
+    block_size = os.statvfs(tmp_path).f_bsize
+    if block_size <= 0:
+        pytest.skip("filesystem block size is unavailable")
+
+    key = "test_model@00000000@0@cccccccccccccccc"
+    _source_raw, source = _aligned_memoryview(stored_blocks * block_size, block_size)
+    _fill(source)
+    writer = LMCacheFSClient(str(tmp_path), 1, "", True, 0)
+    try:
+        _write_corpus(writer, [key], [source])
+    finally:
+        writer.close()
+
+    _dest_raw, dest = _aligned_memoryview(4 * block_size, block_size)
+    reader = LMCacheFSClient(str(tmp_path), 1, "", True, 0, num_read_workers)
+    try:
+        completion = _wait_for_completion(
+            reader, reader.submit_batch_get([key], [dest])
+        )
+        per_key = completion[3]
+        assert per_key is not None
+        assert list(per_key) == [False]
+    finally:
+        reader.close()
+
+
 def test_the_default_budget_is_used_when_none_is_configured(tmp_path: Path) -> None:
     """Zero selects the documented default rather than "no budget"."""
     LMCacheFSClient = _import_fs_client()
