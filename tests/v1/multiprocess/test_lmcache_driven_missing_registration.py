@@ -27,6 +27,9 @@ class _TestTokenHasher:
 
     chunk_size = 2
 
+    def generation_prefix_hash(self, generation: int) -> object:
+        return generation
+
     def compute_chunk_hashes(
         self,
         token_ids: list[int],

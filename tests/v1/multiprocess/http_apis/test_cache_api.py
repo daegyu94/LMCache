@@ -28,6 +28,7 @@ from lmcache.v1.distributed.api import (
     PrefetchResult,
 )
 from lmcache.v1.multiprocess.cache_control.object_service import MAX_DELETE_BATCH
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.http_apis.cache_api import router as cache_router
 from lmcache.v1.multiprocess.http_apis.dependencies import build_context
 from lmcache.v1.multiprocess.http_apis.error_handlers import register_error_handlers
@@ -481,7 +482,12 @@ class _PrefetchStorageManager:
 class _FakeTokenHasher:
     chunk_size: int = 4
 
-    def compute_chunk_hashes(self, token_ids: list[int]) -> list[bytes]:
+    def generation_prefix_hash(self, generation: int) -> None:
+        return None
+
+    def compute_chunk_hashes(
+        self, token_ids: list[int], prefix_hash: object = None
+    ) -> list[bytes]:
         n = len(token_ids) // self.chunk_size
         return [i.to_bytes(4, "big") for i in range(n)]
 
@@ -491,6 +497,7 @@ class _FakeContext:
     layout_desc_registry: _FakeLayoutRegistry
     storage_manager: _PrefetchStorageManager
     token_hasher: _FakeTokenHasher = field(default_factory=_FakeTokenHasher)
+    cache_generation: CacheGeneration = field(default_factory=CacheGeneration)
 
 
 class _PrefetchEngine:

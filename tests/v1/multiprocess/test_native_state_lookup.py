@@ -29,6 +29,7 @@ from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import (
     LayoutDescRegistry,
@@ -234,12 +235,16 @@ def _lookup(
         "native-state", world_size, layouts[0], manager.get_attn_desc(), layouts
     )
     storage = _PresenceStorage(present)
+    cache_generation = CacheGeneration()
     ctx = SimpleNamespace(
         get_read_owners=lambda request_id: None,
         storage_manager=storage,
         token_hasher=hasher,
         layout_desc_registry=registry,
-        session_manager=SessionManager(hasher, cleanup_interval=None),
+        cache_generation=cache_generation,
+        session_manager=SessionManager(
+            hasher, cleanup_interval=None, cache_generation=cache_generation
+        ),
         event_bus=MagicMock(),
         chunk_size=CHUNK,
     )

@@ -15,7 +15,7 @@ attention window.
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 # First Party
 from lmcache.v1.distributed.api import (
@@ -44,8 +44,11 @@ def _resolve_ipc_key_and_hashes(
     world_size: int,
     token_ids: list[int],
     cache_salt: str,
+    prefix_hash: Any = None,
 ) -> tuple[IPCCacheServerKey, list[bytes]]:
     """Build the lookup-side IPC key and hash the complete chunks.
+
+    ``prefix_hash`` seeds the rolling hash (``None``: generation 0).
 
     Raises:
         ValueError: ``token_ids`` exceeds the per-request cap.
@@ -65,7 +68,9 @@ def _resolve_ipc_key_and_hashes(
         request_id="",
         cache_salt=cache_salt,
     )
-    chunk_hashes = token_hasher.compute_chunk_hashes(list(token_ids))
+    chunk_hashes = token_hasher.compute_chunk_hashes(
+        list(token_ids), prefix_hash=prefix_hash
+    )
     return ipc_key, chunk_hashes
 
 
@@ -81,7 +86,9 @@ def resolve_object_keys(
     Hashes ``token_ids`` and expands each complete chunk into one key per rank
     in object group ``0``. The ``token_hasher``
     must be configured to match the fleet's ``chunk_size`` / ``hash_algorithm``
-    or the resolved keys will not match what the servers stored.
+    or the resolved keys will not match what the servers stored. Keys are
+    resolved under cache generation 0, so they do not address objects a
+    server stored after a generation-mode clear.
 
     Args:
         token_hasher: Hasher configured to match the fleet's chunk size and
@@ -117,6 +124,7 @@ def resolve_grouped_object_keys(
     cache_salt: str,
     group_layout_descs: dict[int, MemoryLayoutDesc],
     attn_desc: AttnWindowDesc,
+    prefix_hash: Any = None,
 ) -> tuple[list[GroupedObjectKeys], int]:
     """Resolve a token sequence to prefetch key rows for every object group.
 
@@ -133,6 +141,9 @@ def resolve_grouped_object_keys(
         cache_salt: Per-tenant isolation salt.
         group_layout_descs: Each object group's memory layout.
         attn_desc: The model's per-group attention windows.
+        prefix_hash: Initial prefix hash scoping the keys to a cache
+            generation (``TokenHasher.generation_prefix_hash``); ``None``
+            resolves generation-0 keys.
 
     Returns:
         ``(key_groups, chunk_count)``; ``([], 0)`` for a sub-chunk sequence.
@@ -142,7 +153,7 @@ def resolve_grouped_object_keys(
             (e.g. ``cache_salt``) is invalid, or a group has no layout.
     """
     ipc_key, chunk_hashes = _resolve_ipc_key_and_hashes(
-        token_hasher, model_name, world_size, token_ids, cache_salt
+        token_hasher, model_name, world_size, token_ids, cache_salt, prefix_hash
     )
     if not chunk_hashes:
         return [], 0

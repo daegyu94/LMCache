@@ -94,6 +94,10 @@ class TokenHasher:
             else self._hash_by_unpacking
         )
         self.none_hash = self._init_none_hash()
+        #: ``(generation, prefix hash)`` of the last non-zero generation
+        #: resolved by :meth:`generation_prefix_hash`; replaced as one tuple
+        #: so concurrent readers never pair a generation with another's hash.
+        self._last_generation_prefix: tuple[int, Any] = (0, self.none_hash)
         logger.info(
             "TokenHasher initialized: chunk_size=%d, hash_algorithm=%s",
             chunk_size,
@@ -209,6 +213,47 @@ class TokenHasher:
         none_hash = self.hash_func((0, (0,), None))
         logger.info("Computed NONE_HASH=%s using hash function", none_hash)
         return none_hash
+
+    def generation_prefix_hash(self, generation: int) -> Any:
+        """Return the initial prefix hash that scopes chunk hashes to a
+        cache generation.
+
+        Passing the result as ``prefix_hash`` to the ``compute_*`` methods
+        makes every chunk hash depend on ``generation``, so content hashed
+        under one generation never addresses objects stored under another.
+
+        Generation 0 returns ``none_hash`` -- exactly the seed used when no
+        ``prefix_hash`` is given -- so generation-0 hashes are bit-identical
+        to hashes computed without a generation. A non-zero generation hashes
+        a ``chunk_size + 1``-token pseudo-chunk; real chunks always hold
+        exactly ``chunk_size`` tokens, so a generation seed never equals the
+        hash of any real token prefix (which would alias generation ``g``
+        content onto a longer generation-0 prefix).
+
+        Thread-safe. The most recent non-zero generation is memoized, since
+        callers resolve the same generation on every lookup until a bump.
+
+        Args:
+            generation: A non-negative cache generation that fits in a
+                ``uint32``.
+
+        Returns:
+            The prefix hash, in the configured algorithm's hash type.
+
+        Raises:
+            ValueError: If ``generation`` is negative.
+        """
+        if generation < 0:
+            raise ValueError(f"cache generation must be >= 0; got {generation}")
+        if generation == 0:
+            return self.none_hash
+        cached_generation, cached_hash = self._last_generation_prefix
+        if cached_generation == generation:
+            return cached_hash
+        pseudo_chunk = [generation] + [0] * self.chunk_size
+        prefix_hash = self.hash_tokens(pseudo_chunk, self.none_hash)
+        self._last_generation_prefix = (generation, prefix_hash)
+        return prefix_hash
 
     def hash_tokens(self, tokens: list[int], prefix_hash: Any = None) -> Any:
         """Hash one chunk with rolling prefix.

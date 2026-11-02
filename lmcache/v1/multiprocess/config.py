@@ -166,14 +166,24 @@ class MPServerConfig:
     server_modules: list[ExtServerModuleSpec] = field(default_factory=list)
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
 
+    clear_mode: Literal["l1", "generation"] = "l1"
+    """What a non-forced ``clear`` (e.g. vLLM ``reset_prefix_cache``) does.
+    'l1' (default) frees unlocked L1 objects and leaves L2 untouched.
+    'generation' additionally bumps the server's cache generation, which is
+    mixed into every chunk hash, so all previously stored L1 and L2 objects
+    become unreachable at once; their L2 copies are deleted in the
+    background. Intended for RL rollouts whose weights change at every
+    clear. Not supported with engine_type='blend'."""
+
     def __post_init__(self) -> None:
-        """Validate the chunk size and worker-reaping timeouts.
+        """Validate the chunk size, worker-reaping timeouts and clear mode.
 
         Raises:
             ValueError: If the chunk size is not positive, a timeout is
                 non-finite, the reap timeout is negative or a non-zero value
-                below the 30 s floor, or the registration grace is below the
-                reap timeout.
+                below the 30 s floor, the registration grace is below the
+                reap timeout, or clear mode 'generation' is combined with
+                engine type 'blend'.
         """
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
@@ -193,6 +203,12 @@ class MPServerConfig:
             raise ValueError(
                 "worker registration grace must be >= the worker reap timeout "
                 f"({reap}s); got {grace}"
+            )
+        if self.clear_mode == "generation" and self.engine_type == "blend":
+            # The blend fingerprint index maps content to stored chunk hashes
+            # and would keep resolving old-generation objects after a bump.
+            raise ValueError(
+                "clear mode 'generation' is not supported with engine type 'blend'"
             )
 
 
@@ -597,6 +613,17 @@ def add_mp_server_args(
         "0 disables the channel. Default is %(default)s.",
     )
     mp_group.add_argument(
+        "--clear-mode",
+        choices=("l1", "generation"),
+        default="l1",
+        help="What a cache clear (e.g. vLLM reset_prefix_cache) does. 'l1' "
+        "frees unlocked L1 objects only. 'generation' also bumps the cache "
+        "generation mixed into every chunk hash, making all stored L1 and L2 "
+        "objects unreachable in O(1) and deleting their L2 copies in the "
+        "background (for RL weight updates). Not supported with "
+        "--engine-type blend. Default is l1.",
+    )
+    mp_group.add_argument(
         "--server-module",
         action="append",
         default=[],
@@ -666,6 +693,7 @@ def parse_args_to_mp_server_config(
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         kv_event_log_size=args.kv_event_log_size,
         server_modules=parse_server_module_specs(args.server_module or []),
+        clear_mode=args.clear_mode,
     )
 
 

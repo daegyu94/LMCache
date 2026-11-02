@@ -19,6 +19,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -183,9 +184,9 @@ class LayoutDescRegistry:
 class MPCacheServerContext:
     """Shared infrastructure for all engine modules.
 
-    Holds the storage manager, token hasher, session manager, event bus,
-    and layout descriptor registry. Modules receive this context at init
-    and use it for shared operations.
+    Holds the storage manager, token hasher, cache generation, session
+    manager, event bus, and layout descriptor registry. Modules receive this
+    context at init and use it for shared operations.
 
     Args:
         storage_manager_config: Configuration for the storage manager.
@@ -227,11 +228,14 @@ class MPCacheServerContext:
             storage_manager_config
         )
         self._storage_manager = StorageManager(storage_manager_config)
+        self._cache_generation = CacheGeneration()
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
         self._session_manager = SessionManager(
-            self._token_hasher, ttl=session_ttl_seconds
+            self._token_hasher,
+            ttl=session_ttl_seconds,
+            cache_generation=self._cache_generation,
         )
         self._event_bus = get_event_bus()
         self._layout_desc_registry = LayoutDescRegistry()
@@ -383,6 +387,17 @@ class MPCacheServerContext:
         return self._token_hasher
 
     @property
+    def cache_generation(self) -> CacheGeneration:
+        """The generation counter that scopes every server-side chunk hash.
+
+        Hash call sites seed with
+        ``token_hasher.generation_prefix_hash(cache_generation.current)``
+        (or a session's recorded generation); it stays at 0 unless the
+        server runs with ``clear_mode="generation"``.
+        """
+        return self._cache_generation
+
+    @property
     def session_manager(self) -> SessionManager:
         """The session manager for request lifecycle tracking."""
         return self._session_manager
@@ -463,7 +478,9 @@ class MPCacheServerContext:
             chunk_size=chunk_size, hash_algorithm=self._hash_algorithm
         )
         self._session_manager = SessionManager(
-            self._token_hasher, ttl=self._session_ttl_seconds
+            self._token_hasher,
+            ttl=self._session_ttl_seconds,
+            cache_generation=self._cache_generation,
         )
         self._session_manager.destroy_listeners.extend(destroy_listeners)
 

@@ -50,15 +50,23 @@ def resolve_prefetched_obj_keys(
     hit_chunks: int,
     locked_gids: tuple,
     group_windows: tuple[int, ...] | None = None,
+    cache_generation: int = 0,
 ) -> list[ObjectKey]:
     """Resolve the subset of a request range that lookup actually locked.
 
     ``key.worker_id=None`` resolves every KV rank for scheduler-owned cleanup.
     A worker-specific key resolves only that worker's shard (or one MLA reader
     share), which is required for per-instance RETRIEVE failure cleanup.
+
+    ``cache_generation`` must be the generation the locking lookup hashed
+    under (the session's ``cache_generation``), not the server's current
+    one: after a bump, the locked objects still carry the old hashes.
     """
     chunk_hashes = ctx.token_hasher.compute_packed_chunk_hashes(
-        key.token_bytes, start=key.start, end=key.end
+        key.token_bytes,
+        prefix_hash=ctx.token_hasher.generation_prefix_hash(cache_generation),
+        start=key.start,
+        end=key.end,
     )
     if not chunk_hashes:
         return []
@@ -231,8 +239,14 @@ class LookupModule(DiscoverableModule):
 
         num_kv_readers = key.require_num_kv_readers()
 
+        # Read the generation once: the hashes, the session stamp and so every
+        # later store and lock release of this lookup share it, even if a
+        # clear bumps the generation mid-lookup.
+        cache_generation = self._ctx.cache_generation.current
         chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes, end=key.end
+            key.token_bytes,
+            prefix_hash=self._ctx.token_hasher.generation_prefix_hash(cache_generation),
+            end=key.end,
         )
         if not chunk_hashes:
             self._register_empty_prefetch_job(
@@ -280,7 +294,9 @@ class LookupModule(DiscoverableModule):
         # The engine-covered prefix is never looked up, so it is excluded from
         # the hit-rate denominator and reported separately.
         looked_up_tokens = requested_tokens - start_chunk * self._ctx.chunk_size
-        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
+        session.begin_lookup(
+            key, tuple(attn_desc.num_chunks_in_sw), cache_generation=cache_generation
+        )
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -533,6 +549,7 @@ class LookupModule(DiscoverableModule):
                     replace(key, start=max(key.start, lock_floor)),
                     hit_chunks,
                     session.prefetch_locked_gids,
+                    cache_generation=session.cache_generation,
                 )
             )
         for range_start, range_end in extra_ranges:
@@ -547,6 +564,7 @@ class LookupModule(DiscoverableModule):
                     replace(key, start=range_start, end=range_end),
                     range_end // self._ctx.chunk_size,
                     session.prefetch_locked_gids,
+                    cache_generation=session.cache_generation,
                 )
             )
         if not obj_keys:

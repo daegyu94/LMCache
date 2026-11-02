@@ -63,7 +63,10 @@ def test_chunk_size_negotiation_preserves_configured_session_ttl() -> None:
         )
 
         assert ctx.negotiate_chunk_size(640) == 640
-        assert session_mgr.call_args_list[-1].kwargs == {"ttl": 7200}
+        assert session_mgr.call_args_list[-1].kwargs == {
+            "ttl": 7200,
+            "cache_generation": ctx.cache_generation,
+        }
 
 
 def test_chunk_size_negotiation_rounds_minimum_up_to_alignment() -> None:

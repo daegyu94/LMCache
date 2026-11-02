@@ -14,6 +14,7 @@ import time
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.token_codec import TOKEN_STRIDE, num_packed_tokens
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -36,12 +37,20 @@ class Session:
     :mod:`lmcache.v1.multiprocess.token_codec`, the layout that arrives on
     the wire and that blake3 hashes; only callers needing ints unpack.
 
+    Chunk hashes are scoped to ``cache_generation``: the session is stamped
+    with the server's generation at creation, and :meth:`begin_lookup`
+    re-stamps it (dropping cached hashes) when a later lookup runs under a
+    newer generation. Stores that reuse the session's hashes therefore land
+    in the generation of the request's latest lookup -- never in a newer one.
+
     Thread-safe: all public methods are protected by an internal lock
     to allow concurrent access from multiple TP worker threads.
     """
 
     request_id: str
     hasher: TokenHasher
+    cache_generation: int = 0
+    """Cache generation the cached ``chunk_hashes`` were computed under."""
     tokens: bytes = b""
     chunk_hashes: list = field(default_factory=list)
     last_prefix_hash: Any = None
@@ -144,7 +153,7 @@ class Session:
             prefix = (
                 self.last_prefix_hash
                 if self.last_prefix_hash is not None
-                else self.hasher.none_hash
+                else self.hasher.generation_prefix_hash(self.cache_generation)
             )
             h = self.hasher.hash_packed_chunk(chunk, prefix)
             self.last_prefix_hash = h
@@ -155,9 +164,25 @@ class Session:
         self,
         key: IPCCacheServerKey,
         group_windows: tuple[int, ...],
+        cache_generation: int = 0,
     ) -> None:
-        """Record a new lookup and reset its per-lookup release state."""
+        """Record a new lookup and reset its per-lookup release state.
+
+        Args:
+            key: The lookup's IPC key.
+            group_windows: Sliding window of each object group, in order.
+            cache_generation: Generation the lookup hashed under. When it
+                differs from the session's, cached chunk hashes are dropped
+                and recomputed under it on the next :meth:`get_hashes`, so
+                later stores and lock releases address this lookup's
+                generation.
+        """
         with self._lock:
+            if cache_generation != self.cache_generation:
+                self.cache_generation = cache_generation
+                self.chunk_hashes = []
+                self.last_prefix_hash = None
+                self.num_chunks_processed = 0
             self.lookup_ipc_key = key
             self.prefetch_hit_chunks = -1
             self.prefetch_locked_gids = ()
@@ -277,8 +302,23 @@ class SessionManager:
         hasher: TokenHasher,
         ttl: float = DEFAULT_SESSION_TTL,
         cleanup_interval: float | None = DEFAULT_CLEANUP_INTERVAL,
+        cache_generation: CacheGeneration | None = None,
     ) -> None:
+        """Create a session manager.
+
+        Args:
+            hasher: Hasher shared by every session.
+            ttl: Idle seconds before a session is reaped.
+            cleanup_interval: Seconds between reaper runs; ``None`` or a
+                non-positive value disables the reaper thread.
+            cache_generation: Server generation counter stamped onto new
+                sessions. ``None`` uses a private counter that stays at 0,
+                i.e. generation-free hashing.
+        """
         self._hasher = hasher
+        self._cache_generation = (
+            cache_generation if cache_generation is not None else CacheGeneration()
+        )
         self._ttl = ttl
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
@@ -295,6 +335,9 @@ class SessionManager:
     def get_or_create(self, request_id: str) -> Session:
         """Get existing session or create a new one.
 
+        A new session is stamped with the current cache generation; an
+        existing one keeps its generation until its next lookup.
+
         Args:
             request_id: Unique request identifier.
 
@@ -304,7 +347,9 @@ class SessionManager:
         with self._lock:
             if request_id not in self._sessions:
                 self._sessions[request_id] = Session(
-                    request_id=request_id, hasher=self._hasher
+                    request_id=request_id,
+                    hasher=self._hasher,
+                    cache_generation=self._cache_generation.current,
                 )
                 logger.debug("Created session for request_id=%s", request_id)
             return self._sessions[request_id]

@@ -166,6 +166,8 @@ async def clear_cache(
     By default, clears only objects that are safe to remove. With
     ``force=true``, clears all objects in the tier, including those with active
     read/write locks; in-flight store/prefetch operations may be corrupted.
+    A server started with ``--clear-mode generation`` also bumps its cache
+    generation, invalidating every stored L1 and L2 object.
 
     The body is optional: an absent (or empty) body defaults to
     ``{"tier": "l1", "force": false}``.

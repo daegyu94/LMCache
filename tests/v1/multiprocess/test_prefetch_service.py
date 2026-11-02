@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess.cache_control.errors import (
     Unavailable,
 )
 from lmcache.v1.multiprocess.cache_control.prefetch_service import PrefetchService
+from lmcache.v1.multiprocess.cache_generation import CacheGeneration
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 CHUNK_SIZE = 4
@@ -68,6 +69,7 @@ class _Registry:
 class _Context:
     layout_desc_registry: _Registry
     token_hasher: TokenHasher
+    cache_generation: CacheGeneration = field(default_factory=CacheGeneration)
 
 
 @dataclass

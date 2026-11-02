@@ -306,6 +306,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             hit_chunks,
             locked_gids,
             group_windows=group_windows,
+            cache_generation=session.cache_generation,
         )
         if not session.claim_failed_retrieve_release(
             instance_id, key, lookup_generation
