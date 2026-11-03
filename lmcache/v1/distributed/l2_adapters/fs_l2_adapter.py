@@ -160,6 +160,23 @@ async def _async_readinto_full(
     return total
 
 
+def _paths_exist(paths: list[Path]) -> list[bool]:
+    """Return ``os.path.exists`` for each path, in order.
+
+    Run in one executor call per lookup batch, so a lookup pays one
+    thread-pool round trip and one GIL re-acquisition on the event loop
+    instead of one per key; under load those dominate the lookup time.
+
+    Args:
+        paths: Files to check.
+
+    Returns:
+        Whether each path exists right now (no caching, so a shared file
+        system's current state is reflected).
+    """
+    return [os.path.exists(path) for path in paths]
+
+
 def _object_key_to_filename(key: ObjectKey) -> str:
     """Return the filename shared by Python and native FS."""
     return encode_fs_filename(key)
@@ -526,19 +543,6 @@ class FSL2Adapter(L2AdapterInterface):
     def _key_to_path(self, key: ObjectKey) -> Path:
         return self._base_path / _object_key_to_filename(key)
 
-    async def _key_exists_on_disk(
-        self,
-        key: ObjectKey,
-    ) -> bool:
-        """Check whether the file for *key* exists on disk.
-
-        Uses ``aiofiles.os.path.exists`` so the check is
-        non-blocking and always reflects the real FS state,
-        which is critical for multi-node shared-FS setups.
-        """
-        path = self._key_to_path(key)
-        return await aiofiles.os.path.exists(path)
-
     def _key_to_file_and_tmp_path(self, key: ObjectKey) -> tuple[Path, Path]:
         """Return ``(final_path, tmp_path)``.
 
@@ -726,10 +730,14 @@ class FSL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
     ) -> None:
         bitmap = Bitmap(len(keys))
-        for i, key in enumerate(keys):
-            if not await self._key_exists_on_disk(key):
-                continue
-            bitmap.set(i)
+        # One non-blocking executor call checks the real FS state of the whole
+        # batch (critical for multi-node shared-FS setups).
+        exists = await self._loop.run_in_executor(
+            None, _paths_exist, [self._key_to_path(key) for key in keys]
+        )
+        for i, found in enumerate(exists):
+            if found:
+                bitmap.set(i)
 
         with self._lock:
             self._completed_lookup_tasks[task_id] = bitmap
