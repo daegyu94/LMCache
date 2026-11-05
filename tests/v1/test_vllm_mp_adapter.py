@@ -1533,6 +1533,8 @@ def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> Non
     tracker.allocated_block_ids = {0: [7]}
 
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector._loading_prefixes = {}
+    connector._prefix_key_of = {}
     connector.request_trackers = {request.request_id: tracker}
     connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
 

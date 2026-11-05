@@ -150,6 +150,13 @@ class MPServerConfig:
     ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass. The
     policy is constructed with ``runtime_plugin_config.extra_config``."""
 
+    prefill_lease_timeout_seconds: float = 0.0
+    """Prefill leases (see ``lmcache.v1.multiprocess.prefill_lease``): when
+    positive, a lookup that needs chunks a request of another engine is about
+    to compute waits for them instead of missing and computing them too, and
+    gives up after this many seconds without that request storing any of
+    them. 0 disables leases."""
+
     worker_registration_grace_seconds: float = 3600.0
     """Silence budget (seconds) for a worker that registered but has never
     sent a PING (model warmup, or death before its first request). Must be
@@ -562,6 +569,16 @@ def add_mp_server_args(
         "custom KVLoadPolicy, constructed with --runtime-plugin-config.",
     )
     mp_group.add_argument(
+        "--prefill-lease-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="When positive, a lookup that needs chunks a request of another "
+        "engine is about to compute (e.g. RL group samples spread over several "
+        "engines) waits for them to be stored instead of computing them again, "
+        "giving up after this many seconds without progress. 0 (default) "
+        "disables it.",
+    )
+    mp_group.add_argument(
         "--worker-registration-grace-seconds",
         type=float,
         default=3600.0,
@@ -663,6 +680,7 @@ def parse_args_to_mp_server_config(
         worker_reap_timeout_seconds=args.worker_reap_timeout_seconds,
         session_ttl_seconds=args.session_ttl_seconds,
         kv_load_policy=args.kv_load_policy,
+        prefill_lease_timeout_seconds=args.prefill_lease_timeout_seconds,
         worker_registration_grace_seconds=args.worker_registration_grace_seconds,
         kv_event_log_size=args.kv_event_log_size,
         server_modules=parse_server_module_specs(args.server_module or []),

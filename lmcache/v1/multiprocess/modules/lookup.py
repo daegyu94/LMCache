@@ -2,6 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import partial
 import threading
@@ -11,6 +12,7 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
+    FULL_ATTENTION_WINDOW_CHUNKS,
     AttnWindowDesc,
     ObjectKey,
     PrefetchHandle,
@@ -37,6 +39,7 @@ from lmcache.v1.multiprocess.kv_load_policy import (
     KVLoadPolicy,
     create_kv_load_policy,
 )
+from lmcache.v1.multiprocess.prefill_lease import PrefillLeaseTable
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens, unpack_token_ids
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -45,6 +48,9 @@ logger = init_logger(__name__)
 
 # Stateless, so one instance can serve every LookupModule.
 _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
+
+# Lookups between sweeps of prefill leases whose owner session was reaped.
+_LEASE_SWEEP_EVERY = 256
 
 
 def resolve_prefetched_obj_keys(
@@ -131,6 +137,13 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # Prefill-lease keys of each looked-up chunk (full-attention rows only);
+    # the ones the lookup hits are released when its result is consumed.
+    lease_keys_by_chunk: tuple[tuple[ObjectKey, ...], ...] = ()
+
+
+# Placeholder for a deferred lookup whose prefetch is being submitted.
+_SUBMITTING: Callable[[], None] = lambda: None  # noqa: E731
 
 
 class LookupModule(DiscoverableModule):
@@ -146,6 +159,9 @@ class LookupModule(DiscoverableModule):
             chunk size.
         load_policy: Decides per lookup whether to serve the request or let
             the engine recompute it. Defaults to ``DefaultKVLoadPolicy``.
+        prefill_lease_timeout_s: When positive, enables prefill leases (see
+            ``prefill_lease``); a waiter gives up after this many seconds
+            without the lease owner storing a chunk it waits for.
     """
 
     module_name = "lookup"
@@ -159,17 +175,32 @@ class LookupModule(DiscoverableModule):
                 build_ctx.mp_config.kv_load_policy,
                 build_ctx.mp_config.runtime_plugin_config.extra_config,
             ),
+            prefill_lease_timeout_s=build_ctx.mp_config.prefill_lease_timeout_seconds,
         )
 
     def __init__(
         self,
         ctx: MPCacheServerContext,
         load_policy: KVLoadPolicy = _DEFAULT_LOAD_POLICY,
+        prefill_lease_timeout_s: float = 0.0,
     ) -> None:
         self._ctx = ctx
         self._load_policy = load_policy
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # Prefill leases and the deferred lookups' submit callbacks, both
+        # guarded by _prefetch_job_lock; None when leases are disabled.
+        self._leases: PrefillLeaseTable | None = (
+            PrefillLeaseTable(
+                prefill_lease_timeout_s,
+                self._is_resident,
+                lambda rid: ctx.session_manager.get(rid) is not None,
+            )
+            if prefill_lease_timeout_s > 0
+            else None
+        )
+        self._lookups_since_sweep = 0
+        self._deferred: dict[str, Callable[[], None]] = {}
         self._setup_metrics()
 
     @property
@@ -177,15 +208,21 @@ class LookupModule(DiscoverableModule):
         """Return the shared engine context. Exposed for testing only."""
         return self._ctx
 
-    def report_status(self) -> dict[str, int]:
+    def report_status(self) -> dict[str, float]:
         """Return module-specific status information.
 
         Returns:
             Dictionary with the count of active prefetch jobs.
         """
-        return {
-            "active_prefetch_jobs": self._active_prefetch_count(),
+        status: dict[str, float] = {
+            "active_prefetch_jobs": self._active_prefetch_count()
         }
+        if self._leases is not None:
+            with self._prefetch_job_lock:
+                status.update(
+                    {f"prefill_lease_{k}": v for k, v in self._leases.stats().items()}
+                )
+        return status
 
     def close(self) -> None:
         """Release resources owned by this module (no-op)."""
@@ -371,6 +408,65 @@ class LookupModule(DiscoverableModule):
                 shard_replication_desc,
             ),
         )
+        # Sliding-window rows do not store every chunk, so only full-attention
+        # rows name a chunk's lease.
+        lease_keys_by_chunk = tuple(
+            tuple(
+                row.keys[i]
+                for row in spec.key_groups
+                if row.sliding_window_size == FULL_ATTENTION_WINDOW_CHUNKS
+            )
+            for i in range(len(suffix_hashes))
+        )
+        submit = partial(
+            self._submit_prefetch,
+            key,
+            spec,
+            looked_up_tokens,
+            attn_desc,
+            start_chunk,
+            model_name,
+            lease_keys_by_chunk,
+        )
+        # Clients that do not name their engine (no engine hint) cannot tell
+        # their own siblings apart, so they take no part in leases.
+        engine = (key.request_configs or {}).get("lmcache.hint.engine_id")
+        if self._leases is not None and engine is not None:
+            lease_keys = [k for chunk in lease_keys_by_chunk for k in chunk]
+            with self._prefetch_job_lock:
+                # Owners reaped without END_SESSION; amortized over lookups.
+                self._lookups_since_sweep += 1
+                if self._lookups_since_sweep >= _LEASE_SWEEP_EVERY:
+                    self._lookups_since_sweep = 0
+                    self._sweep_leases()
+                if lease_keys and not self._leases.acquire_or_wait(
+                    key.request_id, lease_keys, str(engine)
+                ):
+                    self._deferred[key.request_id] = submit
+                    return
+        submit()
+
+    def _submit_prefetch(
+        self,
+        key: IPCCacheServerKey,
+        spec: PrefetchTaskSpec,
+        looked_up_tokens: int,
+        attn_desc: AttnWindowDesc,
+        start_chunk: int,
+        model_name: str,
+        lease_keys_by_chunk: tuple[tuple[ObjectKey, ...], ...],
+    ) -> None:
+        """Submit the lookup's prefetch and register its job.
+
+        Args:
+            key: The lookup's cache key.
+            spec: The prefetch over the looked-up range.
+            looked_up_tokens: Hit-rate denominator tokens.
+            attn_desc: The request's attention window descriptor.
+            start_chunk: First chunk of the looked-up range.
+            model_name: The request's model.
+            lease_keys_by_chunk: Prefill-lease keys of each looked-up chunk.
+        """
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
             external_request_id=key.request_id,
@@ -378,6 +474,7 @@ class LookupModule(DiscoverableModule):
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
+                lease_keys_by_chunk=lease_keys_by_chunk,
                 row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
                 request_id=key.request_id,
                 requested_tokens=looked_up_tokens,
@@ -416,6 +513,8 @@ class LookupModule(DiscoverableModule):
             0 if the request_id is unknown (already completed and consumed,
             or invalid).
         """
+        if self._still_deferred(request_id):
+            return None
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
         if job is None:
@@ -447,7 +546,11 @@ class LookupModule(DiscoverableModule):
         Returns:
             Chunk count (int) when done, None if the wait timed out, 0 if the
             request_id is unknown (already completed and consumed, or invalid).
+            A lookup deferred by a prefill lease returns None at once: blocking
+            here would hold the handler thread the lease owner's requests need.
         """
+        if self._still_deferred(request_id):
+            return None
         with self._prefetch_job_lock:
             job = self._prefetch_jobs.get(request_id)
         if job is None:
@@ -581,6 +684,10 @@ class LookupModule(DiscoverableModule):
             )
         )
         session = self._ctx.session_manager.remove(request_id)
+        if self._leases is not None:
+            with self._prefetch_job_lock:
+                self._deferred.pop(request_id, None)
+                self._leases.forget(request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,
@@ -639,6 +746,50 @@ class LookupModule(DiscoverableModule):
             shard_replication_desc,
         )
         return [obj_key for group_keys in per_group for obj_key in group_keys]
+
+    def _still_deferred(self, request_id: str) -> bool:
+        """Return whether ``request_id``'s lookup still waits on a prefill
+        lease; submit its prefetch once the wait is over.
+
+        Args:
+            request_id: The request being polled.
+
+        Returns:
+            True while the lookup is deferred or its prefetch is being
+            submitted by another poll.
+        """
+        if self._leases is None:
+            return False
+        with self._prefetch_job_lock:
+            submit = self._deferred.get(request_id)
+            if submit is None:
+                return False
+            if submit is _SUBMITTING or not self._leases.ready(request_id):
+                return True
+            self._deferred[request_id] = _SUBMITTING
+        try:
+            submit()
+        finally:
+            with self._prefetch_job_lock:
+                self._deferred.pop(request_id, None)
+        return False
+
+    def _sweep_leases(self) -> None:
+        """Drop leases and deferred lookups of requests whose session is
+        gone without END_SESSION (reaped). Caller holds _prefetch_job_lock."""
+        assert self._leases is not None
+        self._leases.sweep()
+        for request_id in [
+            rid
+            for rid, submit in self._deferred.items()
+            if submit is not _SUBMITTING and self._ctx.session_manager.get(rid) is None
+        ]:
+            del self._deferred[request_id]
+            self._leases.forget(request_id)
+
+    def _is_resident(self, key: ObjectKey) -> bool:
+        """Return whether ``key`` is resident in any L1 manager."""
+        return any(m.is_resident(key) for m in self._ctx.storage_manager.l1_managers())
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
@@ -729,6 +880,18 @@ class LookupModule(DiscoverableModule):
         # attributed on it, so the covered prefix never counts as an L1 hit.
         l1_chunks = min(l1_found_count, found_count)
         l2_chunks = found_count - l1_chunks
+        if self._leases is not None and job.lease_keys_by_chunk:
+            # Only the chunks this request misses stay leased to it.
+            with self._prefetch_job_lock:
+                self._leases.release(
+                    job.request_id,
+                    [
+                        k
+                        for chunk in job.lease_keys_by_chunk[:found_count]
+                        for k in chunk
+                    ],
+                )
+
         # The engine resolves the hit in absolute chunks; shift it back.
         found_count += job.start_chunk
 

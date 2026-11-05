@@ -959,6 +959,20 @@ class BaseL1Manager(L1ManagerInterface):
             staging_count,
         )
 
+    def is_resident(self, key: ObjectKey) -> bool:
+        """Return whether ``key`` has a resident object.
+
+        Takes no lock and notifies no listener; a staging object does not
+        count.
+
+        Args:
+            key: The object key to check.
+
+        Returns:
+            True if a resident object exists for ``key``.
+        """
+        return key in self._objects
+
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).
 
