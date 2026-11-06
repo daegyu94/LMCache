@@ -597,6 +597,10 @@ class LMCacheMPSchedulerAdapter:
         # once resolved, so repeated checks return the same value after the
         # server has handed the hit count over (exactly once).
         self._lookups: dict[str, LookupState] = {}
+        # Names this engine in its lookups so the server's prefill leases
+        # make only requests of other engines wait (this engine's prefix
+        # cache already shares a prompt among its own requests).
+        self._engine_id = uuid.uuid4().hex
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -1022,6 +1026,10 @@ class LMCacheMPSchedulerAdapter:
         """
         # NOTE: for the scheduler adapter, we don't have a worker id,
         # so we set it to None in the key.
+        request_configs = {
+            **(request_configs or {}),
+            "lmcache.hint.engine_id": self._engine_id,
+        }
         return IPCCacheServerKey(
             model_name=self.model_name,
             world_size=self.world_size,

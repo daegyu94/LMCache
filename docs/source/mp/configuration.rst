@@ -55,6 +55,8 @@ engine.  Load policies receive the request configs as sent.  The vLLM
 adapter add ``lmcache.hint.engine_computed_tokens``, the tokens the engine
 already holds in its own prefix cache, to their lookups.  vLLM omits it on
 eager-prefetch lookups, which run before vLLM checks its prefix cache.
+The vLLM ``LMCacheMPConnector`` also adds ``lmcache.hint.engine_id``, which
+names its engine for ``--prefill-lease-timeout-seconds``.
 
 MP Server
 ---------
@@ -231,6 +233,17 @@ Source: ``lmcache/v1/multiprocess/config.py``
        ``package.module:ClassName`` value loads a custom
        ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass from
        the server's environment, constructed with ``--runtime-plugin-config``.
+   * - ``--prefill-lease-timeout-seconds``
+     - ``0.0``
+     - Enables prefill leases when positive: a lookup that needs chunks a
+       request of another vLLM engine is about to compute waits for them to be
+       stored instead of computing them too, and gives up after this many
+       seconds without that request storing any of them. Use it when samples of
+       one prompt (e.g. an RL group) are spread over engines that share this
+       server and every engine stores its prefills. A waiting request starts
+       later, so it trades time to first token for rollout throughput. Enable
+       ``lmcache.mp.coalesce_sibling_loads`` on the engines with it. ``0``
+       disables leases.
    * - ``--enable-segmented-prefix``
      - ``False``
      - CacheBlend (``--engine-type blend``) only: on a mid-prefix L2 retrieve
@@ -1093,6 +1106,13 @@ from the in-process connector's ``save_decode_cache`` YAML/environment setting.
        LMCache (``kv_connector_module_path``): it drops the server's
        mapping of the KV cache before vLLM releases the memory, and maps
        the new memory on wake-up.
+   * - ``lmcache.mp.coalesce_sibling_loads``
+     - ``false``
+     - A request whose LMCache hit another request of this engine is loading
+       waits for that load and then shares its blocks through vLLM's prefix
+       cache, instead of loading its own copy. Enable it together with
+       ``--prefill-lease-timeout-seconds``, which releases many such requests at
+       once. Has no effect without vLLM prefix caching.
    * - ``lmcache.mp.lazy_offload``
      - ``false``
      - Buffer stores on the scheduler and submit them according to the

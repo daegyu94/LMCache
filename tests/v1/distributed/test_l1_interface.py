@@ -105,6 +105,14 @@ def test_write_commit_read_release(l1: L1ManagerInterface) -> None:
     assert listener.read_finished == [key(1)]
 
 
+def test_is_resident_only_after_the_write_commits(l1: L1ManagerInterface) -> None:
+    assert not l1.is_resident(key(1))
+    assert l1.reserve_write([key(1)], [False], LAYOUT)[key(1)][0] is L1Error.SUCCESS
+    assert not l1.is_resident(key(1))
+    assert l1.finish_write([key(1)]) == {key(1): L1Error.SUCCESS}
+    assert l1.is_resident(key(1))
+
+
 def test_aborted_write_is_never_readable(l1: L1ManagerInterface) -> None:
     assert l1.reserve_write([key(2)], [False], LAYOUT)[key(2)][0] is L1Error.SUCCESS
     assert l1.finish_write_and_delete([key(2)]) == {key(2): L1Error.SUCCESS}

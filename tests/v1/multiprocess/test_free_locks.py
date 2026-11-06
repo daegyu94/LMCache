@@ -466,7 +466,10 @@ def test_adapter_free_lookup_locks_sends_request(
     assert key.worker_id is None
     assert key.model_name == "test_model"
     assert key.request_id == "req-1"
-    assert key.request_configs == {"lmcache.skip_save": True}
+    # The scheduler adapter also names its engine for prefill leases.
+    assert key.request_configs is not None
+    assert key.request_configs["lmcache.skip_save"] is True
+    assert set(key.request_configs) == {"lmcache.skip_save", "lmcache.hint.engine_id"}
     assert tp_size == 1
     assert extra_ranges == ((256, 512),)
 

@@ -42,11 +42,13 @@ def _make_ctx(wait_result=True, found=None):
 
 def _make_module(ctx):
     # Bypass __init__ (which wires up otel metrics needing a full context); the
-    # handler methods only touch _ctx, _prefetch_jobs, and _prefetch_job_lock.
+    # handler methods only touch _ctx, the job and lease maps, and their lock.
     module = object.__new__(LookupModule)
     module._ctx = ctx
     module._prefetch_jobs = {}
     module._prefetch_job_lock = threading.Lock()
+    module._leases = None
+    module._deferred = {}
     return module
 
 

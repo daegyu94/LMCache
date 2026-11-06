@@ -97,6 +97,9 @@ def _scheduler_connector(scheduler_adapter: MagicMock) -> LMCacheMPConnector:
     scheduler_adapter.lmcache_tokens_per_chunk = 64
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
     connector.request_trackers = {}
+    connector._loading_prefixes = {}
+    connector._prefix_key_of = {}
+    connector._coalesce_sibling_loads = False
     connector.scheduler_adapter = scheduler_adapter
     connector._reserve_last_token_for_lookup = False
     connector.lazy_offload = False
