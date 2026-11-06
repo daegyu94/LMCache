@@ -137,11 +137,19 @@ afterwards.
 3. **Plan** (`_plan_load`). Call `policy.plan_load` on the two maps. Release
    every L1 lock and every L2 lock outside the plan, then set both locked maps
    to the plan.
-3a. **Lock landed keys** (`"prefix"` only). A planned L2 cell whose key became
-   resident in its affinity L1 manager after the lock pass (another request's
-   load landed during this request's lookup) is read-locked there
-   (`_lock_landed_keys`) and leaves the L2 plan, instead of failing to reserve
-   as `l1_contended`.
+3a. **Reuse landed and in-flight loads** (`"prefix"` only). A planned L2
+   cell whose key became resident in its affinity L1 manager after the lock
+   pass (another request's load landed during this request's lookup) is
+   read-locked there (`_lock_landed_keys`) and leaves the L2 plan, instead of
+   failing to reserve as `l1_contended`. A planned cell whose key another
+   in-flight request is loading from the same L2 adapter into the same L1
+   manager is *joined* (`_find_inflight_loads`): it gets no buffer and no
+   load, keeps its L2 lock through the replan of step 4, then returns it and
+   waits on that load (`_wait_for_inflight_loads`). The key is read from L2
+   once (single-flight) however many requests need it. A waiter finishes only
+   when the loader's whole load task lands, so a request joins only loaders
+   whose outstanding load from that adapter is at most
+   `_MAX_JOIN_LOAD_RATIO` (2) times what it would load itself.
 4. **Reserve** (`_transition_to_load_phase`). For each L2 adapter in the plan,
    `reserve_write` staging buffers in its affinity L1 manager under a
    per-request write tag, with retention decided per key by
@@ -157,8 +165,13 @@ afterwards.
    and the request's `l2_loaded_cells`; failed keys are deleted
    (`finish_write_and_delete`, `L2_PREFETCH_FAILED` reason `not_found`); the
    adapter's L2 locks are returned and its entries leave `l2_locked_keys` and
-   `l1_reserved_keys`.
-7. **Finish** (`_finish_request`), once no load task is outstanding. Fold the
+   `l1_reserved_keys`. Requests waiting on these keys are then served
+   (`_serve_waiters`): an admitted key is read-locked for each waiter and
+   counts as its L2 hit; a failed key is a miss for the waiter too. A loader
+   retired without admitting (aborted) fails its waiters the same way.
+7. **Finish** (`_finish_request`), once no load task is outstanding and no
+   joined cell is still waiting; a waiter served by another request finishes
+   at the end of that loop iteration (`_finish_ready_waiters`). Fold the
    merged `l1_locked_keys` (`fold_unfold_grouped`, prefix fetching only; `full`
    keeps every locked cell). Release every L1 lock outside the hit, or every L1
    lock under `NO_LOCK`. Touch the hit keys. Publish the `PrefetchResult` with
@@ -173,8 +186,8 @@ policy assigned to an L2 adapter, "hit" is the final folded prefix:
 | lock pass | L1 read lock | - | L1 read lock if resident | L1 read lock if resident |
 | lookup | L1 read lock | L2 lock | L2 lock if found | L2 lock if found |
 | plan | L1 read lock | L2 lock | released | released |
-| reserve | L1 read lock | L2 lock + staging buffer (`l1_oom` / `l1_contended` cells: L2 lock returned, replanned); landed key: L1 read lock | - | - |
-| admit | L1 read lock | loaded: L1 read lock, L2 lock returned; failed: buffer deleted | - | - |
+| reserve | L1 read lock | L2 lock + staging buffer (`l1_oom` / `l1_contended` cells: L2 lock returned, replanned); landed key: L1 read lock; joined key: L2 lock returned, waits | - | - |
+| admit | L1 read lock | loaded: L1 read lock, L2 lock returned; failed: buffer deleted; joined key: L1 read lock when the loader admits it | - | - |
 | finish | L1 read lock if in hit, else released | L1 read lock if in hit, else released | - | - |
 
 Under `NO_LOCK` the finish row releases every L1 lock; loaded objects stay
@@ -240,8 +253,20 @@ Gauges: `lmcache_mp.num_inflight_l2_loads`,
   request L1 alone serves, so a chunk hot in L1 can age out of L2 first.
 - **Write conflicts under `"full"` are misses.** Under `"prefix"` a key that
   became resident during the lookup is read-locked (step 3a). Under `"full"`
-  it still fails reservation (`l1_contended`) and is reported as a miss: the
-  whole-column trim counts reserved cells only.
+  it still fails reservation (`l1_contended`) and is reported as a miss, and
+  `"full"` requests never join an in-flight load: the whole-column trim
+  counts reserved cells only.
+- **Waiters inherit the loader's object.** A joined key is the loader's
+  admitted object, with the loader's retention: a temporary object is deleted
+  when the last reader finishes even if the waiter's own plan would have kept
+  it.
+- **Single-flight needs both requests admitted.** Under L1 pressure the
+  admission watermark can hold the second request in the pending queue until
+  the first load lands; it then finds the key resident (an L1 hit) or, if it
+  was already released, loads it again.
+- **One loader per key.** Only the first request loading a key is
+  registered; a second load of the same key into another L1 manager (multi-L1)
+  is not joinable.
 - **Uniform rows.** Every key group has the same number of keys.
 
 ## Contract-anchoring tests
@@ -255,6 +280,9 @@ with a real `DramL1Manager` and `MockL2Adapter`:
   request replans (`"prefix"` shortens the hit, `"full"` keeps the other
   cells); under `"prefix"` a key admitted after the lock pass is read-locked,
   under `"full"` it is dropped; an L1 hit survives a racing evictor.
+- `TestSingleFlightLoads` — a request whose keys another request is loading
+  waits for that load and L2 serves each key once; only the overlap is
+  shared; a key the loader fails to load is a miss for the waiter.
 - `TestLockModeAndRetention` — `NO_LOCK` releases every L1 lock at finish and
   leaves loaded objects permanent; `"default"` deletes loaded keys after the
   retrieve, `"retain"` keeps them.

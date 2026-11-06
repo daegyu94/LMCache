@@ -77,6 +77,11 @@ logger = init_logger(__name__)
 # Poll timeout in milliseconds for the prefetch loop
 PREFETCH_LOOP_POLL_TIMEOUT_MS = 500
 
+# A request joins another request's in-flight L2 load only when that load is
+# at most this many times the bytes it would load from the adapter itself:
+# waiting bounds its latency by the loader's whole task, not by its own keys.
+_MAX_JOIN_LOAD_RATIO = 2
+
 PrefetchRequestId = int
 
 # Helper functions
@@ -422,6 +427,15 @@ class PrefetchPhase(enum.Enum):
 
 
 @dataclass
+class _KeyLoad:
+    """The in-flight L2 load of one key."""
+
+    request_id: PrefetchRequestId
+    l2_idx: int
+    l1_idx: int
+
+
+@dataclass
 class InFlightPrefetchRequest:
     """Tracks a single prefetch request across its lifecycle phases."""
 
@@ -455,6 +469,11 @@ class InFlightPrefetchRequest:
     # Cells loaded from L2 so far, one row per key group; empty until the
     # first load result is admitted.
     l2_loaded_cells: Bitmap2D = field(default_factory=lambda: Bitmap2D([]))
+
+    # Cells another in-flight request is loading from L2 into the same L1
+    # manager: key -> (L1 manager index, row, column). Each is read-locked
+    # when that load lands instead of being loaded a second time.
+    waiting_keys: dict[ObjectKey, tuple[int, int, int]] = field(default_factory=dict)
 
     # private fields
     _flattened_keys: list[ObjectKey] = field(init=False, repr=False)
@@ -492,8 +511,9 @@ class InFlightPrefetchRequest:
         return not self.inflight_lookup_tasks
 
     def all_loads_done(self) -> bool:
-        """Return whether every submitted L2 load task has reported."""
-        return not self.inflight_load_tasks
+        """Return whether every submitted L2 load task has reported and no
+        cell still waits on another request's load."""
+        return not self.inflight_load_tasks and not self.waiting_keys
 
 
 class PrefetchController(StorageControllerInterface):
@@ -511,7 +531,9 @@ class PrefetchController(StorageControllerInterface):
        releases every lock outside the plan.
     4. Reserves L1 staging buffers for the L2 plan; on reservation failures
        it drops the affected L2 locks and re-plans on what is reserved.
-    5. Submits one load task per L2 adapter.
+    5. Submits one load task per L2 adapter. A ``"prefix"`` cell another
+       request is loading from the same adapter into the same L1 manager is
+       not loaded again: it waits for that load (single-flight).
     6. As each load task completes, admits the loaded objects into L1 as
        read-locked, deletes the buffers of failed loads, and returns that
        adapter's L2 locks.
@@ -580,6 +602,13 @@ class PrefetchController(StorageControllerInterface):
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
         self._pending_queue: deque[tuple[PrefetchRequestId, PrefetchTaskSpec]] = deque()
+
+        # Single-flight L2 loads (background thread only): the load of each
+        # key, the requests waiting on it, and waiters whose last wait has
+        # been served.
+        self._loading_keys: dict[ObjectKey, _KeyLoad] = {}
+        self._key_waiters: dict[ObjectKey, list[PrefetchRequestId]] = {}
+        self._ready_waiters: set[PrefetchRequestId] = set()
 
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
@@ -974,6 +1003,10 @@ class PrefetchController(StorageControllerInterface):
                         )
                         self._abort_request(request)
 
+            # Before starting pending requests: a finished waiter can release
+            # L1 budget the head of the queue is waiting for.
+            self._finish_ready_waiters()
+
             try:
                 self._start_pending_requests()
             except Exception:
@@ -1052,8 +1085,8 @@ class PrefetchController(StorageControllerInterface):
             Membership in ``l2_locked_keys`` keeps an adapter attached until
             the request has returned its L2 read locks; the entry is removed
             when the adapter's load result is admitted. A request whose cells
-            of an adapter all landed in L1 keeps an empty entry until it
-            finishes, so it delays a drain only that long.
+            of an adapter all joined another load or landed in L1 keeps an
+            empty entry until it finishes, so it delays a drain only that long.
         """
         for request in self._in_flight_requests.values():
             if (
@@ -1367,8 +1400,10 @@ class PrefetchController(StorageControllerInterface):
         self._plan_load(request, active_l2_descs)
 
         # Step 2.5: cells another request's load has landed are read-locked
-        # in L1 instead of failing to reserve.
+        # in L1; cells another request is still loading are joined: they get
+        # no buffer and no load, but keep their L2 locks until step 6.
         self._lock_landed_keys(request)
+        joined = self._find_inflight_loads(request)
 
         # Step 3: reserve L1 write buffers for the planned L2 keys
         # with L1-L2 affinity.
@@ -1377,7 +1412,7 @@ class PrefetchController(StorageControllerInterface):
         reserved_objs: dict[ObjectKey, "MemoryObj"] = {}
         num_failed_reservations = 0
 
-        cells_by_l1, retain = self._build_l1_allocation_plans(request)
+        cells_by_l1, retain = self._build_l1_allocation_plans(request, joined)
         for l1_idx, cells in cells_by_l1.items():
             success, objs, l1_failed_count = _reserve_l1_cells(
                 self._l1_managers[l1_idx], request.key_groups, cells, retain, tag
@@ -1410,7 +1445,10 @@ class PrefetchController(StorageControllerInterface):
             l2_locked_keys_new = MapState()
             for l2_idx, bitmap2d in states.l2_locked_keys.items():
                 l1_idx = self._get_l2_affinity_manager(l2_idx)
-                l2_locked_keys_new[l2_idx] = bitmap2d & l1_reserved_keys[l1_idx]
+                kept = l1_reserved_keys[l1_idx]
+                if l2_idx in joined:
+                    kept = kept + joined[l2_idx]
+                l2_locked_keys_new[l2_idx] = bitmap2d & kept
 
             l2_keys_to_unlock = states.l2_locked_keys - l2_locked_keys_new
             for l2_idx, bitmap2d in l2_keys_to_unlock.items():
@@ -1423,6 +1461,14 @@ class PrefetchController(StorageControllerInterface):
             #         by the replan also owns a staging buffer in its affinity
             #         L1 manager, which is deleted here.
             l2_dropped = self._plan_load(request, active_l2_descs)
+            for l2_idx, grid in joined.items():
+                # A joined cell the replan dropped has no buffer to delete.
+                if l2_idx in l2_dropped:
+                    l2_dropped[l2_idx] -= grid
+                if l2_idx in states.l2_locked_keys:
+                    joined[l2_idx] = grid & states.l2_locked_keys[l2_idx]
+                else:
+                    joined[l2_idx] = grid.zeros_like()
             for l2_idx, bitmaps in l2_dropped.items():
                 keys = _gather_keys(request.key_groups, bitmaps)
                 if not keys:
@@ -1433,7 +1479,9 @@ class PrefetchController(StorageControllerInterface):
                     reserved_objs.pop(key, None)
                 states.l1_reserved_keys[l1_idx] -= bitmaps
 
-        # Step 6: submit the load tasks to L2 adapters
+        # Step 6: the joined cells leave the L2 plan and wait on their
+        # loaders (which hold their own L2 locks); the rest is loaded.
+        self._wait_for_inflight_loads(request, joined)
         self._submit_load_tasks(request, reserved_objs)
 
     def _submit_load_tasks(
@@ -1460,6 +1508,11 @@ class PrefetchController(StorageControllerInterface):
             task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
             request.inflight_load_tasks[l2_idx] = task_id
             plan_keys.extend(keys)
+            l1_idx = self._get_l2_affinity_manager(l2_idx)
+            for key in keys:
+                self._loading_keys.setdefault(
+                    key, _KeyLoad(request.request_id, l2_idx, l1_idx)
+                )
 
             # Groups may differ in object size, so sum per object.
             total_bytes = sum(obj.get_size() for obj in objects)
@@ -1505,8 +1558,7 @@ class PrefetchController(StorageControllerInterface):
         plan: reserving them would fail as ``l1_contended`` and turn a
         resident chunk into a miss.
 
-        Only ``"prefix"`` requests do this: the whole-column trim of ``"full"``
-        counts reserved cells only.
+        Only ``"prefix"`` requests do this, like ``_find_inflight_loads``.
 
         Args:
             request: The request entering the load phase; its L2 locked map
@@ -1548,14 +1600,200 @@ class PrefetchController(StorageControllerInterface):
             else:
                 states.l1_locked_keys[l1_idx] = landed
 
+    def _find_inflight_loads(self, request: InFlightPrefetchRequest) -> MapState:
+        """Return the planned L2 cells the request should join instead of
+        loading: another in-flight request is loading the key from the same
+        L2 adapter into the same L1 manager, so the key is read from L2 once
+        (single-flight).
+
+        A waiter finishes only when the loader's whole load task lands, so a
+        request joins only loaders whose outstanding load from that adapter
+        is at most ``_MAX_JOIN_LOAD_RATIO`` times what the request would load
+        from it itself; a short prefix does not wait on a long document.
+        Only ``"prefix"`` requests join: the whole-column trim of ``"full"``
+        counts reserved cells only.
+
+        Args:
+            request: The request entering the load phase; its L2 locked map
+                is the plan.
+
+        Returns:
+            The cells to join per L2 adapter. They stay in the L2 plan (and
+            keep their L2 locks) until ``_wait_for_inflight_loads``.
+        """
+        joined = MapState()
+        # NO_LOCK promises resident objects; a loader's temporary one is not.
+        if (
+            request.fetching_policy != "prefix"
+            or request.lock_mode == PrefetchLockMode.NO_LOCK
+            or not self._loading_keys
+        ):
+            return joined
+        for l2_idx, cells in request.key_states.l2_locked_keys.items():
+            l1_idx = self._get_l2_affinity_manager(l2_idx)
+            own_bytes = sum(
+                row.popcount()
+                * get_size_bytes(group.layout_desc.shapes, group.layout_desc.dtypes)
+                for group, row in zip(request.key_groups, cells, strict=True)
+            )
+            grid = cells.zeros_like()
+            for row_id, (group, row) in enumerate(
+                zip(request.key_groups, cells, strict=True)
+            ):
+                for col in row.get_indices_list():
+                    loader = self._loading_keys.get(group.keys[col])
+                    if loader is None or (loader.l2_idx, loader.l1_idx) != (
+                        l2_idx,
+                        l1_idx,
+                    ):
+                        continue
+                    loader_bytes = self._in_flight_requests[
+                        loader.request_id
+                    ].load_bytes_by_adapter.get(l2_idx, 0)
+                    if loader_bytes <= _MAX_JOIN_LOAD_RATIO * own_bytes:
+                        grid[row_id].set(col)
+            if grid.popcount() > 0:
+                joined[l2_idx] = grid
+        return joined
+
+    def _wait_for_inflight_loads(
+        self, request: InFlightPrefetchRequest, joined: MapState
+    ) -> None:
+        """Take the joined cells out of the L2 plan, return their L2 locks
+        (each loader holds its own) and register the request as a waiter on
+        their keys.
+
+        Args:
+            request: The request whose joined cells wait.
+            joined: The cells from ``_find_inflight_loads``, trimmed to the
+                final plan.
+        """
+        states = request.key_states
+        for l2_idx, grid in joined.items():
+            keys = _gather_keys(request.key_groups, grid)
+            if not keys:
+                continue
+            states.l2_locked_keys[l2_idx] -= grid
+            self._l2_adapters[l2_idx].submit_unlock(keys)
+            l1_idx = self._get_l2_affinity_manager(l2_idx)
+            for row_id, (group, row) in enumerate(
+                zip(request.key_groups, grid, strict=True)
+            ):
+                for col in row.get_indices_list():
+                    key = group.keys[col]
+                    request.waiting_keys[key] = (l1_idx, row_id, col)
+                    self._key_waiters.setdefault(key, []).append(request.request_id)
+        if request.waiting_keys:
+            logger.debug(
+                "Prefetch request %d: waits on %d keys other requests are loading",
+                request.request_id,
+                len(request.waiting_keys),
+            )
+
+    def _serve_waiters(
+        self,
+        loader_id: PrefetchRequestId,
+        keys: list[ObjectKey],
+        admitted: set[ObjectKey],
+    ) -> None:
+        """Hand the outcome of ``loader_id``'s load of ``keys`` to the
+        requests waiting on it.
+
+        A key the load admitted is read-locked for each waiter and counts as
+        its L2 hit; a failed key is dropped from the waiter's plan (a miss).
+
+        Args:
+            loader_id: The request whose load finished or was abandoned.
+            keys: The keys the load covered.
+            admitted: The keys the load admitted into L1.
+        """
+        # waiter id -> (L1 index, row) -> [(key, column)] to lock in one call
+        served: dict[
+            PrefetchRequestId, dict[tuple[int, int], list[tuple[ObjectKey, int]]]
+        ] = {}
+        for key in keys:
+            load = self._loading_keys.get(key)
+            if load is None or load.request_id != loader_id:
+                continue
+            del self._loading_keys[key]
+            for waiter_id in self._key_waiters.pop(key, []):
+                waiter = self._in_flight_requests.get(waiter_id)
+                if waiter is None or key not in waiter.waiting_keys:
+                    continue
+                l1_idx, row_id, col = waiter.waiting_keys.pop(key)
+                if key in admitted:
+                    served.setdefault(waiter_id, {}).setdefault(
+                        (l1_idx, row_id), []
+                    ).append((key, col))
+                if not waiter.waiting_keys:
+                    self._ready_waiters.add(waiter_id)
+        for waiter_id, by_row in served.items():
+            waiter = self._in_flight_requests[waiter_id]
+            for (l1_idx, row_id), entries in by_row.items():
+                self._lock_served_keys(waiter, l1_idx, row_id, entries)
+
+    def _lock_served_keys(
+        self,
+        waiter: InFlightPrefetchRequest,
+        l1_idx: int,
+        row_id: int,
+        entries: list[tuple[ObjectKey, int]],
+    ) -> None:
+        """Read-lock keys of one row another request just admitted and record
+        them as the waiter's L2 hits; a key already gone again stays a miss.
+
+        Args:
+            waiter: The request the keys were loaded for.
+            l1_idx: The L1 manager holding the keys.
+            row_id: The waiter's row the keys belong to.
+            entries: ``(key, column)`` pairs of that row.
+        """
+        group = waiter.key_groups[row_id]
+        result = self._l1_managers[l1_idx].reserve_read(
+            [key for key, _ in entries], group.num_kv_readers
+        )
+        cells = Bitmap2D.zeros(len(waiter.key_groups), len(group.keys))
+        for key, col in entries:
+            if result[key][0] == L1Error.SUCCESS:
+                cells[row_id].set(col)
+        states = waiter.key_states
+        if l1_idx in states.l1_locked_keys:
+            states.l1_locked_keys[l1_idx] += cells
+        else:
+            states.l1_locked_keys[l1_idx] = cells
+        if len(waiter.l2_loaded_cells) == 0:
+            waiter.l2_loaded_cells = cells.copy()
+        else:
+            waiter.l2_loaded_cells += cells
+
+    def _finish_ready_waiters(self) -> None:
+        """Finish the requests whose last wait on another request's load was
+        served and that have no load of their own outstanding."""
+        ready, self._ready_waiters = self._ready_waiters, set()
+        for request_id in ready:
+            request = self._in_flight_requests.get(request_id)
+            if request is None or not request.all_loads_done():
+                continue
+            try:
+                self._finish_request(request)
+                self._retire_request(request)
+            except Exception:
+                logger.exception(
+                    "Unexpected error finishing prefetch request %d; aborting it",
+                    request_id,
+                )
+                self._abort_request(request)
+
     def _build_l1_allocation_plans(
-        self, request: InFlightPrefetchRequest
+        self, request: InFlightPrefetchRequest, joined: MapState
     ) -> tuple[dict[int, Bitmap2D], dict[ObjectKey, bool]]:
         """Group the request's L2 load plan by the L1 manager that will
         receive each adapter's keys, deciding retention along the way.
 
         Args:
             request: The in-flight request whose L2 plan is grouped.
+            joined: Planned cells another request is loading; they get no
+                buffer.
 
         Returns:
             A tuple of allocation plan and retention plan. More specifically:
@@ -1569,6 +1807,8 @@ class PrefetchController(StorageControllerInterface):
         cells_by_l1: dict[int, Bitmap2D] = {}
         retain: dict[ObjectKey, bool] = {}
         for l2_idx, planned in request.key_states.l2_locked_keys.items():
+            if l2_idx in joined:
+                planned = planned - joined[l2_idx]
             l1_idx = self._get_l2_affinity_manager(l2_idx)
             keys = _gather_keys(request.key_groups, planned)
             if request.lock_mode == PrefetchLockMode.NO_LOCK:
@@ -1679,6 +1919,9 @@ class PrefetchController(StorageControllerInterface):
             del states.l2_locked_keys[adapter_idx]
             del request.inflight_load_tasks[adapter_idx]
             request.load_bytes_by_adapter.pop(adapter_idx, None)
+            self._serve_waiters(
+                request.request_id, loaded_keys + failed_keys, set(loaded_keys)
+            )
 
             self._event_bus.publish(
                 Event(
@@ -1828,8 +2071,12 @@ class PrefetchController(StorageControllerInterface):
         self._retire_request(request)
 
     def _retire_request(self, request: InFlightPrefetchRequest) -> None:
-        """Remove a finished request from the in-flight table."""
+        """Remove a finished request from the in-flight table, failing the
+        waiters of any load it never admitted (an aborted request)."""
         self._in_flight_requests.pop(request.request_id, None)
+        # Only a request with a load still outstanding has unserved keys.
+        if request.inflight_load_tasks:
+            self._serve_waiters(request.request_id, request.get_flattened_keys(), set())
 
     def _release_all_locks(self, request: InFlightPrefetchRequest) -> None:
         """Return every lock and buffer the request's key states record.

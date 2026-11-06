@@ -1198,6 +1198,299 @@ class TestL1AndL2:
 
 
 # =============================================================================
+# Concurrent requests for keys an in-flight request is loading
+# =============================================================================
+
+
+class CountingL2Adapter(MockL2Adapter):
+    """Mock adapter that records every key submitted for loading and can
+    report chosen keys as failed loads."""
+
+    def __init__(self, bandwidth_gb: float, fail_keys: tuple[ObjectKey, ...] = ()):
+        super().__init__(
+            MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=bandwidth_gb)
+        )
+        self.loaded_keys: list[ObjectKey] = []
+        self._fail_keys = set(fail_keys)
+        self._task_keys: dict[L2TaskId, list[ObjectKey]] = {}
+
+    def submit_load_task(self, keys, objects):
+        self.loaded_keys.extend(keys)
+        task_id = super().submit_load_task(keys, objects)
+        self._task_keys[task_id] = list(keys)
+        return task_id
+
+    def query_load_result(self, task_id):
+        result = super().query_load_result(task_id)
+        if result is not None:
+            for i, key in enumerate(self._task_keys.pop(task_id)):
+                if key in self._fail_keys:
+                    result.clear(i)
+        return result
+
+
+def submit_while_loading(
+    ctrl: PrefetchController,
+    adapter: CountingL2Adapter,
+    first: list[ObjectKey],
+    second: list[ObjectKey],
+    second_readers: int = 1,
+) -> tuple[PrefetchResult | None, PrefetchResult | None]:
+    """Submit ``second`` once ``first``'s L2 load is in flight; return both
+    results."""
+    first_id = ctrl.submit_prefetch_request(single_row_spec(first))
+    assert wait_for_condition(lambda: len(adapter.loaded_keys) > 0)
+    second_id = ctrl.submit_prefetch_request(
+        single_row_spec(second, num_kv_readers=second_readers)
+    )
+    return (
+        wait_for_result(ctrl, first_id, timeout=10.0),
+        wait_for_result(ctrl, second_id, timeout=10.0),
+    )
+
+
+def assert_loaded_once(adapter: CountingL2Adapter, keys: list[ObjectKey]) -> None:
+    """Assert the adapter was asked to load each of ``keys`` exactly once."""
+    assert len(adapter.loaded_keys) == len(keys)
+    assert set(adapter.loaded_keys) == set(keys)
+
+
+class TestSingleFlightLoads:
+    def test_concurrent_requests_load_shared_keys_once(self, l1_manager):
+        """A request whose keys another request is loading waits for that
+        load: L2 serves each key once, both requests hit every key from L2,
+        and the shared temporary objects live until both readers finish."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys, keys)
+        ctrl.stop()
+        adapter.close()
+
+        assert_loaded_once(adapter, keys)
+        assert row_bits(first) == row_bits(second) == [0, 1, 2]
+        assert hit_counts(first) == hit_counts(second) == (0, 3)
+        assert l1_manager.get_staging_memory_usage() == 0
+        l1_manager.finish_read(keys)
+        assert_read_locked(l1_manager, keys)
+        l1_manager.finish_read(keys)
+        assert_absent(l1_manager, keys)
+
+    def test_keys_outside_the_inflight_load_are_loaded(self, l1_manager):
+        """Only the overlap is shared; the second request loads the rest."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys[:2], keys)
+        ctrl.stop()
+        adapter.close()
+
+        assert_loaded_once(adapter, keys)
+        assert row_bits(first) == [0, 1]
+        assert row_bits(second) == [0, 1, 2, 3]
+        assert l1_manager.get_staging_memory_usage() == 0
+        l1_manager.finish_read(keys[:2])
+        l1_manager.finish_read(keys)
+
+    def test_waiter_takes_its_own_read_locks(self, l1_manager):
+        """A waiter locks the shared object once per KV reader of its row."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(
+            ctrl, adapter, keys, keys, second_readers=2
+        )
+        ctrl.stop()
+        adapter.close()
+
+        assert_loaded_once(adapter, keys)
+        assert row_bits(first) == row_bits(second) == [0, 1, 2]
+        l1_manager.finish_read(keys)
+        l1_manager.finish_read(keys)
+        assert_read_locked(l1_manager, keys)
+        l1_manager.finish_read(keys)
+        assert_absent(l1_manager, keys)
+
+    def test_short_request_does_not_wait_on_a_long_load(self, l1_manager):
+        """A request needing a small part of a much larger in-flight load
+        loads its keys itself instead of waiting for the whole load."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(6)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys, keys[:2])
+        ctrl.stop()
+        adapter.close()
+
+        assert len(adapter.loaded_keys) == 8
+        assert row_bits(first) == [0, 1, 2, 3, 4, 5]
+        assert row_bits(second) == [0, 1]
+        l1_manager.finish_read(keys)
+        l1_manager.finish_read(keys[:2])
+
+    def test_stop_while_waiting_leaks_nothing(self, l1_manager):
+        """Stopping while a request waits on another's load returns every L2
+        lock and staging buffer."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0002)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        ctrl.submit_prefetch_request(single_row_spec(keys))
+        assert wait_for_condition(lambda: len(adapter.loaded_keys) > 0)
+        ctrl.submit_prefetch_request(single_row_spec(keys))
+        time.sleep(0.5)  # the second request reaches its wait
+        ctrl.stop()
+
+        assert_loaded_once(adapter, keys)
+        assert l1_manager.get_staging_memory_usage() == 0
+        assert_l2_unlocked(adapter)
+        adapter.close()
+
+    def test_aborted_loader_fails_its_waiter_without_a_hang(self, l1_manager):
+        """A loader that errors out leaves its waiter a miss, and no L2 lock
+        or staging buffer behind."""
+
+        class FailingLoads(CountingL2Adapter):
+            def query_load_result(self, task_id):
+                result = MockL2Adapter.query_load_result(self, task_id)
+                if result is not None:
+                    raise RuntimeError("load result failure")
+                return None
+
+        adapter = FailingLoads(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys, keys)
+        ctrl.stop()
+
+        assert row_bits(first) == row_bits(second) == []
+        assert l1_manager.get_staging_memory_usage() == 0
+        assert_l2_unlocked(adapter)
+        adapter.close()
+
+    @pytest.mark.parametrize("oom_chunk, waiter_hit", [(0, []), (3, [0, 1, 2])])
+    def test_replan_keeps_joined_cells_inside_the_prefix(
+        self, l1_manager, oom_chunk, waiter_hit
+    ):
+        """A failed reservation replans with the joined cells still planned:
+        one before them empties the hit, one after them keeps them."""
+
+        class OomOnKey:
+            def __init__(self, inner, key):
+                self._inner, self._key = inner, key
+
+            def reserve_write(self, keys, is_temporary, layout_desc, tag=""):
+                kept = [
+                    (k, t)
+                    for k, t in zip(keys, is_temporary, strict=True)
+                    if k != self._key
+                ]
+                result = {
+                    k: (L1Error.OUT_OF_MEMORY, None) for k in keys if k == self._key
+                }
+                if kept:
+                    result.update(
+                        self._inner.reserve_write(
+                            [k for k, _ in kept],
+                            [t for _, t in kept],
+                            layout_desc,
+                            tag=tag,
+                        )
+                    )
+                return result
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        store_keys_in_l2(adapter, keys, layout)
+        wrapped = OomOnKey(l1_manager, keys[oom_chunk])
+        ctrl = make_controller(wrapped, [adapter])  # type: ignore[arg-type]
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys[1:3], keys)
+        ctrl.stop()
+
+        assert row_bits(first) == [0, 1]
+        assert row_bits(second) == waiter_hit
+        assert l1_manager.get_staging_memory_usage() == 0
+        assert_l2_unlocked(adapter)
+        adapter.close()
+        l1_manager.finish_read(keys[1:3])
+        if waiter_hit:
+            l1_manager.finish_read([keys[i] for i in waiter_hit])
+        assert_absent(l1_manager, keys)
+
+    def test_no_lock_request_does_not_join(self, l1_manager):
+        """NO_LOCK promises resident objects, so it loads its own permanent
+        copy instead of sharing a loader's temporary object."""
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(2)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+        assert wait_for_condition(lambda: len(adapter.loaded_keys) > 0)
+        second_id = ctrl.submit_prefetch_request(
+            single_row_spec(keys, lock_mode=PrefetchLockMode.NO_LOCK)
+        )
+        assert wait_for_result(ctrl, first_id, timeout=10.0) is not None
+        assert wait_for_result(ctrl, second_id, timeout=10.0) is not None
+        ctrl.stop()
+        adapter.close()
+
+        assert len(adapter.loaded_keys) == 4
+        l1_manager.finish_read(keys)
+
+    def test_failed_shared_load_is_a_miss_for_the_waiter(self, l1_manager):
+        """A key the loader fails to load ends the waiter's prefix there."""
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        adapter = CountingL2Adapter(bandwidth_gb=0.0005, fail_keys=(keys[1],))
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        first, second = submit_while_loading(ctrl, adapter, keys, keys)
+        ctrl.stop()
+        adapter.close()
+
+        assert_loaded_once(adapter, keys)
+        assert row_bits(first) == row_bits(second) == [0]
+        assert l1_manager.get_staging_memory_usage() == 0
+        assert_l2_unlocked(adapter)
+        l1_manager.finish_read(keys[:1])
+        l1_manager.finish_read(keys[:1])
+        assert_absent(l1_manager, keys)
+
+
+# =============================================================================
 # Hybrid attention (sliding-window rows)
 # =============================================================================
 
@@ -1519,7 +1812,7 @@ class TestReservationFailures:
         """A key another writer admits after the lock pass (during the L2
         lookup) is read-locked from L1 instead of failing to reserve, so
         "prefix" keeps the whole hit and loads only the other keys."""
-        adapter = make_adapter()
+        adapter = CountingL2Adapter(bandwidth_gb=10.0)
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
         store_keys_in_l2(adapter, keys, layout)
@@ -1539,6 +1832,7 @@ class TestReservationFailures:
         assert racing_l1.admitted, "the racing writer never interleaved"
         assert row_bits(result) == [0, 1, 2]
         assert hit_counts(result) == (1, 2)
+        assert_loaded_once(adapter, [keys[0], keys[2]])
         assert l1_manager.get_staging_memory_usage() == 0
         l1_manager.finish_read(keys)
 

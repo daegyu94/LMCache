@@ -89,10 +89,13 @@ prefetch planning (how much L1 is committed to loads that have not landed).
 
 ## Residual race
 
-A `"prefix"` request read-locks a key that became resident between its L1 lock
-pass and its reservation instead of reserving it. A `"full"` request still
-fails `reserve_write` with `KEY_NOT_WRITABLE`
-(`L2_PREFETCH_FAILED{reason="l1_contended"}`) on such a key; see
+Staging lets two tags stage one key, so the L1 manager itself never
+de-duplicates concurrent loads. The prefetch controller does: a `"prefix"`
+request joins another request's in-flight load of a key instead of staging
+it again, and read-locks a key that became resident during its L2 lookup
+instead of reserving it. A `"full"` request still fails `reserve_write` with
+`KEY_NOT_WRITABLE` (`L2_PREFETCH_FAILED{reason="l1_contended"}`) on a key that
+became resident between its lock pass and its reservation; see
 `../storage_controllers/prefetch_controller.md`.
 
 ## Contract-anchoring tests
