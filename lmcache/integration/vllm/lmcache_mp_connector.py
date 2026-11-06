@@ -79,6 +79,7 @@ from lmcache.integration.vllm.mp_server_launcher import (
     is_mp_server_autostart_enabled,
 )
 from lmcache.integration.vllm.utils import (
+    LORA_TAG_KEY,
     vllm_layout_hints,
 )
 from lmcache.utils import CacheRemoveEvent
@@ -805,6 +806,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 required_chunk_alignment=scheduler_block_size,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Waiting only pays off through vLLM's prefix cache: without it,
+            # requests with the same hit would just load one after another.
+            self._coalesce_loads: bool = vllm_config.cache_config.enable_prefix_caching
+            # Prefixes this engine is loading from LMCache: (cache salt, LoRA
+            # tag, packed tokens of the hit) -> the request whose load vLLM
+            # committed to. A request with the same hit waits for that load,
+            # then shares its blocks through the prefix cache instead of
+            # loading them again. _prefix_key_of caches each request's
+            # (hit tokens, key) so a waiting request's polls copy nothing.
+            self._loading_prefixes: dict[tuple[str, str | None, bytes], str] = {}
+            self._prefix_key_of: dict[
+                str, tuple[int, tuple[str, str | None, bytes]]
+            ] = {}
             # Worker events aggregated per step, awaiting take_events().
             self._kv_cache_events: list[KVCacheEvent] = []
 
@@ -1452,6 +1466,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
             return None, True
+        # Another request of this engine is loading the same hit: wait for
+        # it, then its blocks are prefix-cache hits here. Loading it again
+        # would read the same KV and hold a second copy in GPU blocks.
+        if self._coalesce_loads:
+            cached_key = self._prefix_key_of.get(request.request_id)
+            if cached_key is None or cached_key[0] != ret:
+                self._end_prefix_load(request.request_id)
+                cached_key = (
+                    ret,
+                    (
+                        tracker.cache_salt,
+                        (tracker.request_configs or {}).get(LORA_TAG_KEY),
+                        tracker.packed_token_ids()[: 4 * ret],
+                    ),
+                )
+                self._prefix_key_of[request.request_id] = cached_key
+            loader = self._loading_prefixes.get(cached_key[1])
+            if (
+                ret > num_computed_tokens
+                and loader not in (None, request.request_id)
+                and tracker.awaited_loader in (None, loader)
+            ):
+                tracker.awaited_loader = loader
+                return None, True
         assert tracker.lookup_started_at is not None
         self._connector_stats.record_lookup(
             time.monotonic() - tracker.lookup_started_at
@@ -1623,6 +1661,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 if condition
                 else LMCacheMPRequestState.READY
             )
+            # vLLM committed to the load only now (it may still have declined
+            # or capped it after get_num_new_matched_tokens).
+            cached_key = self._prefix_key_of.get(request.request_id)
+            if condition and cached_key is not None:
+                self._loading_prefixes.setdefault(cached_key[1], request.request_id)
             # Clean up lookup future in scheduler adapter
             self.scheduler_adapter.cleanup_lookup_result(request.request_id)
 
@@ -1709,6 +1752,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if kv_cache_events and isinstance(kv_cache_events, LMCacheMPKVEvents):
             # One aggregated batch per step keeps the workers' event order.
             self._kv_cache_events.extend(kv_cache_events.aggregate().get_all_events())
+
+        for request_id in connector_output.finished_recving or ():
+            self._end_prefix_load(request_id)
 
         if not self.lazy_offload:
             return
@@ -2092,11 +2138,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         configs[_REVISION_TAG_KEY] = revision_tag
         tracker.request_configs = configs
 
+    def _end_prefix_load(self, request_id: str) -> None:
+        """Forget ``request_id``'s prefix load (it finished, failed, its hit
+        changed or the request ended), so requests waiting on it go on."""
+        cached_key = self._prefix_key_of.pop(request_id, None)
+        if cached_key is not None and self._loading_prefixes.get(cached_key[1]) == (
+            request_id
+        ):
+            del self._loading_prefixes[cached_key[1]]
+
     def _cleanup_request_tracker(self, request_id: str) -> None:
         """
         Clean up request tracker and associated lookup future for a request.
         This should be called when a request is finished to prevent memory leak.
         """
+        self._end_prefix_load(request_id)
         # Clean up request tracker
         if self.request_trackers.pop(request_id, None):
             logger.debug(

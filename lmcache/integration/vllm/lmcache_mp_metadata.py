@@ -98,6 +98,10 @@ class LMCacheMPRequestTracker:
     # Lock ranges left by abandoned lookups, released with the next FREE.
     pending_free_ranges: list[tuple[int, int]] = field(default_factory=list)
 
+    # The sibling load this request is waiting for. A request waits for one
+    # load only, so that loads missing the prefix cache cannot form a chain.
+    awaited_loader: str | None = None
+
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
 
     # Packed prefix of `get_token_ids()`, grown in place. A request emits one
@@ -125,6 +129,7 @@ class LMCacheMPRequestTracker:
         self.apc_covered_tokens = 0
         self.need_full_lookup = False
         self.pending_free_ranges = []
+        self.awaited_loader = None
         self.state = LMCacheMPRequestState.PREFETCHING
         self.packed_tokens = bytearray()
         self.mm_adjusted_prompt_ids = []

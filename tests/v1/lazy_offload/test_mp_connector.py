@@ -213,6 +213,9 @@ class _Harness:
 def _make_connector() -> _Harness:
     """Construct the smallest scheduler-side connector these tests need."""
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector._coalesce_loads = True
+    connector._loading_prefixes = {}
+    connector._prefix_key_of = {}
     manager = _RecordingManager()
     adapter = _FakeSchedulerAdapter(manager.call_log)
     # ``role`` is a read-only property over ``_role`` on the vLLM base.
@@ -354,6 +357,7 @@ def test_update_connector_output_forwards_receipts_and_applies_actions() -> None
     harness.manager.store_actions = LazyOffloadActions(sessions_to_end=["req"])
     output = SimpleNamespace(
         kv_cache_events=None,
+        finished_recving=None,
         kv_connector_worker_meta=LMCacheMPWorkerMetadata(
             completed_store_requests={"req": 2},
             failed_store_requests={"req"},
@@ -370,7 +374,9 @@ def test_update_connector_output_ignores_foreign_metadata() -> None:
     harness = _make_connector()
 
     harness.connector.update_connector_output(
-        SimpleNamespace(kv_cache_events=None, kv_connector_worker_meta=None)
+        SimpleNamespace(
+            kv_cache_events=None, kv_connector_worker_meta=None, finished_recving=None
+        )
     )
 
     assert harness.manager.store_results == []
