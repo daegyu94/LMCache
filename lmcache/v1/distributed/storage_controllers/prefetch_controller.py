@@ -1051,7 +1051,9 @@ class PrefetchController(StorageControllerInterface):
         Note:
             Membership in ``l2_locked_keys`` keeps an adapter attached until
             the request has returned its L2 read locks; the entry is removed
-            when the adapter's load result is admitted.
+            when the adapter's load result is admitted. A request whose cells
+            of an adapter all landed in L1 keeps an empty entry until it
+            finishes, so it delays a drain only that long.
         """
         for request in self._in_flight_requests.values():
             if (
@@ -1364,6 +1366,10 @@ class PrefetchController(StorageControllerInterface):
         }
         self._plan_load(request, active_l2_descs)
 
+        # Step 2.5: cells another request's load has landed are read-locked
+        # in L1 instead of failing to reserve.
+        self._lock_landed_keys(request)
+
         # Step 3: reserve L1 write buffers for the planned L2 keys
         # with L1-L2 affinity.
         tag = _get_prefetch_write_tag(request.request_id)
@@ -1491,6 +1497,56 @@ class PrefetchController(StorageControllerInterface):
             len(request.inflight_load_tasks),
             len(plan_keys),
         )
+
+    def _lock_landed_keys(self, request: InFlightPrefetchRequest) -> None:
+        """Read-lock the planned L2 cells whose key became resident in the
+        affinity L1 manager after the lock pass (another request's load
+        landed during this request's L2 lookup), and drop them from the L2
+        plan: reserving them would fail as ``l1_contended`` and turn a
+        resident chunk into a miss.
+
+        Only ``"prefix"`` requests do this: the whole-column trim of ``"full"``
+        counts reserved cells only.
+
+        Args:
+            request: The request entering the load phase; its L2 locked map
+                is the plan.
+        """
+        if request.fetching_policy != "prefix":
+            return
+        states = request.key_states
+        for l2_idx, cells in states.l2_locked_keys.items():
+            l1_idx = self._get_l2_affinity_manager(l2_idx)
+            # The lock pass skips disallowed L1 managers; so does this one.
+            if not _tags_allowed(
+                self._l1_managers[l1_idx].get_memory_tags(),
+                request.allowed_l1_memory_tags,
+            ):
+                continue
+            landed = cells.zeros_like()
+            for row_id, (group, row) in enumerate(
+                zip(request.key_groups, cells, strict=True)
+            ):
+                cols = row.get_indices_list()
+                if not cols:
+                    continue
+                keys = row.gather(group.keys)
+                result = self._l1_managers[l1_idx].reserve_read(
+                    keys, group.num_kv_readers
+                )
+                for col, key in zip(cols, keys, strict=True):
+                    if result[key][0] == L1Error.SUCCESS:
+                        landed[row_id].set(col)
+            if landed.popcount() == 0:
+                continue
+            states.l2_locked_keys[l2_idx] = cells - landed
+            self._l2_adapters[l2_idx].submit_unlock(
+                _gather_keys(request.key_groups, landed)
+            )
+            if l1_idx in states.l1_locked_keys:
+                states.l1_locked_keys[l1_idx] += landed
+            else:
+                states.l1_locked_keys[l1_idx] = landed
 
     def _build_l1_allocation_plans(
         self, request: InFlightPrefetchRequest

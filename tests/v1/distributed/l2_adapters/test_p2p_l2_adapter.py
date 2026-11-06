@@ -334,6 +334,29 @@ def test_lookup_forwards_group_layout_descs_and_returns_addresses():
         assert keys[2] not in adapter._remote_addresses
 
 
+def test_unlock_keeps_the_address_another_lookup_still_holds():
+    """One lookup's unlock must not erase the address a second lookup of the
+    same key is about to load from."""
+    key = _key(0)
+    address = TransferChannelAddress(offset=64, size=64)
+    obj = MagicMock(shm_offset=0, shm_byte_length=64)
+    with _adapter() as (adapter, req_client, _tc_ctx, tc_client, _notifier):
+        req_client.p2p_lookup_and_lock.return_value = _FakeFuture(value=1)
+        req_client.p2p_query_lookup_results.return_value = _FakeFuture(value=[address])
+        for _ in range(2):
+            task = adapter.submit_lookup_and_lock_task([key], {0: _LAYOUT})
+            assert adapter.query_lookup_and_lock_result(task) is not None
+
+        adapter.submit_unlock([key])
+        adapter.submit_load_task([key], [obj])
+        assert tc_client.submit_read.called, "the second lookup lost its address"
+
+        adapter.submit_unlock([key])
+        tc_client.submit_read.reset_mock()
+        adapter.submit_load_task([key], [obj])
+        assert not tc_client.submit_read.called, "no lookup holds the address now"
+
+
 def test_lookup_query_not_ready_then_ready():
     keys = [_key(0)]
     addresses = [TransferChannelAddress(offset=100, size=10)]

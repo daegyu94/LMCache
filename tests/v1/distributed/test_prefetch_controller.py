@@ -1515,9 +1515,10 @@ class TestReservationFailures:
             adapter.close()
             l1_manager.close()
 
-    def test_contended_key_is_dropped_under_prefix(self, l1_manager):
-        """A key admitted by another writer after the lock pass fails to
-        reserve; under "prefix" the hit stops before it."""
+    def test_key_admitted_after_lock_pass_is_read_locked_under_prefix(self, l1_manager):
+        """A key another writer admits after the lock pass (during the L2
+        lookup) is read-locked from L1 instead of failing to reserve, so
+        "prefix" keeps the whole hit and loads only the other keys."""
         adapter = make_adapter()
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
@@ -1536,12 +1537,10 @@ class TestReservationFailures:
         adapter.close()
 
         assert racing_l1.admitted, "the racing writer never interleaved"
-        assert row_bits(result) == [0]
-        assert_read_locked(l1_manager, keys[:1])
-        assert_absent(l1_manager, keys[2:])
+        assert row_bits(result) == [0, 1, 2]
+        assert hit_counts(result) == (1, 2)
         assert l1_manager.get_staging_memory_usage() == 0
-        l1_manager.finish_read(keys[:1])
-        l1_manager.delete([keys[1]])
+        l1_manager.finish_read(keys)
 
     def test_contended_key_is_dropped_under_full(self, l1_manager):
         """Under "full" only the contended key is dropped."""

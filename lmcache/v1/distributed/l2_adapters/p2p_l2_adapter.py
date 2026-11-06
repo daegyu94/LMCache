@@ -405,6 +405,9 @@ class P2PL2Adapter(PeerL2AdapterBase):
         # runs the region hook so nothing is acquired after it returns.
         self._load_tasks: dict[L2TaskId, _LoadTask] = {}
         self._remote_addresses: dict[ObjectKey, TransferChannelAddress] = {}
+        # Lookups holding each address: one lookup's unlock must not erase an
+        # address another lookup of the same key is about to load from.
+        self._remote_address_refs: dict[ObjectKey, int] = {}
         super().__init__(config)
 
     def _register_peer_region(self) -> None:
@@ -435,7 +438,12 @@ class P2PL2Adapter(PeerL2AdapterBase):
         """
         super().submit_unlock(keys)
         for key in keys:
-            self._remote_addresses.pop(key, None)
+            refs = self._remote_address_refs.get(key, 1) - 1
+            if refs > 0:
+                self._remote_address_refs[key] = refs
+            else:
+                self._remote_address_refs.pop(key, None)
+                self._remote_addresses.pop(key, None)
 
     # --------------------
     # Load Interface
@@ -531,6 +539,9 @@ class P2PL2Adapter(PeerL2AdapterBase):
             if addr.is_valid():
                 bitmap.set(i)
                 self._remote_addresses[key] = addr
+                self._remote_address_refs[key] = (
+                    self._remote_address_refs.get(key, 0) + 1
+                )
         return bitmap
 
 
