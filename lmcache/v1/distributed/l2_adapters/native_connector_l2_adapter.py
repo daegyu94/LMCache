@@ -140,6 +140,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         pad_buffers_to_alignment: bool = False,
+        sparse_lookup: bool = False,
     ) -> None:
         """Initialize the adapter over a native connector client.
 
@@ -160,6 +161,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 native connectors whose I/O path requires aligned buffer
                 lengths (e.g. O_DIRECT file storage). See
                 ``_obj_to_memoryview``.
+            sparse_lookup: Whether the connector accepts arbitrary subsets of
+                keys independently of the original request grid.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         self._client = native_client
@@ -167,6 +170,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
         self._pad_buffers_to_alignment = pad_buffers_to_alignment
+        self._sparse_lookup = sparse_lookup
         self._memory_tags = memory_tags
 
         # 3 distinct cross-platform notifiers for the L2 adapter
@@ -300,6 +304,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             )
 
         return task_id
+
+    def supports_sparse_lookup(self) -> bool:
+        """Opt in while native independent-key lookup is used unchanged."""
+        return self._sparse_lookup and (
+            type(self).submit_lookup_and_lock_task
+            is NativeConnectorL2Adapter.submit_lookup_and_lock_task
+        )
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         with self._lock:

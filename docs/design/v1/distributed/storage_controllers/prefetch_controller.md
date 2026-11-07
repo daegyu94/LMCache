@@ -132,7 +132,11 @@ afterwards.
    every chunk, under `"full"` L1 holds every cell), plan from L1 alone and
    finish (steps 3 and 7 with an empty L2 map).
    Otherwise, submit one `lookup_and_lock` task per
-   non-draining adapter, over the full key list. As each result arrives
+   non-draining adapter. When the policy opts in through `prefers_l1_hits()`
+   and the adapter supports `supports_sparse_lookup()`, omit cells already
+   locked in L1. The request records the original cell positions and scatters
+   each sparse result back into the unchanged rectangular grid. Other
+   adapters, including P2P, keep the full key list. As each result arrives
    (`_poll_lookup_results`) it becomes that adapter's row in `l2_locked_keys`.
 3. **Plan** (`_plan_load`). Call `policy.plan_load` on the two maps. Release
    every L1 lock and every L2 lock outside the plan, then set both locked maps
@@ -228,8 +232,8 @@ Gauges: `lmcache_mp.num_inflight_l2_loads`,
   bytes are charged in full to every L1 manager with an active L2 adapter,
   because which adapter (and so which L1) serves each cell is known only after
   planning. Exact for one L1; it under-admits with several.
-- **Full key list to L2.** Lookups are submitted with every key, not only the
-  L1 misses, because the adapter interface carries a flat key list.
+- **Full key list for non-opt-in adapters.** P2P and other adapters that do
+  not support sparse lookup still receive every key.
 - **L2 recency skips L1-only requests.** Adapters that refresh LRU recency on
   lookup (S3, Valkey, Bigtable, HF bucket, SageMaker HyperPod) do not see a
   request L1 alone serves, so a chunk hot in L1 can age out of L2 first.
@@ -261,3 +265,14 @@ with a real `DramL1Manager` and `MockL2Adapter`:
 
 `tests/v1/distributed/test_prefetch_policy.py` tests the policies black-box
 against their docstrings.
+
+## Sparse lookup compatibility
+
+`PrefetchPolicy.prefers_l1_hits()` and
+`L2AdapterInterface.supports_sparse_lookup()` default to false. The default
+L1-first policy and the `fs_native` connector opt in while their planning
+and lookup methods remain unchanged. Existing subclasses overriding those
+methods retain complete lookups unless they override the capability explicitly.
+No key is deduplicated: each submitted occurrence keeps its original grid
+position and its corresponding lookup/unlock accounting. L1 locks are still
+held over the entire prefetch lifecycle and the policy sees a full grid.
