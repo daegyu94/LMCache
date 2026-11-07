@@ -94,6 +94,9 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    active_read_holds: int = 0
+    """ In-flight device reads that must outlive the read-lock TTL. """
+
     staging_charge: int = 0
     """ Bytes added to the staging counter while the object is staged.
 
@@ -437,7 +440,11 @@ class BaseL1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary
+                and not entry.read_lock.is_locked()
+                and entry.active_read_holds == 0
+            ):
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
@@ -469,6 +476,69 @@ class BaseL1Manager(L1ManagerInterface):
         )
 
         return ret
+
+    @l1_mgr_synchronized
+    def hold_read_allocations(self, keys: list[ObjectKey]) -> bool:
+        """Hold resident allocations across asynchronous device reads.
+
+        The operation is atomic for this L1 manager: if any key is absent,
+        no hold is acquired. Holds do not expire with the key's read TTL.
+
+        Args:
+            keys: Resident keys whose allocations will be held.
+
+        Returns:
+            True if every key was present and held; otherwise False.
+        """
+        entries = [self._objects.get(key) for key in keys]
+        if any(entry is None for entry in entries):
+            return False
+        for entry in entries:
+            # The missing-entry case returned above.
+            assert entry is not None
+            entry.active_read_holds += 1
+        return True
+
+    @l1_mgr_synchronized
+    def release_read_allocations(self, keys: list[ObjectKey]) -> None:
+        """Release one active allocation hold for every key in ``keys``.
+
+        When the final hold on a temporary object is released after its read
+        lock has ended, the object is deleted and its allocation is freed.
+
+        Args:
+            keys: The same keys passed to one successful
+                ``hold_read_allocations`` call.
+
+        Raises:
+            ValueError: A key is absent or has fewer active holds than this
+                release requires.
+        """
+        release_counts: dict[ObjectKey, int] = {}
+        for key in keys:
+            release_counts[key] = release_counts.get(key, 0) + 1
+
+        for key, hold_count in release_counts.items():
+            entry = self._objects.get(key)
+            if entry is None or entry.active_read_holds < hold_count:
+                raise ValueError(f"No matching active read hold for key {key}")
+
+        need_to_free: list[MemoryObj] = []
+        need_to_free_keys: list[ObjectKey] = []
+        for key, hold_count in release_counts.items():
+            entry = self._objects[key]
+            entry.active_read_holds -= hold_count
+            if (
+                entry.active_read_holds == 0
+                and entry.is_temporary
+                and not entry.read_lock.is_locked()
+            ):
+                need_to_free.append(entry.memory_obj)
+                need_to_free_keys.append(key)
+                del self._objects[key]
+
+        if need_to_free_keys:
+            self._free_and_report_deleted(need_to_free_keys, need_to_free)
 
     @l1_mgr_synchronized
     def reserve_write(
@@ -761,16 +831,16 @@ class BaseL1Manager(L1ManagerInterface):
             force: When True, delete even a read-locked key and discard its
                 live staging objects. This may free memory a concurrent
                 store/read still uses (same hazard as :meth:`clear` with
-                ``force=True``); use with care.
+                ``force=True``); use with care. Active device-read holds
+                always prevent deletion, including forced deletion.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
 
         Errors:
             KEY_NOT_EXIST: The key does not exist.
-            KEY_IS_LOCKED: The key is read-locked, or a live staging object
-                exists for it, so it cannot be deleted. Never returned when
-                ``force`` is True.
+            KEY_IS_LOCKED: The key has an active device-read hold, or is
+                read-locked / has live staging and ``force`` is False.
         """
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -795,6 +865,9 @@ class BaseL1Manager(L1ManagerInterface):
                 continue
 
             locked = entry.read_lock.is_locked()
+            if entry.active_read_holds > 0:
+                ret[key] = L1Error.KEY_IS_LOCKED
+                continue
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
@@ -878,27 +951,31 @@ class BaseL1Manager(L1ManagerInterface):
         """Clear objects from L1 cache.
 
         Args:
-            force: If True, clear ALL objects including read-locked ones and
-                every staging object. This may corrupt in-flight
-                store/prefetch operations. If False (default), only clear
-                unlocked resident objects and staging objects whose write
-                lock expired, keeping read-locked objects and live staging
-                objects intact.
+            force: If True, clear read-locked objects and every staging
+                object. This may corrupt in-flight store/prefetch operations.
+                Active device-read holds are always retained. If False
+                (default), only clear unlocked resident objects and staging
+                objects whose write lock expired.
         """
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
             logger.warning(
-                "L1Manager: force-clearing all %d objects and %d staging objects "
-                "(including locked ones). This may corrupt in-flight "
+                "L1Manager: force-clearing unheld objects and all %d staging "
+                "objects (including locked ones). This may corrupt in-flight "
                 "store/prefetch operations — use with caution.",
-                len(self._objects),
                 staging_count,
             )
-            all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            retained_keys = {
+                key
+                for key, entry in self._objects.items()
+                if entry.active_read_holds > 0
+            }
+            all_keys = [key for key in self._objects if key not in retained_keys]
+            all_memory_objs = [self._objects[key].memory_obj for key in all_keys]
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            for key in all_keys:
+                del self._objects[key]
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -912,14 +989,18 @@ class BaseL1Manager(L1ManagerInterface):
                 )
             )
             cleared = set(all_keys)
-            staging_keys = [k for k in self._staging if k not in cleared]
+            staging_keys = [
+                k for k in self._staging if k not in cleared and k not in retained_keys
+            ]
             for key in list(self._staging.keys()):
                 self._reclaim_staging(key, force=True)
             self._report_staging_gone(staging_keys)
             logger.info(
-                "L1Manager: cleared %d objects and %d staging objects, 0 remaining.",
+                "L1Manager: cleared %d objects and %d staging objects, "
+                "%d active-read objects retained.",
                 len(all_keys),
                 staging_count,
+                len(retained_keys),
             )
             return
 
@@ -928,7 +1009,7 @@ class BaseL1Manager(L1ManagerInterface):
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
+            if entry.read_lock.is_locked() or entry.active_read_holds > 0:
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -970,11 +1051,16 @@ class BaseL1Manager(L1ManagerInterface):
             key: The object key to check.
 
         Returns:
-            True if the key has a resident object that is not read-locked,
-            or a staging object whose write lock expired; False otherwise.
+            True if the key has a resident object without a read lock or active
+            device-read hold, or a staging object whose write lock expired;
+            False otherwise.
         """
         entry = self._objects.get(key, None)
-        if entry is not None and not entry.read_lock.is_locked():
+        if (
+            entry is not None
+            and not entry.read_lock.is_locked()
+            and entry.active_read_holds == 0
+        ):
             return True
         per_tag = self._staging.get(key, None)
         if per_tag is None:
@@ -1036,8 +1122,21 @@ class BaseL1Manager(L1ManagerInterface):
         return self._config
 
     def close(self) -> None:
-        """Free every object, close the memory manager and drop the gauge target."""
+        """Free every object, close the memory manager and drop the gauge target.
+
+        Raises:
+            RuntimeError: An asynchronous device read still holds an L1
+                allocation.
+        """
         with self._lock:
+            active_holds = sum(
+                entry.active_read_holds for entry in self._objects.values()
+            )
+            if active_holds:
+                raise RuntimeError(
+                    f"Cannot close L1 manager with {active_holds} active read holds"
+                )
+            self._before_close()
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             for per_tag in self._staging.values():
                 all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
@@ -1060,10 +1159,12 @@ class BaseL1Manager(L1ManagerInterface):
         subset and ``write_locked_count`` the live reservations among them.
         """
         read_locked = 0
+        active_read_holds = 0
         temporary = 0
         for entry in self._objects.values():
             if entry.read_lock.is_locked():
                 read_locked += 1
+            active_read_holds += entry.active_read_holds
             if entry.is_temporary:
                 temporary += 1
         staging = 0
@@ -1084,6 +1185,7 @@ class BaseL1Manager(L1ManagerInterface):
             "total_object_count": len(self._objects) + staging,
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
+            "active_read_hold_count": active_read_holds,
             "temporary_count": temporary,
             "staging_object_count": staging,
             "staging_bytes": self._staging_bytes,
@@ -1286,3 +1388,7 @@ class BaseL1Manager(L1ManagerInterface):
             (value(m), {"l1_tag": m.config.tag, "backend": m.backend_type.value})
             for m in managers
         ]
+
+    def _before_close(self) -> None:
+        """Close backend-specific resources before freeing L1 allocations."""
+        return

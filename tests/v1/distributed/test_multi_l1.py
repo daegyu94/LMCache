@@ -482,6 +482,66 @@ def test_overlapping_reads_preserve_each_selected_owner(
     assert fallback.report_status()["read_locked_count"] == 0
 
 
+def test_active_read_completion_holds_allocations_until_stream_callback(
+    storage_factory: StorageFactory,
+) -> None:
+    store, managers = storage_factory((4096, 4096))
+    objects = store.reserve_write([key(1)], LAYOUT)
+    store.finish_write(list(objects), l1_owners_of(objects))
+    handle = store.submit_prefetch_task(
+        single_row_spec([key(1)], LAYOUT, allowed_l2_memory_tags=frozenset())
+    )
+    result = store.query_prefetch_status(handle)
+    assert result is not None
+    owner = result.l1_owners[key(1)]
+    manager = next(item for item in managers if item.l1_manager_id == owner)
+
+    completion = store.prepare_read_completion_with_hold([key(1)], result.l1_owners)
+    assert manager.report_status()["active_read_hold_count"] == 1
+    assert manager.delete([key(1)]) == {key(1): L1Error.KEY_IS_LOCKED}
+
+    store.finish_read_with_hold_by_owner(completion)
+    assert manager.report_status()["active_read_hold_count"] == 0
+    assert manager.delete([key(1)]) == {key(1): L1Error.SUCCESS}
+
+
+def test_failed_active_read_completion_rolls_back_prior_owner_holds(
+    storage_factory: StorageFactory,
+) -> None:
+    store, (primary, fallback) = storage_factory((4096, 4096))
+    primary.reserve_write([key(1)], [False], LAYOUT)
+    primary.finish_write([key(1)])
+    primary.reserve_read([key(1)])
+
+    with pytest.raises(ValueError, match="no longer resident"):
+        store.prepare_read_completion_with_hold(
+            [key(1), key(2)],
+            {key(1): primary.l1_manager_id, key(2): fallback.l1_manager_id},
+        )
+
+    assert primary.report_status()["active_read_hold_count"] == 0
+    store.finish_read_by_owner([(primary.l1_manager_id, [key(1)])])
+    assert primary.delete([key(1)]) == {key(1): L1Error.SUCCESS}
+
+
+def test_storage_manager_close_waits_for_active_device_reads(
+    storage_factory: StorageFactory,
+) -> None:
+    store, (manager, _) = storage_factory((4096, 4096))
+    manager.reserve_write([key(1)], [False], LAYOUT)
+    manager.finish_write([key(1)])
+    manager.reserve_read([key(1)])
+    completion = store.prepare_read_completion_with_hold(
+        [key(1)], {key(1): manager.l1_manager_id}
+    )
+
+    with pytest.raises(RuntimeError, match="asynchronous device reads"):
+        store.close()
+
+    assert manager.report_status()["active_read_hold_count"] == 1
+    store.finish_read_with_hold_by_owner(completion)
+
+
 def test_failed_peer_lookup_releases_earlier_locks(
     storage_factory: StorageFactory,
     monkeypatch: pytest.MonkeyPatch,

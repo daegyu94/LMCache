@@ -156,9 +156,18 @@ zero stored objects. As with copy failures, staging reservations retain their
 write-TTL behavior because queued device writes can still reference the buffers.
 
 `prepare_read_completion` and `finish_read_by_owner` (typed with
-`L1WriteCompletion`) are the read-side pair from before this design. They
-still work but are deprecated (`lmcache_deprecate`, one warning per process):
-new callers pass `l1_owners` to `finish_read_prefetched` themselves.
+`L1WriteCompletion`) are the deprecated owner-capture pair from before this
+design. They remain for readers whose source access is synchronous.
+
+The ordinary `lmcache_driven` retrieve path uses
+`prepare_read_completion_with_hold` and `finish_read_with_hold_by_owner`.
+Before enqueuing H2D work, preparation holds each resident allocation under its
+L1 lock and returns only owner/key groups; it does not serialize a memory
+pointer. The stream callback releases the read lock and then the allocation
+hold after the device finishes. Active holds outlive the read-lock TTL and
+prevent eviction, deletion, forced clear, and manager close from freeing the
+source allocation. If any owner cannot hold its full key group, earlier holds
+are rolled back and retrieve does not enqueue a copy.
 
 When tracing is enabled, `finish_write` and `finish_read_prefetched` redact
 `l1_owners` and record key-only calls, so process-local owner ids never reach

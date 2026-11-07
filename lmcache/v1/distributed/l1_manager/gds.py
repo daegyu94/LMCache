@@ -67,7 +67,6 @@ class GdsL1Manager(BaseL1Manager):
         """Return ``(GDS, LOCAL)``."""
         return MemoryTags(segment=MemorySegment.GDS, residency=MemoryResidency.LOCAL)
 
-    def close(self) -> None:
-        """Close the GDS context, then free objects and the slab address space."""
+    def _before_close(self) -> None:
+        """Close the GDS context before the base manager frees its slab."""
         close_l1_gds_context(self.l1_manager_id)
-        super().close()

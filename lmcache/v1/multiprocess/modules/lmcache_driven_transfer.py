@@ -19,7 +19,11 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     ShardReplicationDesc,
 )
-from lmcache.v1.distributed.storage_manager import L1WriteCompletion, l1_owners_of
+from lmcache.v1.distributed.storage_manager import (
+    L1ActiveReadCompletion,
+    L1WriteCompletion,
+    l1_owners_of,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -258,6 +262,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             "finish_read_by_owner",
             self._ctx.storage_manager.finish_read_by_owner,
             payload_type=L1WriteCompletion,
+        )
+        self._device_host_func_dispatcher.register(
+            "finish_read_with_hold_by_owner",
+            self._ctx.storage_manager.finish_read_with_hold_by_owner,
+            payload_type=L1ActiveReadCompletion,
         )
         self._device_host_func_dispatcher.register(
             "release_imported_event",
@@ -1081,8 +1090,10 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             ]
             # Capture every retained lock before enqueuing GPU work, including
             # groups that a later transfer failure may leave unvisited.
-            read_completion = self._ctx.storage_manager.prepare_read_completion(
-                retained_keys, read_owners
+            read_completion = (
+                self._ctx.storage_manager.prepare_read_completion_with_hold(
+                    retained_keys, read_owners
+                )
             )
             total_bytes = 0
             retrieve_succeeded = True
@@ -1122,7 +1133,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 if retained_keys:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,
-                        "finish_read_by_owner",
+                        "finish_read_with_hold_by_owner",
                         read_completion,
                     )
                 num_tokens = (

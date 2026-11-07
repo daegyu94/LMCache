@@ -603,15 +603,17 @@ Cache Management
 ~~~~~~~~~~~~~~~~~~~~~~
 
 Clears KV cache data currently held in a tier (today ``l1``). Set
-``force=true`` to clear locked objects too.
+``force=true`` to clear read-locked objects too. Active device-read holds are
+always kept until their stream callback confirms the transfer has finished.
 
 .. warning::
 
    By default, this endpoint clears only objects that are safe to remove.
-   With ``force=true``, it is destructive and bypasses read/write locks.
-   In-flight store or prefetch operations may be corrupted. Use forced
-   cleanup only when the server is idle, or when recovering from a
-   known-bad cache state.
+   With ``force=true``, it bypasses read and write locks and may corrupt
+   in-flight store or prefetch operations. Active device-read holds still
+   protect source allocations until their completion callback. Use forced
+   cleanup only when the server is idle, or when recovering from a known-bad
+   cache state.
 
 **Request body:** optional -- an absent (or empty) body uses the defaults below.
 
@@ -629,7 +631,8 @@ Clears KV cache data currently held in a tier (today ``l1``). Set
    * - ``force``
      - bool
      - Optional (default ``false``). When ``true``, active locks may be
-       ignored so the server can force-clear cached objects.
+       ignored so the server can force-clear cached objects. Active
+       device-read holds are never ignored.
 
 **Response** (``200 OK``):
 

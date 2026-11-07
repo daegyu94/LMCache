@@ -104,6 +104,11 @@ def test_write_commit_read_release(l1: L1ManagerInterface) -> None:
     assert listener.read_reserved == [key(1)]
     assert listener.read_finished == [key(1)]
 
+    assert l1.hold_read_allocations([key(1)])
+    assert l1.delete([key(1)]) == {key(1): L1Error.KEY_IS_LOCKED}
+    l1.release_read_allocations([key(1)])
+    assert l1.delete([key(1)]) == {key(1): L1Error.SUCCESS}
+
 
 def test_aborted_write_is_never_readable(l1: L1ManagerInterface) -> None:
     assert l1.reserve_write([key(2)], [False], LAYOUT)[key(2)][0] is L1Error.SUCCESS

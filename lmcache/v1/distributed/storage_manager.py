@@ -100,9 +100,10 @@ logger = init_logger(__name__)
 # tag makes concurrent stores of the same key exclude each other.
 _L1_WRITE_TAG = "storage_manager"
 
-# Owner/key groups of the deprecated read-completion API (see
-# ``prepare_read_completion``). No MemoryObj or device pointer crosses msgpack.
+# Owner/key groups sent through stream completion callbacks. No MemoryObj or
+# device pointer crosses msgpack.
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
+L1ActiveReadCompletion = list[tuple[int, list[ObjectKey]]]
 
 _DEVDAX_L1_TAGS = MemoryTags(segment=MemorySegment.CXL, residency=MemoryResidency.LOCAL)
 
@@ -1238,10 +1239,11 @@ class StorageManager:
         Clear data in the storage manager.
 
         Args:
-            force: If True, clear ALL objects including locked ones.
-                This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+            force: If True, clear read-locked objects and every staging
+                object. This may corrupt in-flight store/prefetch operations.
+                Active device-read holds are always retained. If False
+                (default), only clear unlocked objects, keeping write-locked
+                and read-locked objects intact.
         """
         for manager in self._l1_managers:
             manager.clear(force=force)
@@ -1253,7 +1255,21 @@ class StorageManager:
         Every L2 adapter is closed even if another fails. If any adapter
         fails to close, the L1 managers are left open, since that adapter
         may still access L1 buffers.
+
+        Raises:
+            RuntimeError: An asynchronous device read still holds an L1
+                allocation. No controllers or adapters are closed in this
+                case, so the caller can wait for completion and retry.
         """
+        if any(
+            manager.report_status()["active_read_hold_count"] > 0
+            for manager in self._l1_managers
+        ):
+            raise RuntimeError(
+                "Cannot close storage manager while asynchronous device reads "
+                "hold L1 allocations"
+            )
+
         self._prefetch_controller.stop()
         for controller in self._store_controllers.values():
             controller.stop()
@@ -1388,6 +1404,38 @@ class StorageManager:
         """
         return list(self._read_groups(keys, l1_owners).items())
 
+    def prepare_read_completion_with_hold(
+        self,
+        keys: list[ObjectKey],
+        l1_owners: dict[ObjectKey, int] | None = None,
+    ) -> L1ActiveReadCompletion:
+        """Capture owners and hold L1 allocations until device-read completion.
+
+        Args:
+            keys: Keys whose allocations will be read asynchronously.
+            l1_owners: Owners retained by prefetch; ``None`` resolves owners
+                by probing the L1 managers.
+
+        Returns:
+            Serializable owner/key groups to pass to
+            :meth:`finish_read_with_hold_by_owner` after device work ends.
+
+        Raises:
+            ValueError: A key has no registered owner or is no longer resident.
+        """
+        groups = self._read_groups(keys, l1_owners)
+        with ExitStack() as rollback:
+            for owner, owner_keys in groups.items():
+                manager = self._l1_managers_by_id[owner]
+                if not manager.hold_read_allocations(owner_keys):
+                    raise ValueError(
+                        "Cannot hold L1 allocations for asynchronous read; "
+                        f"some keys are no longer resident on owner {owner}"
+                    )
+                rollback.callback(manager.release_read_allocations, owner_keys)
+            rollback.pop_all()
+        return list(groups.items())
+
     # TODO(ApostaC): refactor the read-completion callers and drop this method.
     @lmcache_deprecate("this method will be dropped in a future refactor")
     def finish_read_by_owner(self, completion: L1WriteCompletion) -> None:
@@ -1407,6 +1455,43 @@ class StorageManager:
             return
         for owner, keys in completion:
             self.finish_read_prefetched(keys, l1_owners=dict.fromkeys(keys, owner))
+
+    def finish_read_with_hold_by_owner(
+        self, completion: L1ActiveReadCompletion
+    ) -> None:
+        """Release read locks and active allocation holds after device use.
+
+        The allocation hold is released even if read-lock cleanup reports an
+        error, because the stream callback establishes that device use ended.
+
+        Args:
+            completion: Groups produced by
+                :meth:`prepare_read_completion_with_hold`.
+
+        Raises:
+            ValueError: An owner is not registered.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("Read completion requires a registered L1 owner")
+
+        try:
+            if not self.is_multi_l1:
+                self.finish_read_prefetched(
+                    [key for _, keys in completion for key in keys]
+                )
+            else:
+                for owner, keys in completion:
+                    self.finish_read_prefetched(
+                        keys, l1_owners=dict.fromkeys(keys, owner)
+                    )
+        finally:
+            if not self.is_multi_l1:
+                self._l1_managers[0].release_read_allocations(
+                    [key for _, keys in completion for key in keys]
+                )
+            else:
+                for owner, keys in completion:
+                    self._l1_managers_by_id[owner].release_read_allocations(keys)
 
     def _group_by_owner(
         self, keys: list[ObjectKey], owners: Mapping[ObjectKey, int]

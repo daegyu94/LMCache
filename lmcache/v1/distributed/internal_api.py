@@ -296,6 +296,31 @@ class L1ManagerInterface(Protocol):
         """Release ``read_locks`` read locks on each key."""
         ...
 
+    def hold_read_allocations(self, keys: list[ObjectKey]) -> bool:
+        """Keep resident allocations alive across asynchronous device reads.
+
+        The operation is atomic for this manager: it either holds every key
+        or acquires no holds.
+
+        Args:
+            keys: Resident keys whose allocations will be held.
+
+        Returns:
+            True when all keys were resident and held; otherwise False.
+        """
+        ...
+
+    def release_read_allocations(self, keys: list[ObjectKey]) -> None:
+        """Release holds acquired by one matching hold call.
+
+        Args:
+            keys: The same keys passed to the successful hold call.
+
+        Raises:
+            ValueError: A key has no matching active hold.
+        """
+        ...
+
     def reserve_write(
         self,
         keys: list[ObjectKey],

@@ -141,6 +141,16 @@ def short_write_ttl_l1_config(basic_memory_config):
 
 
 @pytest.fixture
+def short_read_ttl_l1_config(basic_memory_config):
+    """L1ManagerConfig whose read reservations expire after one second."""
+    return L1ManagerConfig(
+        memory_config=basic_memory_config,
+        write_ttl_seconds=600,
+        read_ttl_seconds=1,
+    )
+
+
+@pytest.fixture
 def basic_layout():
     """Create a basic MemoryLayoutDesc for testing."""
     return MemoryLayoutDesc(
@@ -1301,6 +1311,64 @@ class TestDelete:
 
         assert manager.delete([key], force=True) == {key: L1Error.KEY_NOT_EXIST}
 
+        manager.close()
+
+
+class TestActiveReadHolds:
+    """Active holds keep L1 allocations alive after read reservations expire."""
+
+    def test_expired_reservation_cannot_free_an_active_read_allocation(
+        self, short_read_ttl_l1_config, basic_layout
+    ):
+        manager = DramL1Manager(short_read_ttl_l1_config)
+        key = make_object_key(7001)
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key])
+
+        assert manager.hold_read_allocations([key])
+        time.sleep(1.1)
+
+        assert manager.is_key_evictable(key) is False
+        assert manager.delete([key]) == {key: L1Error.KEY_IS_LOCKED}
+        manager.clear()
+        manager.clear(force=True)
+        assert manager.delete([key], force=True) == {key: L1Error.KEY_IS_LOCKED}
+        with pytest.raises(RuntimeError, match="active read holds"):
+            manager.close()
+
+        manager.release_read_allocations([key])
+        assert manager.delete([key], force=True) == {key: L1Error.SUCCESS}
+        manager.close()
+
+    def test_temporary_object_is_freed_after_final_active_hold(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = DramL1Manager(basic_l1_config)
+        key = make_object_key(7002)
+        manager.reserve_write([key], [True], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key])
+
+        assert manager.hold_read_allocations([key])
+        assert manager.finish_read([key]) == {key: L1Error.SUCCESS}
+        assert manager.delete([key]) == {key: L1Error.KEY_IS_LOCKED}
+
+        manager.release_read_allocations([key])
+        assert manager.delete([key]) == {key: L1Error.KEY_NOT_EXIST}
+        manager.close()
+
+    def test_missing_key_does_not_partially_hold_other_allocations(
+        self, basic_l1_config, basic_layout
+    ):
+        manager = DramL1Manager(basic_l1_config)
+        resident = make_object_key(7003)
+        missing = make_object_key(7004)
+        manager.reserve_write([resident], [False], basic_layout)
+        manager.finish_write([resident])
+
+        assert not manager.hold_read_allocations([resident, missing])
+        assert manager.delete([resident]) == {resident: L1Error.SUCCESS}
         manager.close()
 
 

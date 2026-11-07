@@ -81,6 +81,11 @@ class _FakeStorageManager:
     def finish_read_by_owner(self, batch: list[tuple[int, list[object]]]) -> None:
         return None
 
+    def finish_read_with_hold_by_owner(
+        self, batch: list[tuple[int, list[object]]]
+    ) -> None:
+        return None
+
     def finish_read_prefetched(self, keys: list[object]) -> None:
         return None
 
@@ -92,6 +97,9 @@ class _FakeStorageManager:
         return {}
 
     def prepare_read_completion(self, keys, l1_owners=None):
+        return []
+
+    def prepare_read_completion_with_hold(self, keys, l1_owners=None):
         return []
 
     def unsafe_read(self, keys, l1_owners=None):
