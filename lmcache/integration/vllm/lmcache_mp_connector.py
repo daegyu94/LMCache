@@ -1380,6 +1380,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         tracker = self._get_or_create_request_tracker(request)
 
+        # vLLM may admit requests with skip_reading_prefix_cache while an
+        # asynchronous lookup is pending. Returning a completed miss here
+        # prevents that lookup's read locks and prefetch job from being left
+        # behind; the tracker is still needed for the normal store path. Older
+        # supported vLLM Request versions do not expose this flag.
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return 0, False
+
         # A failed asynchronous load is bypassed until vLLM admits the request
         # for local computation via update_state_after_alloc().  The scheduler
         # may poll this method repeatedly before that admission; do not submit
@@ -1553,6 +1561,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if self.role != KVConnectorRole.SCHEDULER:
             return
         if not self._eager_prefetch or request.resumable:
+            return
+        if getattr(request, "skip_reading_prefix_cache", False):
             return
 
         tracker = self._get_or_create_request_tracker(request)
