@@ -804,8 +804,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
                 required_chunk_alignment=scheduler_block_size,
                 # Heuristic cap: vLLM runs at most max_num_seqs requests, so
-                # more unconsumed lookups mostly queue ahead of the server's
-                # PING instead of being used soon. Eager prefetch submits on
+                # more unconsumed lookups only back up the shared RPC loop
+                # (delaying soon-to-run lookups and the heartbeat PING)
+                # instead of being used soon. Eager prefetch submits on
                 # enqueue by design, so a bound would starve requests that
                 # still need a scheduler-time lookup (e.g. preempted ones).
                 max_pending_lookups=(

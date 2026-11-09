@@ -8,6 +8,12 @@ from unittest.mock import MagicMock, PropertyMock
 # Third Party
 import pytest
 
+# First Party
+from tests.v1.mp_scheduler_adapter_test_utils import (
+    make_request_client,
+    make_scheduler_adapter,
+)
+
 
 @pytest.fixture
 def connector_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
@@ -232,3 +238,57 @@ def test_connector_defers_lookup_until_capacity_frees(
     adapter.can_submit_lookup.return_value = True
     assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
     adapter.maybe_submit_lookup_request.assert_called_once()
+
+
+def test_connector_sends_at_most_bound_lookups_through_real_adapter(
+    connector_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polling a burst sends LOOKUPs only up to the bound, then one per free slot."""
+    # Third Party
+    from vllm.v1.request import RequestStatus
+
+    module = connector_module
+    monkeypatch.setattr(
+        module.LMCacheMPConnector,
+        "role",
+        PropertyMock(return_value=module.KVConnectorRole.SCHEDULER),
+    )
+    client = make_request_client(chunk_size=256)
+    adapter = make_scheduler_adapter(
+        monkeypatch, {"server-a": client}, 16, max_pending_lookups=2
+    )
+    module.LMCacheMPSchedulerAdapter.return_value = adapter
+    connector = module.LMCacheMPConnector(
+        _scheduler_config(eager=False, max_num_seqs=128),
+        module.KVConnectorRole.SCHEDULER,
+    )
+    tokens = list(range(512))
+    requests = [
+        SimpleNamespace(
+            request_id=f"req-{i}",
+            status=RequestStatus.WAITING,
+            cache_salt="",
+            lora_request=None,
+            prompt_token_ids=tokens,
+            num_prompt_tokens=len(tokens),
+            all_token_ids=tokens,
+            num_computed_tokens=0,
+            mm_features=[],
+            sampling_params=None,
+        )
+        for i in range(5)
+    ]
+
+    # Two scheduler steps over the whole queue: lookups are still in flight,
+    # so every poll defers and only the first two requests ever submit.
+    for _ in range(2):
+        for request in requests:
+            assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+    assert client.lookup.call_count == 2
+
+    # Consuming one lookup frees one slot for the next deferred request.
+    adapter.cleanup_lookup_result("req-0")
+    for request in requests[1:]:
+        connector.get_num_new_matched_tokens(request, 0)
+    assert client.lookup.call_count == 3

@@ -84,17 +84,36 @@ scheduler. A query that fails on every attempt is re-sent once per check
 without a limit; a server that is down stops being queried once the heartbeat
 marks it unhealthy.
 
-**Bounded submission.** vLLM's scheduler skips a waiting request whose
-lookup is pending without spending token budget and keeps walking the queue,
-so without a bound one step submits a LOOKUP for every waiting request. LOOKUP
-and PING share the server's request pool, so a burst of thousands (e.g. an RL
-rollout) delays the heartbeat PING past its timeout and the adapter enters
-degraded mode, where every lookup checked reports a miss. The connector
-therefore passes `max_num_seqs` as `max_pending_lookups` and checks
-`can_submit_lookup` before submitting; a request over the bound gets `None`
-and is polled again next step. A request that already has a `LookupState` is
-always admissible so its result can be collected. The bound is off under
-`lmcache.mp.eager_prefetch`, which submits on enqueue by design.
+**Bounded submission.** vLLM's waiting queue can hold far more requests
+than `max_num_seqs`. The scheduler skips a waiting request whose lookup is
+pending without spending token budget and keeps walking the queue, so without
+a bound LMCache submits a LOOKUP for every waiting request it is polled for,
+which is the whole queue whenever the running batch has room. Every RPC of
+the scheduler process (LOOKUP, its ack, QUERY_PREFETCH_STATUS, the replies'
+callbacks, and the heartbeat PING) runs on the one shared ZMQ client loop
+thread, so a queue thousands deep turns into a LOOKUP burst that backs that
+path up for seconds even though the server handles each LOOKUP in well under a
+millisecond. Lookups of the requests that are about to run wait behind lookups
+of requests that cannot run for a long time, delaying admission, and the PING
+can miss its timeout, after which the adapter enters degraded mode, where
+every lookup checked reports a miss. The connector
+passes `max_pending_lookups` and checks `can_submit_lookup` before
+submitting; a request over the bound gets `None` and is polled again next
+step. A request that already has a `LookupState` is always admissible so its
+result can be collected. The bound is off under `lmcache.mp.eager_prefetch`,
+which submits on enqueue by design.
+
+The bound is `max_num_seqs` because that is the largest value that never
+delays admission: one step admits at most `max_num_seqs - len(running)`
+requests, and each admission frees a slot in the same step. A resolved lookup
+whose request cannot be admitted yet keeps its slot, but such a request stops
+the waiting loop (`break` on a failed allocation or exhausted budget), so the
+requests behind it could not be admitted earlier anyway; keeping the slot also
+bounds the chunk locks and L1 prefetch held for retrieval. vLLM's
+`max_num_active_seqs`, when set, is at most `max_num_seqs`, so the argument
+holds for it too. The bound is not a throughput limit of the RPC path: it
+shortens the backlog ahead of PING but does not guarantee the heartbeat, for
+example with high TP or a large `max_num_seqs`.
 
 **Blocking mode.** With `lmcache.mp.nonblocking_lookup_status=false`,
 `on_scheduler_check()` also waits, up to each RPC's deadline, for the
