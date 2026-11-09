@@ -537,6 +537,7 @@ class LMCacheMPSchedulerAdapter:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
         required_chunk_alignment: int | None = None,
+        max_pending_lookups: int | None = None,
     ):
         """
         Args:
@@ -559,6 +560,8 @@ class LMCacheMPSchedulerAdapter:
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             required_chunk_alignment: Optional model-derived chunk alignment
                 used to bind or validate the LMCache server chunk size.
+            max_pending_lookups: Bound on lookups submitted but not yet
+                cleaned up; see ``can_submit_lookup``. None means no bound.
         """
         (
             vllm_block_size,
@@ -594,6 +597,9 @@ class LMCacheMPSchedulerAdapter:
         # once resolved, so repeated checks return the same value after the
         # server has handed the hit count over (exactly once).
         self._lookups: dict[str, LookupState] = {}
+        # Upper bound on len(self._lookups) for new requests (None: unbounded),
+        # enforced by callers through can_submit_lookup.
+        self._max_pending_lookups = max_pending_lookups
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -704,6 +710,30 @@ class LMCacheMPSchedulerAdapter:
             self._mq_timeout,
             self._required_chunk_alignment,
             server_url,
+        )
+
+    def can_submit_lookup(self, request_id: str) -> bool:
+        """Whether a lookup for ``request_id`` may be submitted now.
+
+        Lookups count against ``max_pending_lookups`` from submission until
+        ``cleanup_lookup_result``. A request that already has a lookup is
+        always admissible, so its result can still be polled.
+
+        ``maybe_submit_lookup_request`` does not apply the bound, so callers
+        must check this first. If submit enforced it instead, a refused
+        request would get 0 from ``check_lookup_result`` (a miss) rather
+        than being deferred.
+
+        Args:
+            request_id: The request about to look up.
+
+        Returns:
+            True if the request has a lookup or the bound has room.
+        """
+        return (
+            self._max_pending_lookups is None
+            or request_id in self._lookups
+            or len(self._lookups) < self._max_pending_lookups
         )
 
     @_lmcache_nvtx_annotate

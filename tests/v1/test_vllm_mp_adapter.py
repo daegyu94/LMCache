@@ -474,6 +474,37 @@ def test_scheduler_reset_cache_keeps_lookups_in_flight(
     assert adapter.check_lookup_result("req-1") == 512
 
 
+def test_scheduler_bounds_unconsumed_lookups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New lookups wait for capacity; in-flight ones stay admissible."""
+    client = make_request_client(chunk_size=256)
+    adapter = make_scheduler_adapter(
+        monkeypatch, {"server-a": client}, 16, max_pending_lookups=2
+    )
+    assert adapter.maybe_submit_lookup_request("req-1", list(range(512)))
+    assert adapter.maybe_submit_lookup_request("req-2", list(range(512)))
+
+    assert adapter.can_submit_lookup("req-3") is False
+    # A request whose lookup is in flight must still be polled for its result.
+    assert adapter.can_submit_lookup("req-1") is True
+
+    adapter.cleanup_lookup_result("req-1")
+    assert adapter.can_submit_lookup("req-3") is True
+
+
+def test_scheduler_lookups_unbounded_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without max_pending_lookups every lookup may go out."""
+    client = make_request_client(chunk_size=256)
+    adapter = make_scheduler_adapter(monkeypatch, {"server-a": client}, 16)
+    for i in range(4):
+        assert adapter.maybe_submit_lookup_request(f"req-{i}", list(range(512)))
+
+    assert adapter.can_submit_lookup("req-new") is True
+
+
 @pytest.mark.parametrize(
     "error",
     [TimeoutError("server down"), RuntimeError("rpc failed")],

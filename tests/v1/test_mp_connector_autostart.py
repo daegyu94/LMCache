@@ -84,6 +84,7 @@ def test_connector_multiserver_autostart_fails_before_network(
         parallel_config=SimpleNamespace(
             world_size=2, data_parallel_size=1, pipeline_parallel_size=1
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=256),
     )
     if enabled in (True, "true"):
         with pytest.raises(ValueError, match="only supports a single server"):
@@ -132,6 +133,7 @@ def test_connector_single_server_autostart_keeps_resolved_endpoint(
         parallel_config=SimpleNamespace(
             world_size=2, data_parallel_size=1, pipeline_parallel_size=1
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=256),
     )
     module.LMCacheMPConnector(config, role)
     expected = "tcp://localhost:6000" if explicit_url else "tcp://127.0.0.1:5555"
@@ -141,3 +143,92 @@ def test_connector_single_server_autostart_keeps_resolved_endpoint(
         ]
     else:
         assert module.LMCacheMPWorkerAdapter.call_args.kwargs["server_url"] == expected
+
+
+def _scheduler_config(eager: bool, max_num_seqs: int) -> SimpleNamespace:
+    """Single-server, non-autostart scheduler config for lookup-bound tests."""
+    extra: dict[str, object] = {
+        "lmcache.mp.host": "127.0.0.1",
+        "lmcache.mp.port": 5555,
+        "lmcache.mp.eager_prefetch": eager,
+    }
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config=extra,
+            get_from_extra_config=extra.get,
+            is_kv_producer=True,
+        ),
+        parallel_config=SimpleNamespace(
+            world_size=2, data_parallel_size=1, pipeline_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+    )
+
+
+@pytest.mark.parametrize(("eager", "expected"), [(False, 128), (True, None)])
+def test_scheduler_lookup_bound_follows_max_num_seqs_unless_eager(
+    connector_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    eager: bool,
+    expected: int | None,
+) -> None:
+    """Lookups are bounded by max_num_seqs, except under eager prefetch."""
+    module = connector_module
+    monkeypatch.setattr(
+        module.LMCacheMPConnector,
+        "role",
+        PropertyMock(return_value=module.KVConnectorRole.SCHEDULER),
+    )
+    module.LMCacheMPConnector(
+        _scheduler_config(eager, max_num_seqs=128), module.KVConnectorRole.SCHEDULER
+    )
+
+    kwargs = module.LMCacheMPSchedulerAdapter.call_args.kwargs
+    assert kwargs["max_pending_lookups"] == expected
+
+
+def test_connector_defers_lookup_until_capacity_frees(
+    connector_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At the bound the connector defers, then submits once capacity frees."""
+    # Third Party
+    from vllm.v1.request import RequestStatus
+
+    module = connector_module
+    monkeypatch.setattr(
+        module.LMCacheMPConnector,
+        "role",
+        PropertyMock(return_value=module.KVConnectorRole.SCHEDULER),
+    )
+    adapter = MagicMock(name="scheduler_adapter")
+    adapter.lmcache_tokens_per_chunk = 16
+    adapter.experimental = set()
+    adapter.can_submit_lookup.return_value = False
+    adapter.check_lookup_result.return_value = None
+    module.LMCacheMPSchedulerAdapter.return_value = adapter
+    connector = module.LMCacheMPConnector(
+        _scheduler_config(eager=False, max_num_seqs=128),
+        module.KVConnectorRole.SCHEDULER,
+    )
+    tokens = list(range(64))
+    request = SimpleNamespace(
+        request_id="req-1",
+        status=RequestStatus.WAITING,
+        cache_salt="",
+        lora_request=None,
+        prompt_token_ids=tokens,
+        num_prompt_tokens=len(tokens),
+        all_token_ids=tokens,
+        num_computed_tokens=0,
+        mm_features=[],
+        sampling_params=None,
+    )
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+    adapter.maybe_submit_lookup_request.assert_not_called()
+
+    adapter.can_submit_lookup.return_value = True
+    assert connector.get_num_new_matched_tokens(request, 0) == (None, True)
+    adapter.maybe_submit_lookup_request.assert_called_once()

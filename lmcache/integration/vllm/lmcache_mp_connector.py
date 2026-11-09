@@ -803,6 +803,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
                 required_chunk_alignment=scheduler_block_size,
+                # Heuristic cap: vLLM runs at most max_num_seqs requests, so
+                # more unconsumed lookups mostly queue ahead of the server's
+                # PING instead of being used soon. Eager prefetch submits on
+                # enqueue by design, so a bound would starve requests that
+                # still need a scheduler-time lookup (e.g. preempted ones).
+                max_pending_lookups=(
+                    None
+                    if self._eager_prefetch
+                    else vllm_config.scheduler_config.max_num_seqs
+                ),
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
             # Worker events aggregated per step, awaiting take_events().
@@ -1377,6 +1387,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             call. If the cache cannot be loaded for some tokens (e.g., due to
             connectivity issues or eviction), those tokens must not be taken
             into account.
+
+            While the scheduler adapter's bound on unconsumed lookups is full,
+            a request without a lookup gets None and no lookup is submitted;
+            it is submitted on a later call once capacity frees.
         """
         tracker = self._get_or_create_request_tracker(request)
 
@@ -1429,6 +1443,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 // tokens_per_chunk
                 * tokens_per_chunk
             )
+
+        # vLLM polls every waiting request each step; defer the ones beyond
+        # the lookup bound instead of submitting a lookup for the whole queue.
+        if not self.scheduler_adapter.can_submit_lookup(request.request_id):
+            return None, True
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()

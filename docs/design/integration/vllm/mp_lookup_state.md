@@ -12,6 +12,7 @@ server acks, not one scheduler step later.
 
 | Adapter call | `LookupState` call |
 |---|---|
+| `can_submit_lookup` | none (checks the bound on live `LookupState`s) |
 | `maybe_submit_lookup_request` | create, `submit()` (sends LOOKUP to every server) |
 | `check_lookup_result` | `on_scheduler_check()`, then `get_result()` |
 | `cleanup_lookup_result` | `close()` and forget the object |
@@ -82,6 +83,18 @@ QUERY_PREFETCH_STATUS is treated like `None` and never raised into the
 scheduler. A query that fails on every attempt is re-sent once per check
 without a limit; a server that is down stops being queried once the heartbeat
 marks it unhealthy.
+
+**Bounded submission.** vLLM's scheduler skips a waiting request whose
+lookup is pending without spending token budget and keeps walking the queue,
+so without a bound one step submits a LOOKUP for every waiting request. LOOKUP
+and PING share the server's request pool, so a burst of thousands (e.g. an RL
+rollout) delays the heartbeat PING past its timeout and the adapter enters
+degraded mode, where every lookup checked reports a miss. The connector
+therefore passes `max_num_seqs` as `max_pending_lookups` and checks
+`can_submit_lookup` before submitting; a request over the bound gets `None`
+and is polled again next step. A request that already has a `LookupState` is
+always admissible so its result can be collected. The bound is off under
+`lmcache.mp.eager_prefetch`, which submits on enqueue by design.
 
 **Blocking mode.** With `lmcache.mp.nonblocking_lookup_status=false`,
 `on_scheduler_check()` also waits, up to each RPC's deadline, for the

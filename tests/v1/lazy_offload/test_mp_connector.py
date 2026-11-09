@@ -134,6 +134,10 @@ class _FakeSchedulerAdapter:
         self.shutdown_calls += 1
         self.call_log.append("adapter.shutdown")
 
+    def can_submit_lookup(self, request_id: str) -> bool:
+        """Never bound lookups; these tests exercise store routing."""
+        return True
+
     def maybe_submit_lookup_request(
         self,
         request_id: str,
@@ -198,6 +202,7 @@ def _make_vllm_config(
         model_config=SimpleNamespace(
             model="test-model", use_mla=False, is_hybrid=False
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=256),
     )
 
 
