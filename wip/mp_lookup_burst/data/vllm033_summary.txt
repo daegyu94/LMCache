@@ -1,0 +1,24 @@
+== trace_none    degraded-mode entries (whole run): 1
+  N=8192: first=8.128 256th=17.779 p50=38.56 makespan=61.76 | waiting max=7964
+    LOOKUP submitted=8203 peak/s=2797 | submit->server lag max=4.18s | server handler sum=1.04s | QUERY=0
+    heartbeat PING rtt (s): [8.13, 0.0, 0.0, 0.0, 0.0] ok: ['True', 'True', 'True', 'True', 'True']
+  N=8192: first=9.442 256th=21.025 p50=42.171 makespan=65.737 | waiting max=7986
+    LOOKUP submitted=8198 peak/s=3641 | submit->server lag max=6.21s | server handler sum=0.88s | QUERY=0
+    heartbeat PING rtt (s): [0.0, 10.0, 0.0, 0.0, 0.0, 0.01] ok: ['True', 'False', 'True', 'True', 'True', 'True']
+== trace_cap256    degraded-mode entries (whole run): 0
+  N=8192: first=8.24 256th=9.021 p50=26.773 makespan=46.425 | waiting max=7575
+    LOOKUP submitted=8197 peak/s=514 | submit->server lag max=0.12s | server handler sum=0.88s | QUERY=0
+    heartbeat PING rtt (s): [0.01, 0.0, 0.0, 0.0] ok: ['True', 'True', 'True', 'True']
+  N=8192: first=9.682 256th=9.81 p50=27.821 makespan=48.249 | waiting max=7623
+    LOOKUP submitted=8198 peak/s=512 | submit->server lag max=0.25s | server handler sum=1.08s | QUERY=0
+    heartbeat PING rtt (s): [0.0, 0.0, 0.0, 0.0, 0.0] ok: ['True', 'True', 'True', 'True', 'True']
+== trace_s_none    degraded-mode entries (whole run): 0
+  N=8192: first=8.058 256th=16.266 p50=36.893 makespan=60.459 | waiting max=7979
+    LOOKUP submitted=8220 peak/s=3273 | submit->server lag max=4.22s | server handler sum=1.03s | QUERY=8220
+    schedule() sum=8.3s (connector polls 4.9s, 891870 polls) longest step=0.24s
+    heartbeat PING rtt (s): [6.67, 0.0, 0.0, 0.0, 0.01] ok: ['True', 'True', 'True', 'True', 'True']
+== trace_s_cap256    degraded-mode entries (whole run): 0
+  N=8192: first=9.02 256th=9.118 p50=26.867 makespan=47.437 | waiting max=7621
+    LOOKUP submitted=8192 peak/s=518 | submit->server lag max=0.12s | server handler sum=0.88s | QUERY=8192
+    schedule() sum=2.6s (connector polls 0.6s, 431068 polls) longest step=0.16s
+    heartbeat PING rtt (s): [0.0, 0.0, 0.0, 0.0] ok: ['True', 'True', 'True', 'True']

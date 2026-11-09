@@ -1,0 +1,20 @@
+[Perf][MP] Bound unconsumed scheduler lookups by max_num_seqs
+
+vLLM's waiting queue can hold far more requests than max_num_seqs. While a
+connector lookup is pending, vLLM's scheduler skips the request without
+spending token budget and keeps walking the queue, so whenever the running
+batch has room LMCache submits a LOOKUP for every waiting request in one
+step. The server handles LOOKUP and PING in the same BLOCKING pool, so a
+deep queue turns into a LOOKUP burst that delays the heartbeat PING past its
+timeout; the adapter then enters degraded mode, and every lookup checked
+meanwhile reports a miss and is recomputed.
+
+Bound lookups that are submitted but not yet cleaned up by max_num_seqs,
+the largest bound that never delays admission. A request beyond the bound
+returns (None, True) so vLLM polls it again next step; a request with a
+lookup in flight is always admissible so its result can still be collected.
+The bound is disabled under lmcache.mp.eager_prefetch, which submits on
+enqueue by design.
+
+The bound shortens the backlog ahead of PING; it is not a server-capacity
+limit and does not guarantee the heartbeat on its own.

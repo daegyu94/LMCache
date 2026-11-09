@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>[Perf][MP] Bound unconsumed scheduler lookups by max_num_seqs | Reviewer guide / 审阅指南</title>
+<style>
+:root{
+  --bg:#ffffff; --fg:#1f2328; --muted:#59636e; --line:#d1d9e0; --soft:#f6f8fa;
+  --accent:#0969da; --accent-soft:#ddf4ff; --bad:#cf222e; --bad-soft:#ffebe9;
+  --good:#1a7f37; --good-soft:#dafbe1; --warn:#9a6700; --warn-soft:#fff8c5;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans","Helvetica Neue",Arial,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#3d444d;--soft:#151b23;
+    --accent:#4493f8;--accent-soft:#0c2d6b;--bad:#f85149;--bad-soft:#3c1618;
+    --good:#3fb950;--good-soft:#0f2e1a;--warn:#d29922;--warn-soft:#3a2d0b;}
+}
+*{box-sizing:border-box}
+html{font-family:var(--sans);color:var(--fg);background:var(--bg);line-height:1.6}
+body{margin:0}
+main{max-width:980px;margin:0 auto;padding:24px 20px 80px}
+h1{font-size:1.6rem;line-height:1.3;margin:.2em 0 .4em}
+h2{font-size:1.25rem;margin:2.2em 0 .6em;padding-bottom:.3em;border-bottom:1px solid var(--line)}
+h3{font-size:1.05rem;margin:1.6em 0 .4em}
+p,li{max-width:76ch}
+code,pre{font-family:var(--mono);font-size:.88em}
+code{background:var(--soft);padding:.1em .35em;border-radius:4px}
+pre{background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:12px 14px;overflow-x:auto;line-height:1.45}
+pre code{background:none;padding:0}
+.add{color:var(--good)} .ctx{color:var(--muted)}
+a{color:var(--accent)}
+table{border-collapse:collapse;width:100%;margin:.6em 0;font-size:.93em}
+th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+th{background:var(--soft)}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.meta{color:var(--muted);font-size:.92em}
+.callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:0 6px 6px 0;margin:1em 0}
+.callout.warn{border-color:var(--warn);background:var(--warn-soft)}
+.callout.bad{border-color:var(--bad);background:var(--bad-soft)}
+.callout.good{border-color:var(--good);background:var(--good-soft)}
+figure{margin:1.4em 0;border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--bg)}
+figcaption{color:var(--muted);font-size:.9em;margin-top:8px}
+svg{max-width:100%;height:auto;display:block}
+svg text{font-family:var(--sans);fill:var(--fg)}
+svg .mono{font-family:var(--mono)}
+svg .box{fill:var(--soft);stroke:var(--line)}
+svg .hl{fill:var(--accent-soft);stroke:var(--accent)}
+svg .badbox{fill:var(--bad-soft);stroke:var(--bad)}
+svg .goodbox{fill:var(--good-soft);stroke:var(--good)}
+svg .warnbox{fill:var(--warn-soft);stroke:var(--warn)}
+svg .edge{stroke:var(--muted);fill:none;stroke-width:1.5}
+svg .edge.good{stroke:var(--good)} svg .edge.bad{stroke:var(--bad)}
+svg .small{font-size:12px} svg .tiny{font-size:11px;fill:var(--muted)}
+svg .title{font-size:14px;font-weight:600}
+.toolbar{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+.toolbar .inner{max-width:980px;margin:0 auto;padding:8px 20px;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.toolbar .brand{font-weight:600;font-size:.95em}
+button{font:inherit;font-size:.9em;padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:var(--soft);color:var(--fg);cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+.lang-switch{display:flex;gap:4px}
+.toc{columns:2;column-gap:24px;font-size:.93em;padding-left:1.2em}
+main{overflow-wrap:break-word}
+p code,li code,td code,h1 code,h3 code,figcaption code{overflow-wrap:anywhere}
+@media (max-width:720px){table{display:block;overflow-x:auto}main{padding:16px 12px 60px}}
+@media (max-width:640px){.toc{columns:1}}
+.stepper .controls{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.stepper .caption{min-height:4.5em;border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--soft)}
+.stepper svg .node{transition:fill .25s, stroke .25s}
+.stepper svg .node.active{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2.5}
+.stepper svg .node.done{fill:var(--good-soft)}
+@media (prefers-reduced-motion: reduce){.stepper svg .node{transition:none}}
+.js-only{display:none}
+html.js .js-only{display:block}
+.pill{display:inline-block;font-size:.78em;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin-left:4px;vertical-align:middle}
+.sev-b{color:var(--bad);border-color:var(--bad)} .sev-s{color:var(--warn);border-color:var(--warn)} .sev-n{color:var(--muted)}
+/* Language visibility: both shown without JS; JS picks one. */
+html[data-lang="en"] .zh{display:none !important}
+html[data-lang="zh"] .en{display:none !important}
+html:not([data-lang]) .zh{border-left:3px solid var(--line);padding-left:8px}
+html:not([data-lang]) span.zh{border:none;padding:0}
+html:not([data-lang]) span.zh::before{content:" / "}
+</style>
+</head>
+<body>
+<div class="toolbar"><div class="inner">
+  <span class="brand"><span class="en">Reviewer guide</span><span class="zh">审阅指南</span></span>
+  <div class="lang-switch js-only" role="group" aria-label="Language / 语言">
+    <button type="button" id="btn-en" aria-pressed="true" lang="en">English</button>
+    <button type="button" id="btn-zh" aria-pressed="false" lang="zh-CN">中文</button>
+  </div>
+</div></div>
+<main>
+
+<h1>[Perf][MP] Bound unconsumed scheduler lookups by <code>max_num_seqs</code></h1>
+<p class="meta">
+  <span class="en">Explained revision</span><span class="zh">对应提交</span>:
+  <a href="https://github.com/daegyu94/LMCache/commit/63b78a162383acc53881a88a021d1203eba8813e"><code>63b78a16</code></a>
+  &middot; <span class="en">base</span><span class="zh">基线</span>: <code>LMCache/LMCache@dev</code> (<code>cd29b563</code>)
+  &middot; <span class="en">1 commit, 8 files, +195 / &minus;1</span><span class="zh">1 个提交，8 个文件，+195 / &minus;1</span>
+</p>
+<div class="callout warn">
+  <p class="en">This guide describes exactly commit <code>63b78a16</code>. Any later AI-assisted change needs a regenerated guide. The code, tests, benchmark, and this guide were produced with an AI coding agent and checked by separate AI review passes; the human line-by-line review is still pending and tracked in the PR checklist.</p>
+  <p class="zh">本指南只对应提交 <code>63b78a16</code>。之后任何由 AI 辅助的改动都需要重新生成本指南。代码、测试、基准测试和本指南均由 AI 编程助手生成，并经过独立的 AI 审阅；人工逐行审阅尚未完成，状态见 PR 的检查清单。</p>
+</div>
+
+<nav aria-label="Contents">
+<ol class="toc">
+  <li><a href="#tldr"><span class="en">Summary</span><span class="zh">概要</span></a></li>
+  <li><a href="#problem"><span class="en">Problem: one step looks up the whole queue</span><span class="zh">问题：一个调度步查询整个队列</span></a></li>
+  <li><a href="#fig1"><span class="en">Before / after</span><span class="zh">修改前后对比</span></a></li>
+  <li><a href="#design"><span class="en">Design and alternatives</span><span class="zh">设计与备选方案</span></a></li>
+  <li><a href="#walk"><span class="en">Code walkthrough</span><span class="zh">代码逐段讲解</span></a></li>
+  <li><a href="#life"><span class="en">Lookup lifecycle (step-through)</span><span class="zh">lookup 生命周期（逐步演示）</span></a></li>
+  <li><a href="#liveness"><span class="en">Why the bound cannot leak or stall</span><span class="zh">为什么上限不会泄漏或卡死</span></a></li>
+  <li><a href="#bounds"><span class="en">Responsibility boundaries and tests</span><span class="zh">职责边界与测试</span></a></li>
+  <li><a href="#tests"><span class="en">Test rationale</span><span class="zh">测试的必要性</span></a></li>
+  <li><a href="#bench"><span class="en">Measurement</span><span class="zh">测量结果</span></a></li>
+  <li><a href="#compat"><span class="en">Compatibility, risks, known gaps</span><span class="zh">兼容性、风险与已知不足</span></a></li>
+  <li><a href="#review"><span class="en">Suggested review order and questions</span><span class="zh">建议审阅顺序与问题</span></a></li>
+  <li><a href="#validation"><span class="en">Validation performed</span><span class="zh">已做的验证</span></a></li>
+</ol>
+</nav>
+
+<h2 id="tldr"><span class="en">Summary</span><span class="zh">概要</span></h2>
+<div class="en">
+<ul>
+  <li><strong>Problem.</strong> With <code>LMCacheMPConnector</code>, a burst of N waiting requests gets N LOOKUP RPCs in a single vLLM scheduler step. On the LMCache MP server, LOOKUP and the heartbeat PING share one request pool, so the PING times out and the scheduler adapter enters <em>degraded mode</em>, in which lookups checked report a miss and are recomputed.</li>
+  <li><strong>Change.</strong> Lookups that have been submitted but not yet consumed are bounded by vLLM's <code>max_num_seqs</code>. A request beyond the bound returns <code>(None, True)</code>, the existing vLLM signal for "ask me again next step", without sending a LOOKUP.</li>
+  <li><strong>Scope.</strong> About 30 lines of production code in two files, no new config option, a design-doc update, and 5 new tests. The bound is off when <code>lmcache.mp.eager_prefetch</code> is enabled and for any caller that does not pass it.</li>
+  <li><strong>Effect (one GPU, N = 8192).</strong> The median TTFT went from 39.0&ndash;43.7 s to 28.0&ndash;28.3 s, which equals vanilla vLLM. Degraded-mode entries went from 1 to 0.</li>
+</ul>
+</div>
+<div class="zh">
+<ul>
+  <li><strong>问题。</strong>使用 <code>LMCacheMPConnector</code> 时，若有 N 个请求同时进入等待队列，vLLM 会在一个调度步内发出 N 个 LOOKUP RPC。LMCache MP 服务端的 LOOKUP 与心跳 PING 共用同一个请求线程池，因此 PING 超时，调度端 adapter 进入<em>降级模式（degraded mode）</em>。在此期间被检查的 lookup 一律按未命中处理，需要重新计算。</li>
+  <li><strong>改动。</strong>已提交但尚未被消费的 lookup 数量受 vLLM 的 <code>max_num_seqs</code> 限制。超出上限的请求返回 <code>(None, True)</code>，即 vLLM 已有的“下一步再问我”信号，并且不发送 LOOKUP。</li>
+  <li><strong>范围。</strong>两个文件中约 30 行生产代码，没有新增配置项，更新一份设计文档，新增 5 个测试。启用 <code>lmcache.mp.eager_prefetch</code> 时，以及调用方未传入上限时，上限均不生效。</li>
+  <li><strong>效果（单 GPU，N = 8192）。</strong>TTFT 中位数从 39.0&ndash;43.7 秒降到 28.0&ndash;28.3 秒，与原生 vLLM 持平。进入降级模式的次数从 1 次降为 0 次。</li>
+</ul>
+</div>
+
+<h2 id="problem"><span class="en">Problem: one scheduler step looks up the whole waiting queue</span><span class="zh">问题：一个调度步查询整个等待队列</span></h2>
+<div class="en">
+<p>vLLM v1's scheduler walks the waiting queue every step. For each request without computed tokens it asks the KV connector how many tokens are cached (<code>get_num_new_matched_tokens</code>). When the connector answers <code>None</code> ("not known yet"), the scheduler moves the request to a per-step skipped queue and <code>continue</code>s. The skip <em>does not consume token budget</em>, and the loop stops only when the running batch is full or the budget is exhausted (<code>vllm/v1/core/sched/scheduler.py</code>, waiting loop, vLLM 0.24).</p>
+<p><code>LMCacheMPConnector</code> answers <code>None</code> while its asynchronous lookup is in flight, which is true for every request in its first poll. vLLM's waiting queue can hold far more requests than <code>max_num_seqs</code>, for example after a burst of arrivals or when clients keep more requests in flight than one instance can run. Whenever the running batch has room, a single scheduler step therefore submits a LOOKUP for <em>every</em> waiting request: the number of LOOKUPs follows the queue depth, not what vLLM can run.</p>
+<p>On the server, <code>lookup</code>, <code>query_prefetch_status</code>, <code>free_lookup_locks</code>, <code>end_session</code>, and <code>ping</code> are all <code>HandlerType.BLOCKING</code> handlers in the NORMAL pool. That pool has <code>--max-cpu-workers</code> threads, which falls back to <code>--max-workers</code> (default 1). Each LOOKUP hashes the prompt, creates a session, and submits a prefetch, so thousands of them form a backlog of several seconds. The scheduler's heartbeat PING waits behind that backlog. If it gets no answer within <code>heartbeat_interval</code> (10 s), the adapter marks the server unhealthy. While it is unhealthy, <code>check_lookup_result</code> returns 0, so every request checked in that window is treated as a miss and recomputed. Recovery comes with the next successful PING, 10 s later.</p>
+</div>
+<div class="zh">
+<p>vLLM v1 调度器每一步都会遍历等待队列。对每个尚无已计算 token 的请求，它会询问 KV connector 有多少 token 已被缓存（<code>get_num_new_matched_tokens</code>）。若 connector 返回 <code>None</code>（“暂时未知”），调度器把该请求移入本步的跳过队列，然后 <code>continue</code>。这次跳过<em>不消耗 token 预算</em>；只有当运行批次已满或预算耗尽时循环才会停止（<code>vllm/v1/core/sched/scheduler.py</code> 中的等待队列循环，vLLM 0.24）。</p>
+<p><code>LMCacheMPConnector</code> 在异步 lookup 进行期间返回 <code>None</code>，而每个请求的第一次轮询都处于这种状态。vLLM 的等待队列可以容纳远多于 <code>max_num_seqs</code> 的请求，例如请求突发到达之后，或客户端同时保持的请求数超过单个实例能运行的数量时。因此只要运行批次还有空位，一个调度步就会为<em>所有</em>等待中的请求提交 LOOKUP：LOOKUP 的数量取决于队列深度，而不是 vLLM 能运行多少请求。</p>
+<p>在服务端，<code>lookup</code>、<code>query_prefetch_status</code>、<code>free_lookup_locks</code>、<code>end_session</code> 和 <code>ping</code> 都是 NORMAL 线程池中的 <code>HandlerType.BLOCKING</code> 处理函数。该线程池的线程数由 <code>--max-cpu-workers</code> 决定，未设置时沿用 <code>--max-workers</code>（默认 1）。每个 LOOKUP 都要计算 prompt 的哈希、创建 session 并提交 prefetch，数千个 LOOKUP 会积压成数秒的队列。调度端的心跳 PING 排在这批积压之后。若在 <code>heartbeat_interval</code>（10 秒）内收不到回应，adapter 就把服务端标记为不健康。不健康期间 <code>check_lookup_result</code> 返回 0，因此这段时间内被检查的请求都按未命中处理并重新计算。要等 10 秒后下一次 PING 成功才会恢复。</p>
+</div>
+
+<figure id="fig1" aria-labelledby="fig1cap">
+<svg viewBox="0 0 940 430" role="img" aria-labelledby="fig1title fig1desc">
+  <title id="fig1title">Before and after: lookups submitted in one scheduler step and their effect on the server request pool</title>
+  <desc id="fig1desc">Before: the scheduler step submits a LOOKUP for all 8192 waiting requests, which queue in the server NORMAL pool ahead of the heartbeat PING; the PING times out after 10 seconds and the adapter enters degraded mode. After: at most max_num_seqs (256) lookups are unconsumed; the remaining requests return None and are polled next step; the PING is served promptly.</desc>
+  <!-- BEFORE -->
+  <text x="20" y="26" class="title en">Before (dev)</text><text x="20" y="26" class="title zh">修改前（dev）</text>
+  <rect x="20" y="40" width="200" height="70" rx="8" class="box"/>
+  <text x="34" y="64" class="small en">vLLM scheduler step</text><text x="34" y="64" class="small zh">vLLM 调度步</text>
+  <text x="34" y="84" class="tiny en">walks 8192 waiting requests</text><text x="34" y="84" class="tiny zh">遍历 8192 个等待请求</text>
+  <text x="34" y="100" class="tiny en">None → skip, no budget used</text><text x="34" y="100" class="tiny zh">None → 跳过，不耗预算</text>
+  <path d="M220 75 H290" class="edge bad" marker-end="url(#arrBad)"/>
+  <text x="232" y="56" class="tiny">8192 ×</text><text x="232" y="68" class="tiny">LOOKUP</text>
+  <rect x="290" y="40" width="430" height="70" rx="8" class="badbox"/>
+  <text x="304" y="62" class="small en">MP server NORMAL pool (1 thread by default)</text><text x="304" y="62" class="small zh">MP 服务端 NORMAL 线程池（默认 1 个线程）</text>
+  <g class="mono" font-size="11">
+    <rect x="304" y="72" width="44" height="26" rx="3" class="box"/><text x="310" y="89">LKP</text>
+    <rect x="352" y="72" width="44" height="26" rx="3" class="box"/><text x="358" y="89">LKP</text>
+    <rect x="400" y="72" width="44" height="26" rx="3" class="box"/><text x="406" y="89">LKP</text>
+    <text x="452" y="90">… ×8192 …</text>
+    <rect x="540" y="72" width="44" height="26" rx="3" class="box"/><text x="546" y="89">LKP</text>
+    <rect x="590" y="72" width="54" height="26" rx="3" class="badbox"/><text x="598" y="89">PING</text>
+  </g>
+  <path d="M720 75 H760" class="edge bad" marker-end="url(#arrBad)"/>
+  <rect x="760" y="40" width="160" height="70" rx="8" class="badbox"/>
+  <text x="772" y="62" class="small en">PING &gt; 10 s timeout</text><text x="772" y="62" class="small zh">PING 超过 10 秒超时</text>
+  <text x="772" y="82" class="tiny en">adapter: degraded mode</text><text x="772" y="82" class="tiny zh">adapter 进入降级模式</text>
+  <text x="772" y="98" class="tiny en">lookups → 0 (recompute)</text><text x="772" y="98" class="tiny zh">lookup 结果为 0（重算）</text>
+  <!-- AFTER -->
+  <text x="20" y="176" class="title en">After (this PR)</text><text x="20" y="176" class="title zh">修改后（本 PR）</text>
+  <rect x="20" y="190" width="200" height="110" rx="8" class="box"/>
+  <text x="34" y="214" class="small en">vLLM scheduler step</text><text x="34" y="214" class="small zh">vLLM 调度步</text>
+  <text x="34" y="234" class="tiny en">first 256 polls: room → submit</text><text x="34" y="234" class="tiny zh">前 256 次轮询：有空位 → 提交</text>
+  <text x="34" y="252" class="tiny en">rest: can_submit_lookup False</text><text x="34" y="252" class="tiny zh">其余：can_submit_lookup 为 False</text>
+  <text x="34" y="270" class="tiny en">→ (None, True), no RPC</text><text x="34" y="270" class="tiny zh">→ (None, True)，不发 RPC</text>
+  <text x="34" y="288" class="tiny en">→ polled again next step</text><text x="34" y="288" class="tiny zh">→ 下一步再轮询</text>
+  <path d="M220 225 H290" class="edge good" marker-end="url(#arrGood)"/>
+  <text x="230" y="206" class="tiny">≤ 256 ×</text><text x="230" y="218" class="tiny">LOOKUP</text>
+  <rect x="290" y="190" width="430" height="70" rx="8" class="goodbox"/>
+  <text x="304" y="212" class="small en">MP server NORMAL pool</text><text x="304" y="212" class="small zh">MP 服务端 NORMAL 线程池</text>
+  <g class="mono" font-size="11">
+    <rect x="304" y="222" width="44" height="26" rx="3" class="box"/><text x="310" y="239">LKP</text>
+    <rect x="352" y="222" width="44" height="26" rx="3" class="box"/><text x="358" y="239">LKP</text>
+    <text x="404" y="240">… ≤256 …</text>
+    <rect x="480" y="222" width="54" height="26" rx="3" class="goodbox"/><text x="488" y="239">PING</text>
+  </g>
+  <path d="M720 225 H760" class="edge good" marker-end="url(#arrGood)"/>
+  <rect x="760" y="190" width="160" height="70" rx="8" class="goodbox"/>
+  <text x="772" y="212" class="small en">PING answered</text><text x="772" y="212" class="small zh">PING 及时响应</text>
+  <text x="772" y="232" class="tiny en">server stays healthy</text><text x="772" y="232" class="tiny zh">服务端保持健康</text>
+  <text x="772" y="248" class="tiny en">hits are kept</text><text x="772" y="248" class="tiny zh">命中结果保留</text>
+  <!-- consumption loop -->
+  <path d="M505 260 V330 H120 V300" class="edge good" marker-end="url(#arrGood)"/>
+  <text x="140" y="348" class="tiny en">vLLM allocates a request → update_state_after_alloc → cleanup_lookup_result frees one slot</text>
+  <text x="140" y="348" class="tiny zh">vLLM 为请求分配 block → update_state_after_alloc → cleanup_lookup_result 释放一个空位</text>
+  <text x="20" y="396" class="tiny en">Numbers are from the measured setup (max_num_seqs = 256, N = 8192). The "LKP" boxes stand for queued LOOKUP RPCs; drawn queue lengths are schematic.</text>
+  <text x="20" y="396" class="tiny zh">数字取自实测配置（max_num_seqs = 256，N = 8192）。“LKP” 方块表示排队中的 LOOKUP RPC；队列长度仅为示意。</text>
+  <defs>
+    <marker id="arrBad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#cf222e"/></marker>
+    <marker id="arrGood" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#1a7f37"/></marker>
+  </defs>
+</svg>
+<figcaption id="fig1cap"><span class="en">Figure 1. Before/after behavior for a cold burst of 8192 requests. The bound limits how many LOOKUPs can be queued ahead of the heartbeat PING. Because a slot is freed only when vLLM actually admits a request, lookup submission follows the scheduler's own pace.</span><span class="zh">图 1：8192 个请求冷启动突发时的修改前后对比。上限限制了能排在心跳 PING 之前的 LOOKUP 数量。只有当 vLLM 真正接纳某个请求时才会释放空位，因此 lookup 的提交节奏与调度器自身的节奏一致。</span></figcaption>
+</figure>
+
+<h2 id="design"><span class="en">Design and alternatives</span><span class="zh">设计与备选方案</span></h2>
+<div class="en">
+<h3>What is bounded</h3>
+<p>The adapter already keeps <code>self._lookups: dict[str, LookupState]</code>. An entry is added when a LOOKUP is submitted and removed by <code>cleanup_lookup_result</code>. So <code>len(self._lookups)</code> is exactly the number of lookups that have been submitted but not yet consumed, and no new counter is needed. The bound is checked against that size.</p>
+<h3>Why the check lives in the connector, not inside <code>maybe_submit_lookup_request</code></h3>
+<p>If <code>maybe_submit_lookup_request</code> silently refused, the next <code>check_lookup_result</code> would find no lookup for the request and return 0. That reads as a <em>cache miss</em>, so the request would be computed from scratch instead of deferred. The connector therefore asks <code>can_submit_lookup</code> first and returns <code>(None, True)</code>. The method's docstring states that callers must check it first.</p>
+<h3>Why <code>max_num_seqs</code></h3>
+<p>vLLM can run at most <code>max_num_seqs</code> requests, so in one step it can admit at most <code>max_num_seqs &minus; len(running)</code> new ones. The bound is a heuristic, not a limit vLLM enforces: holding up to <code>max_num_seqs</code> unconsumed lookups gives a full batch of look-ahead, which keeps L2&rarr;L1 prefetch overlapping the queue wait, without letting the whole queue flood the server. It also reuses an existing engine setting, so no new option is introduced.</p>
+<h3>Why <code>max_pending_lookups</code> defaults to <code>None</code> (unbounded)</h3>
+<p>The adapter is also built by vLLM's in-tree fallback copy of the connector (<code>vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py</code>), which does not pass the new argument and never calls <code>can_submit_lookup</code>. With the default <code>None</code>, that path behaves exactly as before.</p>
+<h3>Why the bound is off under <code>lmcache.mp.eager_prefetch</code></h3>
+<p>Eager prefetch (opt-in, off by default) submits a lookup in <code>on_new_request</code> when a request is enqueued. That path is deliberately not gated: the user chose early lookups. With the bound active as well, eager lookups would fill it, and any request that still needs a scheduler-time lookup could be refused for as long as the backlog stays at or above <code>max_num_seqs</code>. That covers preempted requests (their first lookup was already consumed), resumable requests (skipped by <code>on_new_request</code>), and requests that arrived while the server was unhealthy. So the connector passes <code>None</code> in this mode, which keeps eager behavior unchanged.</p>
+<h3>Alternatives considered</h3>
+<table>
+<tr><th>Alternative</th><th>Why not (in this PR)</th></tr>
+<tr><td>Give PING its own server pool, or a higher priority</td><td>It treats the symptom (heartbeat starvation) but not the wasted work. The scheduler still sends thousands of LOOKUPs, takes locks, and prefetches for requests that will not run for minutes. The two fixes are complementary; this PR is the client-side half and touches no server or transport code.</td></tr>
+<tr><td>Enforce the bound inside <code>maybe_submit_lookup_request</code></td><td>A refused submit turns into a reported miss (see above).</td></tr>
+<tr><td>A new config option for the bound</td><td>No concrete need yet; <code>max_num_seqs</code> already expresses how many requests vLLM can run. The coding standard asks for no speculative options.</td></tr>
+<tr><td>A smaller fixed bound (e.g. 64)</td><td>Fewer queued LOOKUPs, but less look-ahead. Requests admitted in a step would more often find their lookup not yet started, which delays prefetch.</td></tr>
+</table>
+</div>
+<div class="zh">
+<h3>限制的对象</h3>
+<p>adapter 本来就维护 <code>self._lookups: dict[str, LookupState]</code>。提交 LOOKUP 时加入一项，<code>cleanup_lookup_result</code> 时删除。因此 <code>len(self._lookups)</code> 恰好等于“已提交但尚未被消费”的 lookup 数量，不需要新增计数器。上限就是针对这个大小来检查的。</p>
+<h3>为什么检查放在 connector，而不是 <code>maybe_submit_lookup_request</code> 内部</h3>
+<p>如果 <code>maybe_submit_lookup_request</code> 静默拒绝，下一次 <code>check_lookup_result</code> 找不到该请求的 lookup，会返回 0。这会被当作<em>缓存未命中</em>，请求会被从头计算，而不是延后。因此 connector 先调用 <code>can_submit_lookup</code>，没有空位时返回 <code>(None, True)</code>。该方法的 docstring 写明了调用方必须先做这项检查。</p>
+<h3>为什么选 <code>max_num_seqs</code></h3>
+<p>vLLM 最多同时运行 <code>max_num_seqs</code> 个请求，因此一步最多接纳 <code>max_num_seqs &minus; len(running)</code> 个新请求。这个上限是一种经验取值，并非 vLLM 自身强制的限制：保留最多 <code>max_num_seqs</code> 个未消费的 lookup，相当于提前准备一整批，让 L2&rarr;L1 prefetch 仍能与排队等待重叠，同时又不会让整个队列压垮服务端。它复用了现有的引擎配置，因此无需新增配置项。</p>
+<h3>为什么 <code>max_pending_lookups</code> 默认为 <code>None</code>（不限制）</h3>
+<p>vLLM 仓库内自带的后备版 connector（<code>vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py</code>）也会构造这个 adapter。它不传新参数，也不调用 <code>can_submit_lookup</code>。默认值为 <code>None</code> 时，这条路径的行为与以前完全相同。</p>
+<h3>为什么启用 <code>lmcache.mp.eager_prefetch</code> 时关闭上限</h3>
+<p>eager prefetch（需手动开启，默认关闭）会在请求入队时于 <code>on_new_request</code> 中提交 lookup。这条路径刻意不受上限约束，因为用户主动选择了提前 lookup。如果同时启用上限，eager lookup 会把上限占满；只要积压不低于 <code>max_num_seqs</code>，仍需要在调度时 lookup 的请求就可能一直被拒绝。这包括被抢占的请求（它们的第一次 lookup 已被消费）、可恢复（resumable）的请求（<code>on_new_request</code> 会跳过它们），以及服务端不健康期间到达的请求。因此在该模式下 connector 传入 <code>None</code>，eager 的行为保持不变。</p>
+<h3>考虑过的备选方案</h3>
+<table>
+<tr><th>备选方案</th><th>本 PR 不采用的原因</th></tr>
+<tr><td>为 PING 单独设置线程池，或提高其优先级</td><td>只能缓解症状（心跳饥饿），无法消除浪费的工作。调度端仍会为几分钟后才运行的请求发出数千个 LOOKUP、加锁并 prefetch。两种修复互为补充；本 PR 是客户端这一半，不改动服务端或传输层代码。</td></tr>
+<tr><td>在 <code>maybe_submit_lookup_request</code> 内部施加上限</td><td>被拒绝的提交会变成“未命中”（见上文）。</td></tr>
+<tr><td>为上限新增配置项</td><td>目前没有具体需求；<code>max_num_seqs</code> 已经表达了 vLLM 能同时运行多少请求。编码规范要求不添加推测性的配置项。</td></tr>
+<tr><td>使用更小的固定上限（如 64）</td><td>排队的 LOOKUP 更少，但提前量也更小。一步中被接纳的请求更可能发现自己的 lookup 尚未开始，从而推迟 prefetch。</td></tr>
+</table>
+</div>
+
+<h2 id="walk"><span class="en">Code walkthrough</span><span class="zh">代码逐段讲解</span></h2>
+<p class="en">Links point to the exact revision. Lines marked <span class="add">+</span> are added by this PR; the others are context.</p>
+<p class="zh">链接指向确切的提交版本。以 <span class="add">+</span> 标记的行为本 PR 新增，其余为上下文。</p>
+
+<h3>1. <code>LMCacheMPSchedulerAdapter.__init__</code>: <span class="en">new keyword and field</span><span class="zh">新增关键字参数与字段</span>
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/vllm_multi_process_adapter.py#L540">vllm_multi_process_adapter.py:540</a>,
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/vllm_multi_process_adapter.py#L600">:600</a></h3>
+<pre><code><span class="ctx">        required_chunk_alignment: int | None = None,</span>
+<span class="add">+       max_pending_lookups: int | None = None,</span>
+<span class="ctx">    ):</span>
+<span class="ctx">        ...</span>
+<span class="ctx">        self._lookups: dict[str, LookupState] = {}</span>
+<span class="add">+       # Upper bound on len(self._lookups) for new requests (None: unbounded),</span>
+<span class="add">+       # enforced by callers through can_submit_lookup.</span>
+<span class="add">+       self._max_pending_lookups = max_pending_lookups</span></code></pre>
+<p class="en">The argument is keyword-only and defaults to <code>None</code>, so existing positional and keyword callers are unaffected. It is documented in the constructor docstring.</p>
+<p class="zh">该参数为仅限关键字参数，默认值为 <code>None</code>，因此现有的按位置或按关键字调用都不受影响。构造函数的 docstring 中已有说明。</p>
+
+<h3>2. <code>can_submit_lookup</code>: <span class="en">the admission rule</span><span class="zh">准入规则</span>
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/vllm_multi_process_adapter.py#L715">vllm_multi_process_adapter.py:715</a></h3>
+<pre><code><span class="add">+   def can_submit_lookup(self, request_id: str) -> bool:</span>
+<span class="add">+       ...</span>
+<span class="add">+       return (</span>
+<span class="add">+           self._max_pending_lookups is None</span>
+<span class="add">+           or request_id in self._lookups</span>
+<span class="add">+           or len(self._lookups) &lt; self._max_pending_lookups</span>
+<span class="add">+       )</span></code></pre>
+<div class="en"><p>There are three clauses:</p>
+<ol>
+<li><strong>No bound configured</strong>: always admit. This is the legacy and eager-prefetch behavior.</li>
+<li><strong>Request already has a lookup</strong>: always admit. The scheduler polls the same request every step until it is allocated. Refusing it would hide a result that has already been paid for, and the request would never leave the bound, which is a self-inflicted stall.</li>
+<li><strong>Otherwise</strong>: admit only while there is room.</li>
+</ol>
+<p>The method is pure: it reads state and has no side effects. Everything runs on the scheduler thread, like the rest of the per-request dict (see <code>docs/design/integration/vllm/mp_lookup_state.md</code>, "Threading").</p></div>
+<div class="zh"><p>共有三个条件：</p>
+<ol>
+<li><strong>未配置上限</strong>：总是允许。这是旧行为，也是 eager prefetch 的行为。</li>
+<li><strong>请求已有 lookup</strong>：总是允许。在被分配 block 之前，调度器每一步都会轮询同一个请求。若拒绝它，已经付出代价得到的结果会被藏起来，而这个请求也永远不会离开上限，等于自己把自己卡死。</li>
+<li><strong>其他情况</strong>：只在有空位时允许。</li>
+</ol>
+<p>该方法是纯函数：只读状态，没有副作用。它与该请求字典的其他操作一样都在调度线程上执行（见 <code>docs/design/integration/vllm/mp_lookup_state.md</code> 的 “Threading” 一节）。</p></div>
+
+<h3>3. <span class="en">Connector wiring</span><span class="zh">connector 中的接线</span>
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L806">lmcache_mp_connector.py:806</a></h3>
+<pre><code><span class="ctx">            self.scheduler_adapter = LMCacheMPSchedulerAdapter(</span>
+<span class="ctx">                ...</span>
+<span class="add">+               # Heuristic cap: vLLM runs at most max_num_seqs requests, so</span>
+<span class="add">+               # more unconsumed lookups mostly queue ahead of the server's</span>
+<span class="add">+               # PING instead of being used soon. Eager prefetch submits on</span>
+<span class="add">+               # enqueue by design, so a bound would starve requests that</span>
+<span class="add">+               # still need a scheduler-time lookup (e.g. preempted ones).</span>
+<span class="add">+               max_pending_lookups=(</span>
+<span class="add">+                   None</span>
+<span class="add">+                   if self._eager_prefetch</span>
+<span class="add">+                   else vllm_config.scheduler_config.max_num_seqs</span>
+<span class="add">+               ),</span>
+<span class="ctx">            )</span></code></pre>
+<p class="en"><code>self._eager_prefetch</code> is parsed earlier in <code>__init__</code> (<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L686">:686</a>), so it is already set when the adapter is built. This runs only in the scheduler role.</p>
+<p class="zh"><code>self._eager_prefetch</code> 在 <code>__init__</code> 更早的位置（<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L686">:686</a>）解析，构造 adapter 时已经确定。这段代码只在调度器角色中执行。</p>
+
+<h3>4. <span class="en">The gate in</span><span class="zh">位于</span> <code>get_num_new_matched_tokens</code> <span class="zh">中的检查</span>
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L1449">lmcache_mp_connector.py:1449</a></h3>
+<pre><code><span class="ctx">        lookup_start = 0</span>
+<span class="ctx">        if not tracker.need_full_lookup:</span>
+<span class="ctx">            ...  # APC-covered start, recomputed on every poll</span>
+<span class="ctx"></span>
+<span class="add">+       # vLLM polls every waiting request each step; defer the ones beyond</span>
+<span class="add">+       # the lookup bound instead of submitting a lookup for the whole queue.</span>
+<span class="add">+       if not self.scheduler_adapter.can_submit_lookup(request.request_id):</span>
+<span class="add">+           return None, True</span>
+<span class="ctx"></span>
+<span class="ctx">        if tracker.lookup_started_at is None:</span>
+<span class="ctx">            tracker.lookup_started_at = time.monotonic()</span>
+<span class="ctx">        submitted = self.scheduler_adapter.maybe_submit_lookup_request(...)</span></code></pre>
+<div class="en">
+<p>Where the gate sits matters:</p>
+<ul>
+<li><strong>After</strong> the two early returns for <code>BYPASS_LMCACHE</code> and for the failed-async-load reset. Those return <code>0</code> and must keep working when the bound is full.</li>
+<li><strong>Before</strong> any state is written. <code>lookup_started_at</code> stays unset, so lookup-latency stats measure from the real submission. <code>apc_covered_tokens</code> is not frozen either, so the APC boundary is taken at the real submit. The tracker stays in its initial state, and the next poll repeats the same checks.</li>
+<li><code>(None, True)</code> is the value this method already returns while a lookup is in flight, so vLLM's handling is unchanged: skip without consuming budget, then poll again next step.</li>
+</ul>
+<p>Other submit sites are intentionally not gated. The APC-shrink re-lookup (<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L1506">:1506</a>) calls <code>cleanup_lookup_result</code> right before resubmitting, so the count does not change. <code>on_new_request</code> (<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L1566">:1566</a>) only submits under eager prefetch, where the bound is <code>None</code>.</p>
+<p>The docstring of <code>get_num_new_matched_tokens</code> gains a note that <code>None</code> is also returned, with no lookup submitted, while the bound is full.</p>
+</div>
+<div class="zh">
+<p>检查放在哪里很关键：</p>
+<ul>
+<li>放在 <code>BYPASS_LMCACHE</code> 和“异步加载失败后重置”这两个提前返回<strong>之后</strong>。它们返回 <code>0</code>，在上限已满时也必须照常工作。</li>
+<li>放在任何状态写入<strong>之前</strong>。<code>lookup_started_at</code> 不会被设置，因此 lookup 延迟统计从真正提交时开始计时。<code>apc_covered_tokens</code> 也不会被冻结，APC 边界以真正提交时为准。tracker 保持初始状态，下一次轮询会重复同样的检查。</li>
+<li><code>(None, True)</code> 是该方法在 lookup 进行中时本来就会返回的值，所以 vLLM 的处理方式不变：跳过且不消耗预算，下一步再轮询。</li>
+</ul>
+<p>其他提交位置刻意不加检查。APC 收缩后的重新 lookup（<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L1506">:1506</a>）在重新提交前会先调用 <code>cleanup_lookup_result</code>，所以数量不变。<code>on_new_request</code>（<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/lmcache/integration/vllm/lmcache_mp_connector.py#L1566">:1566</a>）只在 eager prefetch 下提交，此时上限为 <code>None</code>。</p>
+<p><code>get_num_new_matched_tokens</code> 的 docstring 新增一条说明：上限已满时同样会返回 <code>None</code>，并且不会提交 lookup。</p>
+</div>
+
+<h3>5. <span class="en">Design doc</span><span class="zh">设计文档</span>
+<a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/docs/design/integration/vllm/mp_lookup_state.md#L87">docs/design/integration/vllm/mp_lookup_state.md:87</a></h3>
+<p class="en">The "Adapter surface" table gains a <code>can_submit_lookup</code> row, and "Why the rules are what they are" gains a <strong>Bounded submission</strong> paragraph that records the reasoning above.</p>
+<p class="zh">“Adapter surface” 表格新增 <code>can_submit_lookup</code> 一行；“Why the rules are what they are” 一节新增 <strong>Bounded submission</strong> 段落，记录上述理由。</p>
+
+<h2 id="life"><span class="en">Lookup lifecycle (step-through)</span><span class="zh">lookup 生命周期（逐步演示）</span></h2>
+<p class="en">Use the controls to walk through one request. The numbered list under the figure has the same content and is always shown, so the figure is optional.</p>
+<p class="zh">使用下方按钮逐步查看一个请求的流程。图下方的编号列表内容相同且始终显示，因此不看图也能获得全部信息。</p>
+<figure class="stepper" id="fig2" aria-labelledby="fig2cap">
+<svg viewBox="0 0 940 360" role="img" aria-labelledby="fig2title fig2desc">
+  <title id="fig2title">Lifecycle of one request's lookup under the bound</title>
+  <desc id="fig2desc">A waiting request is polled by the vLLM scheduler. The connector asks can_submit_lookup. If there is no room it returns None, True and the request is polled again next step. If there is room the adapter creates a LookupState counted in _lookups and sends LOOKUP. Later polls collect the result. The slot is freed by cleanup_lookup_result on allocation, on request_finished, on bypass after a failed load, or around an APC-shrink re-lookup.</desc>
+  <rect id="n1" class="node box" x="20" y="30" width="190" height="64" rx="8"/>
+  <text x="34" y="56" class="small en">1. WAITING request</text><text x="34" y="56" class="small zh">1. 等待中的请求</text>
+  <text x="34" y="76" class="tiny">get_num_new_matched_tokens</text>
+
+  <rect id="n2" class="node box" x="270" y="30" width="190" height="64" rx="8"/>
+  <text x="284" y="56" class="small en">2. Gate</text><text x="284" y="56" class="small zh">2. 准入检查</text>
+  <text x="284" y="76" class="tiny">can_submit_lookup(id)?</text>
+
+  <rect id="n3" class="node box" x="270" y="160" width="190" height="64" rx="8"/>
+  <text x="284" y="186" class="small en">3. Defer</text><text x="284" y="186" class="small zh">3. 延后</text>
+  <text x="284" y="206" class="tiny">return (None, True)</text>
+
+  <rect id="n4" class="node box" x="520" y="30" width="200" height="64" rx="8"/>
+  <text x="534" y="56" class="small en">4. Submit</text><text x="534" y="56" class="small zh">4. 提交</text>
+  <text x="534" y="76" class="tiny">_lookups[id] = LookupState</text>
+
+  <rect id="n5" class="node box" x="760" y="30" width="160" height="64" rx="8"/>
+  <text x="774" y="56" class="small en">5. Poll result</text><text x="774" y="56" class="small zh">5. 轮询结果</text>
+  <text x="774" y="76" class="tiny">check_lookup_result</text>
+
+  <rect id="n6" class="node box" x="760" y="160" width="160" height="64" rx="8"/>
+  <text x="774" y="186" class="small en">6. Consumed</text><text x="774" y="186" class="small zh">6. 已消费</text>
+  <text x="774" y="206" class="tiny">update_state_after_alloc</text>
+
+  <rect id="n7" class="node box" x="520" y="160" width="200" height="64" rx="8"/>
+  <text x="534" y="186" class="small en">7. Other exits</text><text x="534" y="186" class="small zh">7. 其他退出路径</text>
+  <text x="534" y="206" class="tiny">finished / bypass / APC shrink</text>
+
+  <rect id="n8" class="node box" x="520" y="280" width="400" height="56" rx="8"/>
+  <text x="534" y="304" class="small en">8. cleanup_lookup_result: slot freed</text><text x="534" y="304" class="small zh">8. cleanup_lookup_result：释放空位</text>
+  <text x="534" y="322" class="tiny en">a deferred request finds room next step</text><text x="534" y="322" class="tiny zh">被延后的请求下一步获得空位</text>
+
+  <path d="M210 62 H270" class="edge" marker-end="url(#arr)"/>
+  <path d="M365 94 V160" class="edge" marker-end="url(#arr)"/><text x="372" y="132" class="tiny en">full</text><text x="372" y="132" class="tiny zh">已满</text>
+  <path d="M460 62 H520" class="edge" marker-end="url(#arr)"/><text x="470" y="54" class="tiny en">room</text><text x="470" y="54" class="tiny zh">有空位</text>
+  <path d="M270 192 H115 V94" class="edge" marker-end="url(#arr)"/><text x="122" y="140" class="tiny en">next step</text><text x="122" y="140" class="tiny zh">下一步</text>
+  <path d="M720 62 H760" class="edge" marker-end="url(#arr)"/>
+  <path d="M840 94 V160" class="edge" marker-end="url(#arr)"/>
+  <path d="M840 224 V280" class="edge" marker-end="url(#arr)"/>
+  <path d="M620 224 V280" class="edge" marker-end="url(#arr)"/>
+  <path d="M520 308 H115 V94" class="edge" stroke-dasharray="4 4" marker-end="url(#arr)"/>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#59636e"/></marker></defs>
+</svg>
+<div class="js-only">
+  <div class="controls" role="group" aria-label="Step controls / 步骤控制">
+    <button type="button" id="st-prev"><span class="en">◀ Previous</span><span class="zh">◀ 上一步</span></button>
+    <button type="button" id="st-next"><span class="en">Next ▶</span><span class="zh">下一步 ▶</span></button>
+    <button type="button" id="st-play" aria-pressed="false"><span class="en">Play</span><span class="zh">播放</span></button>
+    <button type="button" id="st-replay"><span class="en">Replay</span><span class="zh">重播</span></button>
+    <span class="meta" id="st-count" aria-hidden="true"></span>
+  </div>
+  <div class="caption" id="st-caption" aria-live="polite"></div>
+</div>
+<figcaption id="fig2cap"><span class="en">Figure 2. Lifecycle of one lookup. Every edge that leaves the bound ends in <code>cleanup_lookup_result</code> (node 8). The dashed edge is the only way a deferred request makes progress, so liveness reduces to "every admitted lookup is eventually cleaned up".</span><span class="zh">图 2：一次 lookup 的生命周期。所有离开上限的路径最终都经过 <code>cleanup_lookup_result</code>（节点 8）。虚线是被延后的请求唯一的前进路径，因此“不会卡死”可以归结为“每个被接纳的 lookup 最终都会被清理”。</span></figcaption>
+<ol id="st-list">
+  <li data-node="n1"><span class="en"><strong>Poll.</strong> The vLLM scheduler walks the waiting queue and calls <code>LMCacheMPConnector.get_num_new_matched_tokens(request, num_computed_tokens)</code> for a request that has no computed tokens.</span><span class="zh"><strong>轮询。</strong>vLLM 调度器遍历等待队列，对尚无已计算 token 的请求调用 <code>LMCacheMPConnector.get_num_new_matched_tokens(request, num_computed_tokens)</code>。</span></li>
+  <li data-node="n2"><span class="en"><strong>Gate.</strong> After the bypass and failed-load early returns, the connector calls <code>scheduler_adapter.can_submit_lookup(request_id)</code>. It is true when no bound is set, when the request already has a lookup, or when <code>len(_lookups) &lt; max_pending_lookups</code>.</span><span class="zh"><strong>准入检查。</strong>在 bypass 和加载失败这两个提前返回之后，connector 调用 <code>scheduler_adapter.can_submit_lookup(request_id)</code>。以下三种情况为真：未设置上限、该请求已有 lookup、或 <code>len(_lookups) &lt; max_pending_lookups</code>。</span></li>
+  <li data-node="n3"><span class="en"><strong>Defer.</strong> If the bound is full, the connector returns <code>(None, True)</code>. No RPC is sent and no tracker field is written. vLLM moves the request to its skipped queue without spending token budget and polls it again next step, in the same FCFS order.</span><span class="zh"><strong>延后。</strong>若上限已满，connector 返回 <code>(None, True)</code>。不发送 RPC，也不写入 tracker 的任何字段。vLLM 把请求移入跳过队列，不消耗 token 预算，并在下一步按相同的 FCFS 顺序再次轮询。</span></li>
+  <li data-node="n4"><span class="en"><strong>Submit.</strong> If there is room, <code>maybe_submit_lookup_request</code> creates a <code>LookupState</code>, stores it in <code>_lookups</code> (now counted against the bound), and sends LOOKUP to every server without waiting for the ack.</span><span class="zh"><strong>提交。</strong>若有空位，<code>maybe_submit_lookup_request</code> 创建 <code>LookupState</code> 并存入 <code>_lookups</code>（此后计入上限），然后向每个服务端发送 LOOKUP，不等待确认。</span></li>
+  <li data-node="n5"><span class="en"><strong>Poll result.</strong> On later polls the gate is always true, because the request already has a lookup. <code>check_lookup_result</code> returns <code>None</code> while the prefetch runs and the hit count once it is resolved. If the server is unhealthy it returns 0.</span><span class="zh"><strong>轮询结果。</strong>之后的轮询中准入检查总为真，因为该请求已有 lookup。prefetch 进行期间 <code>check_lookup_result</code> 返回 <code>None</code>，完成后返回命中的 token 数。若服务端不健康则返回 0。</span></li>
+  <li data-node="n6"><span class="en"><strong>Consumed.</strong> When vLLM allocates blocks for the request, <code>update_state_after_alloc</code> (in the PREFETCHING state) calls <code>cleanup_lookup_result</code>.</span><span class="zh"><strong>已消费。</strong>vLLM 为该请求分配 block 时，<code>update_state_after_alloc</code>（处于 PREFETCHING 状态）调用 <code>cleanup_lookup_result</code>。</span></li>
+  <li data-node="n7"><span class="en"><strong>Other exits.</strong> <code>request_finished</code> (finish or abort, before its lookup was consumed), the bypass after a failed asynchronous load, and the APC-shrink path, which cleans up and immediately resubmits (net count unchanged), all call <code>cleanup_lookup_result</code>.</span><span class="zh"><strong>其他退出路径。</strong><code>request_finished</code>（请求完成或在 lookup 被消费前中止）、异步加载失败后的 bypass，以及 APC 收缩路径（先清理再立即重新提交，总数不变）都会调用 <code>cleanup_lookup_result</code>。</span></li>
+  <li data-node="n8"><span class="en"><strong>Slot freed.</strong> The entry leaves <code>_lookups</code>. On the next scheduler step, the first deferred request polled finds room and submits.</span><span class="zh"><strong>释放空位。</strong>该项从 <code>_lookups</code> 中移除。下一个调度步中，第一个被轮询到的延后请求获得空位并提交。</span></li>
+</ol>
+</figure>
+
+<h2 id="liveness"><span class="en">Why the bound cannot leak or stall (default configuration)</span><span class="zh">为什么上限不会泄漏或卡死（默认配置）</span></h2>
+<p class="en">A stall would need the bound to be full of entries that are never cleaned up. These are all the places that add to or remove from <code>_lookups</code>:</p>
+<p class="zh">要卡死，就必须让上限被永远不会清理的项占满。以下是所有向 <code>_lookups</code> 添加或删除项的位置：</p>
+<table>
+<tr><th><span class="en">Path</span><span class="zh">路径</span></th><th><span class="en">Effect on <code>_lookups</code></span><span class="zh">对 <code>_lookups</code> 的影响</span></th><th><span class="en">Why it is safe</span><span class="zh">为什么安全</span></th></tr>
+<tr><td><code>maybe_submit_lookup_request</code></td><td>+1</td><td><span class="en">The only insertion. Gated in <code>get_num_new_matched_tokens</code>.</span><span class="zh">唯一的插入点，在 <code>get_num_new_matched_tokens</code> 中受检查。</span></td></tr>
+<tr><td><code>update_state_after_alloc</code> (PREFETCHING)</td><td>&minus;1</td><td><span class="en">Runs whenever vLLM admits the request, whether the lookup hit or missed.</span><span class="zh">只要 vLLM 接纳该请求就会执行，无论 lookup 命中与否。</span></td></tr>
+<tr><td><code>request_finished</code></td><td>&minus;1</td><td><span class="en">Runs for finished and aborted requests, including those aborted while still waiting.</span><span class="zh">对完成和中止的请求都会执行，包括仍在等待中就被中止的请求。</span></td></tr>
+<tr><td><span class="en">Bypass after failed async load</span><span class="zh">异步加载失败后的 bypass</span></td><td>&minus;1</td><td><span class="en">Drops the stale lookup before recomputing locally.</span><span class="zh">在本地重算之前丢弃过期的 lookup。</span></td></tr>
+<tr><td><span class="en">APC-shrink re-lookup</span><span class="zh">APC 收缩后重新 lookup</span></td><td>&minus;1 then +1</td><td><span class="en">Net zero. The request keeps its slot.</span><span class="zh">净变化为零，请求保留其空位。</span></td></tr>
+<tr><td><span class="en">Preemption</span><span class="zh">抢占</span></td><td>0</td><td><span class="en">The first lookup was consumed at allocation. On resume, the request needs a new slot like any waiting request.</span><span class="zh">第一次 lookup 在分配时已被消费。恢复时，它与其他等待请求一样需要新的空位。</span></td></tr>
+<tr><td><span class="en">Server unhealthy</span><span class="zh">服务端不健康</span></td><td>0</td><td><span class="en">No submit happens and <code>check_lookup_result</code> returns 0, so the request is allocated and cleaned up.</span><span class="zh">不会提交，<code>check_lookup_result</code> 返回 0，于是请求被分配并清理。</span></td></tr>
+</table>
+<p class="en">Entries can be held for a while by requests whose lookups are resolved but which cannot be admitted yet, for example because KV blocks are short, the LoRA limit is reached, or the token budget is used up. That is backpressure, not a deadlock. Those are exactly the requests that run next, and vLLM admits them as running requests finish.</p>
+<p class="zh">如果某些请求的 lookup 已完成但暂时无法被接纳（例如 KV block 不足、达到 LoRA 上限或 token 预算用完），它们会暂时占住空位。这是背压而不是死锁：这些请求正是下一批要运行的请求，随着运行中的请求结束，vLLM 会接纳它们。</p>
+
+<h2 id="bounds"><span class="en">Responsibility boundaries and where each test hooks in</span><span class="zh">职责边界与各测试的作用位置</span></h2>
+<figure id="fig3" aria-labelledby="fig3cap">
+<svg viewBox="0 0 940 380" role="img" aria-labelledby="fig3title fig3desc">
+  <title id="fig3title">Layers touched by the change and the tests covering each layer</title>
+  <desc id="fig3desc">Four layers from left to right: vLLM scheduler (unchanged), LMCacheMPConnector (owns the policy: gate and choice of bound), LMCacheMPSchedulerAdapter (owns the count and the admission rule), and the LMCache MP server (unchanged). Adapter tests use the real adapter with mocked request clients; connector tests use the real constructor with a mocked adapter. vLLM's fallback connector constructs the adapter without the bound.</desc>
+  <rect x="20" y="40" width="190" height="240" rx="10" class="box"/>
+  <text x="34" y="66" class="title en">vLLM scheduler</text><text x="34" y="66" class="title zh">vLLM 调度器</text>
+  <text x="34" y="88" class="tiny en">unchanged</text><text x="34" y="88" class="tiny zh">未改动</text>
+  <text x="34" y="120" class="small en">waiting loop: None →</text><text x="34" y="120" class="small zh">等待循环：None →</text>
+  <text x="34" y="138" class="small en">skip, poll next step</text><text x="34" y="138" class="small zh">跳过，下一步再轮询</text>
+  <rect x="250" y="40" width="210" height="240" rx="10" class="hl"/>
+  <text x="264" y="66" class="title">LMCacheMPConnector</text>
+  <text x="264" y="88" class="tiny en">owns the policy</text><text x="264" y="88" class="tiny zh">负责策略</text>
+  <text x="264" y="120" class="small en">• bound = max_num_seqs</text><text x="264" y="120" class="small zh">• 上限 = max_num_seqs</text>
+  <text x="264" y="140" class="small en">  or None under eager</text><text x="264" y="140" class="small zh">  eager 模式下为 None</text>
+  <text x="264" y="162" class="small en">• gate → (None, True)</text><text x="264" y="162" class="small zh">• 检查 → (None, True)</text>
+  <rect x="500" y="40" width="220" height="240" rx="10" class="hl"/>
+  <text x="514" y="66" class="title">SchedulerAdapter</text>
+  <text x="514" y="88" class="tiny en">owns the count and the rule</text><text x="514" y="88" class="tiny zh">负责计数与准入规则</text>
+  <text x="514" y="120" class="small mono">_lookups (existing)</text>
+  <text x="514" y="140" class="small mono">_max_pending_lookups</text>
+  <text x="514" y="162" class="small mono">can_submit_lookup()</text>
+  <rect x="760" y="40" width="160" height="240" rx="10" class="box"/>
+  <text x="774" y="66" class="title en">MP server</text><text x="774" y="66" class="title zh">MP 服务端</text>
+  <text x="774" y="88" class="tiny en">unchanged</text><text x="774" y="88" class="tiny zh">未改动</text>
+  <text x="774" y="120" class="small en">NORMAL pool:</text><text x="774" y="120" class="small zh">NORMAL 线程池：</text>
+  <text x="774" y="138" class="small mono">LOOKUP, PING, …</text>
+  <path d="M210 130 H250" class="edge" marker-end="url(#arr3)"/>
+  <path d="M460 140 H500" class="edge" marker-end="url(#arr3)"/>
+  <path d="M720 140 H760" class="edge" marker-end="url(#arr3)"/>
+  <!-- tests -->
+  <rect x="250" y="200" width="210" height="66" rx="6" class="goodbox"/>
+  <text x="260" y="220" class="tiny">test_connector_defers_lookup_</text>
+  <text x="260" y="234" class="tiny">  until_capacity_frees</text>
+  <text x="260" y="252" class="tiny">test_scheduler_lookup_bound_…</text>
+  <rect x="510" y="200" width="200" height="66" rx="6" class="goodbox"/>
+  <text x="520" y="220" class="tiny">test_scheduler_bounds_</text>
+  <text x="520" y="234" class="tiny">  unconsumed_lookups</text>
+  <text x="520" y="252" class="tiny">test_scheduler_lookups_unbounded…</text>
+  <!-- fallback connector -->
+  <rect x="500" y="300" width="420" height="56" rx="8" class="warnbox"/>
+  <text x="514" y="322" class="small en">vLLM in-tree fallback connector builds the adapter</text><text x="514" y="322" class="small zh">vLLM 仓库内的后备 connector 也构造该 adapter</text>
+  <text x="514" y="342" class="tiny en">no max_pending_lookups → None → behaves as before</text><text x="514" y="342" class="tiny zh">不传 max_pending_lookups → None → 行为不变</text>
+  <defs><marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#59636e"/></marker></defs>
+</svg>
+<figcaption id="fig3cap"><span class="en">Figure 3. Highlighted layers change; vLLM and the server do not. The policy (which bound, when to defer) lives in the connector, and the mechanism (count and rule) lives in the adapter next to the state it counts. Each green box is a test that targets that layer through its public surface.</span><span class="zh">图 3：高亮的层有改动，vLLM 和服务端没有改动。策略（用哪个上限、何时延后）位于 connector；机制（计数与规则）位于 adapter，紧挨着它所计数的状态。每个绿色方块是通过该层公开接口进行验证的测试。</span></figcaption>
+</figure>
+
+<h2 id="tests"><span class="en">Test rationale</span><span class="zh">测试的必要性</span></h2>
+<table>
+<tr><th><span class="en">Test</span><span class="zh">测试</span></th><th><span class="en">Regression it protects</span><span class="zh">防止的回归</span></th><th><span class="en">Why at this level</span><span class="zh">为什么放在这一层</span></th></tr>
+<tr><td><a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/tests/v1/test_vllm_mp_adapter.py#L477"><code>test_scheduler_bounds_unconsumed_lookups</code></a></td>
+<td><span class="en">The bound refuses new requests when full, still admits a request whose lookup is in flight (otherwise its result could never be collected), and frees a slot on <code>cleanup_lookup_result</code>.</span><span class="zh">上限已满时拒绝新请求；仍允许已有 lookup 在进行中的请求（否则永远拿不到结果）；<code>cleanup_lookup_result</code> 后释放空位。</span></td>
+<td><span class="en">Real adapter, built through the shared <code>make_scheduler_adapter</code> helper, with mocked request clients. It uses only public methods.</span><span class="zh">通过共用的 <code>make_scheduler_adapter</code> 辅助函数构造真实 adapter，request client 为 mock，只使用公开方法。</span></td></tr>
+<tr><td><a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/tests/v1/test_vllm_mp_adapter.py#L496"><code>test_scheduler_lookups_unbounded_by_default</code></a></td>
+<td><span class="en">The default (<code>None</code>) keeps the old unbounded behavior that vLLM's fallback connector relies on.</span><span class="zh">默认值（<code>None</code>）保持旧的不限制行为，vLLM 的后备 connector 依赖这一点。</span></td>
+<td><span class="en">Same adapter-level harness.</span><span class="zh">与上一项相同的 adapter 层测试框架。</span></td></tr>
+<tr><td><a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/tests/v1/test_mp_connector_autostart.py#L170"><code>test_scheduler_lookup_bound_follows_max_num_seqs_unless_eager</code></a> ×2</td>
+<td><span class="en">The connector passes <code>scheduler_config.max_num_seqs</code> (128, a non-default value, so a hard-coded default cannot pass) and passes <code>None</code> under eager prefetch. The eager case would catch a reintroduction of the starvation bug.</span><span class="zh">connector 传入 <code>scheduler_config.max_num_seqs</code>（使用非默认值 128，硬编码的默认值无法通过），eager prefetch 下传入 <code>None</code>。eager 用例可以捕获饥饿问题的复现。</span></td>
+<td><span class="en">The real <code>LMCacheMPConnector</code> constructor, using the file's existing <code>connector_module</code> fixture, which mocks only the network adapters and geometry helpers.</span><span class="zh">使用真实的 <code>LMCacheMPConnector</code> 构造函数，借助该文件现有的 <code>connector_module</code> fixture；它只 mock 网络 adapter 和几何辅助函数。</span></td></tr>
+<tr><td><a href="https://github.com/daegyu94/LMCache/blob/63b78a162383acc53881a88a021d1203eba8813e/tests/v1/test_mp_connector_autostart.py#L191"><code>test_connector_defers_lookup_until_capacity_frees</code></a></td>
+<td><span class="en">While the bound is full the connector returns <code>(None, True)</code> and sends nothing. Once there is room, the next poll submits exactly once.</span><span class="zh">上限已满时 connector 返回 <code>(None, True)</code> 且不发送任何请求；有空位后，下一次轮询恰好提交一次。</span></td>
+<td><span class="en">A connector built through its constructor plus a mocked adapter, driven only through <code>get_num_new_matched_tokens</code>. No private attributes are set.</span><span class="zh">通过构造函数创建 connector，配合 mock adapter，只通过 <code>get_num_new_matched_tokens</code> 驱动，不设置任何私有属性。</span></td></tr>
+</table>
+<div class="en">
+<p><strong>Fixture edits.</strong> These are needed because the connector now reads <code>scheduler_config.max_num_seqs</code> and calls <code>can_submit_lookup</code>:</p>
+<ul>
+<li>Three duck-typed <code>vllm_config</code> builders (<code>test_mp_connector_kv_roles.py</code>, <code>lazy_offload/test_mp_connector.py</code>, and two configs in <code>test_mp_connector_autostart.py</code>) gain <code>max_num_seqs</code>. Real vLLM configs always have this field.</li>
+<li>The hand-written <code>_FakeSchedulerAdapter</code> in the lazy-offload tests gains a <code>can_submit_lookup</code> that always admits. Those tests are about store routing.</li>
+<li><code>make_scheduler_adapter</code> gains an optional <code>max_pending_lookups</code>.</li>
+</ul>
+<p><strong>Mutation check.</strong> With the production change reverted, all 5 new test cases fail; with it applied they pass.</p>
+<p><strong>Not covered by unit tests:</strong> the end-to-end effect on heartbeat health and TTFT (covered only by the benchmark below), PRIORITY-policy ordering, and TP &gt; 1.</p>
+</div>
+<div class="zh">
+<p><strong>Fixture 的修改。</strong>以下修改是必需的，因为 connector 现在会读取 <code>scheduler_config.max_num_seqs</code> 并调用 <code>can_submit_lookup</code>：</p>
+<ul>
+<li>三处鸭子类型的 <code>vllm_config</code> 构造代码（<code>test_mp_connector_kv_roles.py</code>、<code>lazy_offload/test_mp_connector.py</code>，以及 <code>test_mp_connector_autostart.py</code> 中的两个配置）新增 <code>max_num_seqs</code>。真实的 vLLM 配置总是包含该字段。</li>
+<li>lazy-offload 测试中手写的 <code>_FakeSchedulerAdapter</code> 新增一个总是允许的 <code>can_submit_lookup</code>。这些测试关注的是 store 路由。</li>
+<li><code>make_scheduler_adapter</code> 新增可选参数 <code>max_pending_lookups</code>。</li>
+</ul>
+<p><strong>变异检查。</strong>回退生产代码改动后，5 个新测试用例全部失败；应用改动后全部通过。</p>
+<p><strong>单元测试未覆盖：</strong>对心跳健康状态和 TTFT 的端到端影响（只由下文的基准测试覆盖）、PRIORITY 策略下的顺序，以及 TP &gt; 1。</p>
+</div>
+
+<h2 id="bench"><span class="en">Measurement</span><span class="zh">测量结果</span></h2>
+<p class="en"><strong>Setup.</strong> One RTX PRO 4000 Blackwell GPU, Qwen3-0.6B, vLLM 0.24 with <code>--max-num-seqs 256</code>, <code>--max-model-len 4096</code>, and prefix caching on. LMCache ran with <code>lmcache server --l1-size 40 --eviction-policy LRU --chunk-size 256</code>. N = prompts &times; 16 samples, with random 1024-token prompts and 16 output tokens. All requests were sent at once as streaming <code>/v1/completions</code> calls from a single asyncio client. Each configuration ran twice; times are seconds from the start of the burst. The benchmark scripts are not part of this PR.</p>
+<p class="zh"><strong>环境。</strong>单张 RTX PRO 4000 Blackwell GPU，模型 Qwen3-0.6B，vLLM 0.24，参数 <code>--max-num-seqs 256</code>、<code>--max-model-len 4096</code>，开启 prefix caching。LMCache 以 <code>lmcache server --l1-size 40 --eviction-policy LRU --chunk-size 256</code> 运行。N = prompt 数 &times; 16 个样本，prompt 为 1024 个随机 token，输出 16 个 token。所有请求由单个 asyncio 客户端以流式 <code>/v1/completions</code> 同时发出。每种配置运行两次，时间为从突发开始计算的秒数。基准测试脚本不包含在本 PR 中。</p>
+<table>
+<tr><th>N</th><th><span class="en">Metric</span><span class="zh">指标</span></th><th><span class="en">vanilla vLLM</span><span class="zh">原生 vLLM</span></th><th>LMCache (dev)</th><th><span class="en">LMCache (this PR)</span><span class="zh">LMCache（本 PR）</span></th></tr>
+<tr><td class="num">2048</td><td><span class="en">256th-fastest TTFT</span><span class="zh">第 256 快的 TTFT</span></td><td class="num">1.87 / 1.88</td><td class="num">3.25 / 3.07</td><td class="num">2.22 / 2.33</td></tr>
+<tr><td class="num">2048</td><td><span class="en">makespan</span><span class="zh">总完成时间</span></td><td class="num">11.1 / 11.1</td><td class="num">12.8 / 12.2</td><td class="num">11.1 / 11.1</td></tr>
+<tr><td class="num">8192</td><td><span class="en">median TTFT</span><span class="zh">TTFT 中位数</span></td><td class="num">28.4 / 28.9</td><td class="num">39.0 / 43.7</td><td class="num">28.3 / 28.0</td></tr>
+<tr><td class="num">8192</td><td><span class="en">makespan</span><span class="zh">总完成时间</span></td><td class="num">50.6 / 51.6</td><td class="num">62.6 / 67.6</td><td class="num">48.9 / 49.7</td></tr>
+<tr><td class="num">8192</td><td><span class="en">degraded-mode entries</span><span class="zh">进入降级模式次数</span></td><td class="num">&ndash;</td><td class="num">1</td><td class="num">0</td></tr>
+</table>
+<div class="en">
+<p>How to read the table:</p>
+<ul>
+<li>At N = 512 all three configurations are within noise.</li>
+<li>The first-token time of vanilla vLLM itself grows with N (about 9 s at N = 8192) because of API-server ingestion of 8192 HTTP requests. Compare columns, not rows.</li>
+<li>Run-to-run spread at N = 8192 is about 1 s.</li>
+<li>Only one model, one GPU, TP = 1, and one workload shape were measured.</li>
+</ul>
+</div>
+<div class="zh">
+<p>阅读说明：</p>
+<ul>
+<li>N = 512 时三种配置的差异都在噪声范围内。</li>
+<li>原生 vLLM 的首 token 时间本身就随 N 增长（N = 8192 时约 9 秒），原因是 API 服务端需要接收 8192 个 HTTP 请求。请按列比较，不要按行比较。</li>
+<li>N = 8192 时两次运行之间的差异约为 1 秒。</li>
+<li>只测量了一个模型、一张 GPU、TP = 1 和一种负载形态。</li>
+</ul>
+</div>
+
+<h2 id="compat"><span class="en">Compatibility, risks, known gaps</span><span class="zh">兼容性、风险与已知不足</span></h2>
+<div class="en"><ul>
+<li><strong>Compatibility.</strong> The adapter argument is keyword-only with a <code>None</code> default, so vLLM's in-tree fallback connector keeps its old behavior. No config, wire format, or server change. The bound is off under <code>lmcache.mp.eager_prefetch</code>.</li>
+<li><strong>Known limitation: PRIORITY scheduling policy</strong> <span class="pill sev-s">should-fix candidate</span>. While the bound is full, a high-priority request that is deferred early in a step can lose a freed slot to a lower-priority request polled later in the same step. It never deadlocks, and FCFS (the default) is unaffected because the oldest deferred request is also the first one polled. It only matters when lookups, not compute or memory, are the bottleneck and the backlog exceeds <code>max_num_seqs</code>. A possible follow-up: once one request is deferred in a step, defer all new lookups for the rest of that step.</li>
+<li><strong>Partial protection.</strong> A cold burst still sends up to <code>max_num_seqs</code> LOOKUPs in one step ahead of the PING. The bound reduces heartbeat starvation; it does not remove it. A separate PING pool would be the server-side complement.</li>
+<li><strong>Eager prefetch</strong> keeps the old unbounded behavior, including its exposure to bursts.</li>
+<li><strong>TP &gt; 1 not measured.</strong> LOOKUP count is per request, not per rank. But server-side work per lookup grows with the number of KV ranks (one key row per object group and KV rank), and each worker rank also sends its own PING through the same pool, so the effect is expected to be larger at high TP.</li>
+<li><strong>Stats.</strong> Lookup latency (<code>record_lookup</code>) starts at submission, so time spent deferred is not counted.</li>
+</ul></div>
+<div class="zh"><ul>
+<li><strong>兼容性。</strong>adapter 的新参数为仅限关键字参数且默认为 <code>None</code>，vLLM 仓库内的后备 connector 行为不变。没有修改配置、通信格式或服务端。启用 <code>lmcache.mp.eager_prefetch</code> 时上限不生效。</li>
+<li><strong>已知限制：PRIORITY 调度策略</strong> <span class="pill sev-s">可作为后续修复</span>。上限已满时，一个在本步较早被延后的高优先级请求，可能被同一步中较晚轮询到的低优先级请求抢走刚释放的空位。这不会造成死锁；默认的 FCFS 不受影响，因为最早被延后的请求也是最先被轮询的。只有当瓶颈在 lookup 而不在计算或显存，并且积压超过 <code>max_num_seqs</code> 时才有影响。可能的后续修复：一旦某个请求在本步被延后，本步余下的新 lookup 全部延后。</li>
+<li><strong>只是部分缓解。</strong>冷启动突发时，一步中仍可能有最多 <code>max_num_seqs</code> 个 LOOKUP 排在 PING 之前。上限减轻了心跳饥饿，但没有彻底消除。为 PING 单独设置线程池是服务端的补充方案。</li>
+<li><strong>eager prefetch</strong> 保持旧的不限制行为，因此仍会受到突发的影响。</li>
+<li><strong>未测量 TP &gt; 1。</strong>LOOKUP 的数量按请求计，与 rank 数无关。但服务端每个 lookup 的工作量随 KV rank 数增长（每个 object group 和 KV rank 一行 key），而且每个 worker rank 也会通过同一个线程池发送自己的 PING，因此在高 TP 下影响预计会更大。</li>
+<li><strong>统计。</strong>lookup 延迟（<code>record_lookup</code>）从提交时开始计时，被延后的时间不计入。</li>
+</ul></div>
+
+<h2 id="review"><span class="en">Suggested review order and questions</span><span class="zh">建议审阅顺序与问题</span></h2>
+<div class="en"><ol>
+<li><code>can_submit_lookup</code> and the constructor change in <code>vllm_multi_process_adapter.py</code>: is the admission rule right?</li>
+<li>The gate placement in <code>LMCacheMPConnector.get_num_new_matched_tokens</code>, relative to the bypass returns and the state writes that follow it.</li>
+<li>The constructor wiring (<code>max_num_seqs</code> or <code>None</code> under eager prefetch).</li>
+<li>The liveness table above, checked against every <code>cleanup_lookup_result</code> call site.</li>
+<li>The tests and the fixture edits.</li>
+<li>The design-doc paragraph.</li>
+</ol>
+<p><strong>Questions for maintainers</strong></p>
+<ul>
+<li>Is <code>max_num_seqs</code> the right bound, or would you prefer a configurable value?</li>
+<li>Should the PRIORITY-ordering limitation be fixed in this PR or left as a follow-up?</li>
+<li>Would you also want a server-side change, such as a dedicated pool for PING?</li>
+</ul></div>
+<div class="zh"><ol>
+<li><code>vllm_multi_process_adapter.py</code> 中的 <code>can_submit_lookup</code> 与构造函数改动：准入规则是否正确？</li>
+<li><code>LMCacheMPConnector.get_num_new_matched_tokens</code> 中检查的位置，以及它与 bypass 提前返回、后续状态写入之间的先后关系。</li>
+<li>构造函数中的接线（<code>max_num_seqs</code>，eager prefetch 下为 <code>None</code>）。</li>
+<li>对照每个 <code>cleanup_lookup_result</code> 调用点核对上文的“不会卡死”表格。</li>
+<li>测试与 fixture 的修改。</li>
+<li>设计文档中新增的段落。</li>
+</ol>
+<p><strong>想请维护者回答的问题</strong></p>
+<ul>
+<li><code>max_num_seqs</code> 是否是合适的上限？还是更希望做成可配置的值？</li>
+<li>PRIORITY 顺序问题应在本 PR 中修复，还是留作后续？</li>
+<li>是否还需要服务端的改动，例如为 PING 设置专用线程池？</li>
+</ul></div>
+
+<h2 id="validation"><span class="en">Validation performed</span><span class="zh">已做的验证</span></h2>
+<div class="en"><ul>
+<li><code>pytest -p no:cacheprovider</code> over every test file that references the MP connector or scheduler adapter (16 files): 402 passed, 3 failed. The same 3 also fail on unmodified <code>dev</code>: <code>test_free_locks_request_transport[grpc]</code> and <code>test_multi_connector_child_role_and_completion[*-kv_both]</code>.</li>
+<li>Mutation check: all 5 new test cases fail with the production change reverted.</li>
+<li><code>ruff check</code> and <code>ruff format --check</code> (0.11.7), <code>isort --check-only</code> (6.0.1), and <code>codespell</code> (2.4.1) on the changed files: clean. <code>mypy</code> (1.17.1) on the two source files reports 5 errors, all on lines this PR does not touch.</li>
+<li>Code review in three independent AI review passes by two separate reviewers. The first found the eager-prefetch starvation and the PRIORITY ordering issue; the first is fixed and the second is documented above.</li>
+</ul></div>
+<div class="zh"><ul>
+<li>对所有引用 MP connector 或调度端 adapter 的测试文件（16 个）运行 <code>pytest -p no:cacheprovider</code>：402 个通过，3 个失败。这 3 个在未修改的 <code>dev</code> 上同样失败：<code>test_free_locks_request_transport[grpc]</code> 与 <code>test_multi_connector_child_role_and_completion[*-kv_both]</code>。</li>
+<li>变异检查：回退生产代码改动后，5 个新测试用例全部失败。</li>
+<li>对改动文件运行 <code>ruff check</code> 和 <code>ruff format --check</code>（0.11.7）、<code>isort --check-only</code>（6.0.1）、<code>codespell</code>（2.4.1），均无问题。对两个源文件运行 <code>mypy</code>（1.17.1）报告 5 个错误，全部位于本 PR 未改动的行。</li>
+<li>代码由两个独立的 AI 审阅者共进行了三轮审阅。第一轮发现了 eager prefetch 下的饥饿问题和 PRIORITY 顺序问题；前者已修复，后者已在上文说明。</li>
+</ul></div>
+
+</main>
+<script>
+(function(){
+  var root=document.documentElement;
+  root.classList.add('js');
+  var btnEn=document.getElementById('btn-en'), btnZh=document.getElementById('btn-zh');
+  function setLang(l){
+    root.setAttribute('data-lang',l);
+    root.setAttribute('lang', l==='zh' ? 'zh-CN' : 'en');
+    btnEn.setAttribute('aria-pressed', String(l==='en'));
+    btnZh.setAttribute('aria-pressed', String(l==='zh'));
+    try{localStorage.setItem('pr-explainer-lang',l);}catch(e){}
+    renderStep();
+  }
+  var init='en';
+  if(/[?#&]lang=zh/.test(location.search+location.hash)) init='zh';
+  else if(/[?#&]lang=en/.test(location.search+location.hash)) init='en';
+  else { try{var s=localStorage.getItem('pr-explainer-lang'); if(s==='zh'||s==='en') init=s;}catch(e){} }
+  btnEn.addEventListener('click',function(){setLang('en');});
+  btnZh.addEventListener('click',function(){setLang('zh');});
+
+  // Step-through for figure 2. The <ol> is the static source of truth.
+  var items=[].slice.call(document.querySelectorAll('#st-list li'));
+  var cap=document.getElementById('st-caption'), cnt=document.getElementById('st-count');
+  var prev=document.getElementById('st-prev'), next=document.getElementById('st-next');
+  var play=document.getElementById('st-play'), replay=document.getElementById('st-replay');
+  var reduce=window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var i=0, timer=null;
+  function renderStep(){
+    if(!items.length) return;
+    items.forEach(function(li,k){
+      var n=document.getElementById(li.getAttribute('data-node'));
+      if(!n) return;
+      n.classList.toggle('active',k===i);
+      n.classList.toggle('done',k<i);
+    });
+    var lang=root.getAttribute('data-lang')||'en';
+    var src=items[i].querySelector(lang==='zh'?'.zh':'.en');
+    cap.innerHTML=src?src.innerHTML:items[i].innerHTML;
+    cnt.textContent=(i+1)+' / '+items.length;
+    prev.disabled=(i===0); next.disabled=(i===items.length-1);
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;} play.setAttribute('aria-pressed','false'); }
+  prev.addEventListener('click',function(){stop(); if(i>0){i--;renderStep();}});
+  next.addEventListener('click',function(){stop(); if(i<items.length-1){i++;renderStep();}});
+  replay.addEventListener('click',function(){stop(); i=0; renderStep();});
+  play.addEventListener('click',function(){
+    if(timer){stop();return;}
+    if(i===items.length-1){i=0;renderStep();}
+    play.setAttribute('aria-pressed','true');
+    // No auto-loop; stops at the last step. Slower pacing under reduced motion.
+    timer=setInterval(function(){
+      if(i<items.length-1){i++;renderStep();} else {stop();}
+    }, reduce?5000:2800);
+  });
+  setLang(init);
+})();
+</script>
+</body>
+</html>
