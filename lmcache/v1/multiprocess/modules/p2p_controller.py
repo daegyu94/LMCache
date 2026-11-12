@@ -221,8 +221,11 @@ class P2PController(DiscoverableModule):
         self._digests_url = ""
         # Peer id -> (generation, count) of the digest its adapter holds.
         self._digest_versions: dict[str, tuple[int, int]] = {}
+        # Digests poll every second or so; warn once per outage, not per poll.
+        self._digest_fetch_failing = False
         self._http_client: httpx.Client | None = None
         self._poll_thread: PeriodicThread | None = None
+        self._digest_thread: PeriodicThread | None = None
 
         if p2p_config.enabled:
             self._start_orchestration(coordinator_config)
@@ -273,6 +276,16 @@ class P2PController(DiscoverableModule):
             level=ThreadLevel.MEDIUM,
         )
         self._poll_thread.start()
+        if self._digests_url:
+            # Separate from peer discovery: digests go stale within seconds,
+            # while the peer set changes rarely.
+            self._digest_thread = create_periodic_thread(
+                name="p2p-digest-thread",
+                interval=self._p2p_config.lookup_digest_interval,
+                execute_fn=self._digest_cycle,
+                level=ThreadLevel.MEDIUM,
+            )
+            self._digest_thread.start()
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -298,7 +311,10 @@ class P2PController(DiscoverableModule):
         }
 
     def close(self) -> None:
-        """Stop the poll thread and release peer adapters and the channel."""
+        """Stop the poll threads and release peer adapters and the channel."""
+        if self._digest_thread is not None:
+            self._digest_thread.stop()
+            self._digest_thread = None
         if self._poll_thread is not None:
             self._poll_thread.stop()
             self._poll_thread = None
@@ -555,10 +571,18 @@ class P2PController(DiscoverableModule):
             and inst.ip
             and inst.mq_port
         }
-        summary = self._apply_state(_P2PState.REGISTERED, upstream)
-        if self._digests_url:
-            self._refresh_digests()
-        return summary
+        return self._apply_state(_P2PState.REGISTERED, upstream)
+
+    def _digest_cycle(self) -> ThreadRunSummary:
+        """Run one digest poll for the peers that have adapters.
+
+        Returns:
+            A summary naming how many peers hold a digest afterwards.
+        """
+        self._refresh_digests()
+        return ThreadRunSummary(
+            success=True, message=f"digests={len(self._digest_versions)}"
+        )
 
     def _fetch_instances(self) -> list[_PeerInstance]:
         """Fetch and parse the coordinator's active-instance list.
@@ -622,11 +646,16 @@ class P2PController(DiscoverableModule):
             response.raise_for_status()
             entries = response.json()["digests"]
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
-            logger.warning("P2P L1 digest fetch failed; sending all lookups: %s", e)
+            log = logger.debug if self._digest_fetch_failing else logger.warning
+            log("P2P L1 digest fetch failed; sending all lookups: %s", e)
+            self._digest_fetch_failing = True
             for _, lookup_digest in adapters:
                 lookup_digest.digest = None
             self._digest_versions.clear()
             return
+        if self._digest_fetch_failing:
+            logger.info("P2P L1 digest fetch recovered")
+            self._digest_fetch_failing = False
         versions: dict[str, tuple[int, int]] = {}
         for peer_id, lookup_digest in adapters:
             entry = entries.get(peer_id)

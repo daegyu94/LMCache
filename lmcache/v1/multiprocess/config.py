@@ -260,6 +260,17 @@ class P2PConfig:
     """Skip lookups to peers whose coordinator L1 digest rules out every key.
     Needs ``--coordinator-event-reporting`` on every server."""
 
+    lookup_digest_interval: float = 1.0
+    """Seconds between L1 digest polls. A key stored on a peer since the last
+    poll is not in its digest yet, so its hit can be missed for about this
+    long plus the cache-event flush interval."""
+
+    def __post_init__(self) -> None:
+        if self.lookup_digest_interval <= 0:
+            raise ValueError(
+                f"lookup_digest_interval must be > 0, got {self.lookup_digest_interval}"
+            )
+
     @property
     def enabled(self) -> bool:
         """Whether P2P is enabled (an advertise URL is configured)."""
@@ -764,6 +775,15 @@ def add_p2p_args(
         "--coordinator-event-reporting; keys stored since the last digest poll "
         "can be missed. Default is off.",
     )
+    group.add_argument(
+        "--p2p-lookup-digest-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between L1 digest polls when --p2p-lookup-digest is on. "
+        "A key stored on a peer since the last poll can be missed for about "
+        "this long plus --coordinator-event-flush-interval; polls send only "
+        "what changed, so short intervals are cheap. Default is 1.",
+    )
     return parser
 
 
@@ -785,6 +805,7 @@ def parse_args_to_p2p_config(
         load_timeout=getattr(args, "p2p_load_timeout", 30.0),
         transfer_engine=getattr(args, "p2p_transfer_engine", "nixl"),
         lookup_digest=getattr(args, "p2p_lookup_digest", False),
+        lookup_digest_interval=getattr(args, "p2p_lookup_digest_interval", 1.0),
     )
 
 

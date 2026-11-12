@@ -6,7 +6,7 @@ definitions, MemoryLayoutDesc wire serialization, and server handlers.
 
 # Standard
 from typing import Literal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import os
 
 # Third Party
@@ -32,6 +32,7 @@ from lmcache.v1.mp_coordinator.app import create_app
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
 from lmcache.v1.multiprocess.modules import p2p_controller
+from lmcache.v1.multiprocess.modules import p2p_controller as p2p_controller_module
 from lmcache.v1.multiprocess.modules.p2p_controller import (
     _MAX_MISSES,
     P2PController,
@@ -735,6 +736,7 @@ def test_poll_cycle_peer_without_a_digest_gets_all_lookups():
     )
 
     controller._poll_cycle()
+    controller._digest_cycle()
 
     configs = {
         c.args[0].peer_transfer_channel_server_url: c.args[0]
@@ -824,3 +826,23 @@ def test_digest_delta_for_another_generation_is_not_applied():
         {"generation": 1, "count": 1, "added": [b"y".hex()]}, held, (1, 0)
     )
     assert applied is not None and applied.might_contain(b"y")
+
+
+def test_digest_fetch_outage_warns_once_and_clears_digests():
+    """While the coordinator is unreachable every peer loses its digest (all
+    lookups sent), and the outage is warned about once, not on every poll."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "http://coordinator/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    lookup_digest.digest = BloomDigest.build([b"x"])
+    controller._http_client = MagicMock()
+    controller._http_client.get.side_effect = httpx.ConnectError("refused")
+
+    with patch.object(p2p_controller_module.logger, "warning") as warning:
+        for _ in range(5):
+            controller._digest_cycle()
+
+    assert lookup_digest.digest is None
+    assert warning.call_count == 1
