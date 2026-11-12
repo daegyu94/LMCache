@@ -19,11 +19,17 @@ it runs outside the directory lock in three steps::
 
 Inserts and removals that land between the first and the last step are
 recorded against the rebuild and applied when it is installed.
+
+Each installed filter starts a new *generation*, and the hashes folded into it
+afterwards are kept in order. A reader that already holds generation ``g`` up
+to ``n`` folded hashes therefore needs only the hashes after ``n``, not the
+whole filter (see :class:`L1DigestView`).
 """
 
 # Standard
 from collections.abc import Mapping, Set
 from dataclasses import dataclass, field
+import itertools
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -61,12 +67,35 @@ class RebuildJob:
     _token: _Rebuild
 
 
+@dataclass(frozen=True)
+class L1DigestView:
+    """One instance's digest as of a read.
+
+    Attributes:
+        generation: Identifies the filter build; changes on every rebuild and
+            never repeats, even across instances.
+        digest: The filter with every hash folded in so far.
+        added: Hashes folded in since the build, in order. Only the first
+            ``count`` are part of ``digest``; the list may grow later.
+        count: Number of hashes of ``added`` included in ``digest``.
+    """
+
+    generation: int
+    digest: BloomDigest
+    added: list[bytes]
+    count: int
+
+
 @dataclass
 class _InstanceDigest:
     bloom: BloomFilter | None = None  # None until the first build is installed
+    generation: int = 0
     built_with: int = 0
     removed: int = 0
     pending: list[bytes] = field(default_factory=list)
+    # Folded since the build. Replaced, never cleared, on a rebuild, so a
+    # view handed out earlier keeps a stable prefix.
+    log: list[bytes] = field(default_factory=list)
     snapshot: BloomDigest | None = None
     rebuild: _Rebuild | None = None
 
@@ -80,6 +109,7 @@ class L1DigestIndex:
 
     def __init__(self) -> None:
         self._digests: dict[str, _InstanceDigest] = {}
+        self._generations = itertools.count(1)
 
     def on_add(self, instance_id: str, chunk_hash: bytes) -> None:
         """Record a key newly placed in ``instance_id``'s L1.
@@ -182,7 +212,7 @@ class L1DigestIndex:
 
     def finish(
         self, built: dict[str, tuple[RebuildJob, BloomFilter]]
-    ) -> dict[str, BloomDigest]:
+    ) -> dict[str, L1DigestView]:
         """Install built filters and return the current digest per instance.
 
         A filter whose instance was dropped, cleared or re-fenced while it was
@@ -193,7 +223,7 @@ class L1DigestIndex:
             built: The output of :meth:`build`.
 
         Returns:
-            ``instance_id`` → digest of its L1 chunk hashes.
+            ``instance_id`` → view of its current digest.
         """
         for instance_id, (job, bloom) in built.items():
             state = self._digests.get(instance_id)
@@ -201,20 +231,28 @@ class L1DigestIndex:
                 continue
             bloom.add_many(job._token.added)
             state.bloom = bloom
+            state.generation = next(self._generations)
+            state.log = []
             state.built_with = len(job.chunk_hashes)
             state.removed = job._token.removed
             state.pending.clear()
             state.snapshot = None
             state.rebuild = None
-        result: dict[str, BloomDigest] = {}
+        result: dict[str, L1DigestView] = {}
         for instance_id, state in self._digests.items():
             if state.bloom is None:
                 continue
             if state.pending:
                 state.bloom.add_many(state.pending)
+                state.log.extend(state.pending)
                 state.pending.clear()
                 state.snapshot = None
             if state.snapshot is None:
                 state.snapshot = state.bloom.snapshot()
-            result[instance_id] = state.snapshot
+            result[instance_id] = L1DigestView(
+                generation=state.generation,
+                digest=state.snapshot,
+                added=state.log,
+                count=len(state.log),
+            )
         return result

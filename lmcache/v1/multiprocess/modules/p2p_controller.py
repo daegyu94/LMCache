@@ -219,6 +219,8 @@ class P2PController(DiscoverableModule):
 
         self._instances_url = ""
         self._digests_url = ""
+        # Peer id -> (generation, count) of the digest its adapter holds.
+        self._digest_versions: dict[str, tuple[int, int]] = {}
         self._http_client: httpx.Client | None = None
         self._poll_thread: PeriodicThread | None = None
 
@@ -592,28 +594,86 @@ class P2PController(DiscoverableModule):
     def _refresh_digests(self) -> None:
         """Fetch the peers' L1 digests and hand each to its adapter.
 
+        The request lists the generation and hash count this controller
+        already holds per peer, so the coordinator sends only the hashes
+        added since, or the whole filter after a rebuild.
+
         A peer absent from the response gets no digest, so its lookups are
         all sent: absence also covers a peer that does not report cache
         events, whose hits an empty digest would silently drop. A failed
-        fetch clears every digest for the same reason.
+        fetch, or a delta that does not match what is held, clears the
+        digest for the same reason; the next poll then fetches it whole.
         """
         assert self._http_client is not None
         with self._orch_lock:
-            adapters = list(self._adapters.items())
+            adapters = [
+                (peer_id, adapter.lookup_digest)
+                for peer_id, adapter in self._adapters.items()
+                if adapter.lookup_digest is not None
+            ]
+        known = ",".join(
+            f"{peer_id}:{generation}:{count}"
+            for peer_id, (generation, count) in self._digest_versions.items()
+        )
         try:
-            response = self._http_client.get(self._digests_url)
+            response = self._http_client.get(
+                self._digests_url, params={"known": known} if known else None
+            )
             response.raise_for_status()
-            raw = response.json()["digests"]
-            digests = {iid: BloomDigest.from_json(d) for iid, d in raw.items()}
+            entries = response.json()["digests"]
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             logger.warning("P2P L1 digest fetch failed; sending all lookups: %s", e)
-            for _, adapter in adapters:
-                if adapter.lookup_digest is not None:
-                    adapter.lookup_digest.digest = None
+            for _, lookup_digest in adapters:
+                lookup_digest.digest = None
+            self._digest_versions.clear()
             return
-        for peer_id, adapter in adapters:
-            if adapter.lookup_digest is not None:
-                adapter.lookup_digest.digest = digests.get(peer_id)
+        versions: dict[str, tuple[int, int]] = {}
+        for peer_id, lookup_digest in adapters:
+            entry = entries.get(peer_id)
+            if entry is None:
+                lookup_digest.digest = None
+                continue
+            try:
+                version = (int(entry["generation"]), int(entry["count"]))
+                lookup_digest.digest = self._apply_digest_entry(
+                    entry, lookup_digest.digest, self._digest_versions.get(peer_id)
+                )
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning(
+                    "Bad P2P L1 digest for %s; sending all lookups: %s", peer_id, e
+                )
+                lookup_digest.digest = None
+                continue
+            if lookup_digest.digest is not None:
+                versions[peer_id] = version
+        self._digest_versions = versions
+
+    @staticmethod
+    def _apply_digest_entry(
+        entry: dict,
+        current: BloomDigest | None,
+        held: tuple[int, int] | None,
+    ) -> BloomDigest | None:
+        """Turn one response entry into the peer's new digest.
+
+        Args:
+            entry: A full or delta entry from ``/directory/l1-digests``.
+            current: The digest currently held for the peer.
+            held: The generation and count ``current`` corresponds to.
+
+        Returns:
+            The new digest, or ``None`` when a delta does not apply to what
+            is held.
+
+        Raises:
+            ValueError: If a full entry is malformed or a hash is not hex.
+            KeyError: If a required field is missing.
+        """
+        if "bits" in entry:
+            return BloomDigest.from_json(entry)
+        if current is None or held is None or held[0] != entry["generation"]:
+            return None
+        return current.with_added([bytes.fromhex(h) for h in entry["added"]])
 
     def _is_self_registered(self, instances: list[_PeerInstance]) -> bool:
         """Return whether this instance appears in ``instances`` with our URL.

@@ -25,7 +25,6 @@ import numpy as np
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey, Tier
-from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.mp_coordinator.api import (
     UNKNOWN_TOKEN_OFFSET,
     BlendMatch,
@@ -35,7 +34,7 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventType,
 )
 from lmcache.v1.mp_coordinator.blend_index import BlendIndex, BlendIndexStats
-from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestIndex
+from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestIndex, L1DigestView
 from lmcache.v1.mp_coordinator.metric_sources import register_metric_source
 from lmcache.v1.mp_coordinator.persistence.durable_component import (
     DurableComponent,
@@ -520,7 +519,7 @@ class KeyDirectory(View):
                 total += 1
             return total, page
 
-    def l1_digests(self) -> dict[str, BloomDigest]:
+    def l1_digests(self) -> dict[str, L1DigestView]:
         """Return a Bloom digest of each instance's L1 chunk hashes.
 
         Incremental: inserts since the last call are folded in, and an
@@ -530,7 +529,8 @@ class KeyDirectory(View):
         call is left out.
 
         Returns:
-            ``instance_id`` → digest of its L1 chunk hashes.
+            ``instance_id`` → its digest, with what is needed to send only
+            the hashes added since a generation the reader already has.
         """
         with self._lock:
             jobs = self._l1_digests.begin_rebuilds(self._l1_keys_by_instance)

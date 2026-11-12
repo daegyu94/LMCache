@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from lmcache.v1.distributed.api import Tier
 from lmcache.v1.mp_coordinator.api import BlendMatch, BlendNamespace
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
+from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestView
 from lmcache.v1.mp_coordinator.schemas import (
     BlendLookupRequest,
     BlendLookupResponse,
@@ -34,6 +35,36 @@ from lmcache.v1.mp_coordinator.views.key_directory import DirectoryStats, KeyDir
 from lmcache.v1.multiprocess.cache_control.key_resolver import resolve_object_keys
 
 router = APIRouter()
+
+
+def _parse_known_digests(known: str) -> dict[str, tuple[int, int]]:
+    """Parse ``instance_id:generation:count,...`` into a map.
+
+    Raises:
+        ValueError: If an entry is not three colon-separated fields with
+            integer generation and count.
+    """
+    held: dict[str, tuple[int, int]] = {}
+    for item in filter(None, known.split(",")):
+        instance_id, generation, count = item.rsplit(":", 2)
+        held[instance_id] = (int(generation), int(count))
+    return held
+
+
+def _encode_digest(
+    view: L1DigestView, held: tuple[int, int] | None
+) -> dict[str, object]:
+    """Encode ``view`` as a delta against ``held`` when that is smaller."""
+    entry: dict[str, object] = {"generation": view.generation, "count": view.count}
+    if held is not None and held[0] == view.generation and held[1] <= view.count:
+        added = view.added[held[1] : view.count]
+        # Compare wire sizes: a hash is hex (2x) plus JSON quoting and a comma;
+        # base64 adds a third to the bits.
+        if sum(2 * len(h) + 4 for h in added) < len(view.digest.bits) * 4 // 3:
+            entry["added"] = [h.hex() for h in added]
+            return entry
+    entry.update(view.digest.to_json())
+    return entry
 
 
 @router.post("/directory/lookup")
@@ -225,21 +256,41 @@ async def list_directory_keys(
 
 
 @router.get("/directory/l1-digests")
-async def l1_digests(request: Request) -> dict[str, dict[str, dict[str, object]]]:
+async def l1_digests(
+    request: Request, known: str = ""
+) -> dict[str, dict[str, dict[str, object]]]:
     """Return a Bloom digest of each instance's L1 chunk hashes.
 
     P2P requesters poll this to skip lookup RPCs to peers that hold none of
-    a request's chunks. The directory keeps the digests incrementally, so a
-    poll folds in recent inserts and rebuilds only instances whose keys have
-    churned.
+    a request's chunks. A requester lists the digests it already holds, and
+    for those only the hashes added since are sent, which keeps a poll small
+    when filters are large and change little.
+
+    Args:
+        request: The FastAPI request carrying the coordinator context.
+        known: Comma-separated ``instance_id:generation:count`` entries for
+            the digests the caller already holds.
 
     Returns:
-        ``{"digests": {instance_id: BloomDigest.to_json()}}``.
+        ``{"digests": {instance_id: entry}}``. Every entry has
+        ``generation`` and ``count``; a full one adds ``num_bits`` and
+        ``bits`` (see :meth:`BloomDigest.to_json`), a delta adds ``added``,
+        the hex chunk hashes to insert into the caller's copy.
+
+    Raises:
+        HTTPException: 400 if ``known`` is malformed.
     """
+    try:
+        held = _parse_known_digests(known)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     directory = get_context(request).views.get(KeyDirectory)
 
     def _encode() -> dict[str, dict[str, object]]:
-        return {iid: d.to_json() for iid, d in directory.l1_digests().items()}
+        return {
+            instance_id: _encode_digest(view, held.get(instance_id))
+            for instance_id, view in directory.l1_digests().items()
+        }
 
     digests = await asyncio.to_thread(_encode)
     return {"digests": digests}

@@ -7,8 +7,10 @@ definitions, MemoryLayoutDesc wire serialization, and server handlers.
 # Standard
 from typing import Literal
 from unittest.mock import MagicMock
+import os
 
 # Third Party
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 import torch
@@ -26,6 +28,8 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
+from lmcache.v1.mp_coordinator.app import create_app
+from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
 from lmcache.v1.multiprocess.modules import p2p_controller
 from lmcache.v1.multiprocess.modules.p2p_controller import (
@@ -715,12 +719,20 @@ def test_poll_cycle_peer_without_a_digest_gets_all_lookups():
     digests = MagicMock()
     digests.raise_for_status.return_value = None
     digests.json.return_value = {
-        "digests": {"peerA": BloomDigest.build([held]).to_json()}
+        "digests": {
+            "peerA": {
+                "generation": 1,
+                "count": 0,
+                **BloomDigest.build([held]).to_json(),
+            }
+        }
     }
     instances = _instances_response(
         [_entry("self", "me:1"), _entry("peerA", "tc:1"), _entry("peerB", "tc:2")]
     )
-    client.get.side_effect = lambda url: digests if "digests" in url else instances
+    client.get.side_effect = lambda url, params=None: (
+        digests if "digests" in url else instances
+    )
 
     controller._poll_cycle()
 
@@ -733,3 +745,82 @@ def test_poll_cycle_peer_without_a_digest_gets_all_lookups():
     assert with_digest is not None and with_digest.digest is not None
     assert with_digest.digest.might_contain(held)
     assert without_digest is not None and without_digest.digest is None
+
+
+def test_digest_polls_send_deltas_that_reproduce_the_coordinators_digest():
+    """Against a real coordinator app: the first poll fetches the whole
+    filter, the next one only the hashes added since, and the result matches
+    the coordinator's own digest bit for bit; after enough evictions the
+    rebuilt filter is fetched whole again and rules the evicted keys out."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"node-a": _peer("node-a")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    hashes = [os.urandom(32) for _ in range(3_000)]
+    seq = iter(range(1, 10_000))
+
+    def post(event_type: str, chunk_hashes: list[bytes]) -> None:
+        for start in range(0, len(chunk_hashes), 500):
+            entries = [
+                {
+                    "key": {"chunk_hash_hex": h.hex(), "model_name": "m", "kv_rank": 0},
+                    "size_bytes": 1,
+                }
+                for h in chunk_hashes[start : start + 500]
+            ]
+            batch = {
+                "instance_id": "node-a",
+                "incarnation": 1,
+                "seq": next(seq),
+                "event_type": event_type,
+                "tier": "l1",
+                "backend": "dram",
+                "entries": entries,
+            }
+            assert coord.post("/events", json={"batches": [batch]}).status_code == 200
+
+    config = MPCoordinatorConfig(health_check_interval=0.0, eviction_check_interval=0.0)
+    with TestClient(create_app(config)) as coord:
+        sizes = []
+        real_get = coord.get
+
+        def get(url, params=None):
+            response = real_get(url, params=params)
+            sizes.append(len(response.content))
+            return response
+
+        controller._http_client = MagicMock(get=get)
+
+        def coordinator_bits() -> bytes:
+            entry = real_get("/directory/l1-digests").json()["digests"]["node-a"]
+            return BloomDigest.from_json(entry).bits
+
+        post("store", hashes)
+        controller._refresh_digests()
+        assert lookup_digest.digest.bits == coordinator_bits()
+
+        new = [os.urandom(32) for _ in range(50)]
+        post("store", new)
+        controller._refresh_digests()
+        assert sizes[-1] < sizes[0] / 3  # a delta, not the whole filter
+        assert lookup_digest.digest.bits == coordinator_bits()
+        assert all(lookup_digest.digest.might_contain(h) for h in new)
+
+        evicted = hashes[:1_000]
+        post("delete", evicted)
+        controller._refresh_digests()
+        assert lookup_digest.digest.bits == coordinator_bits()
+        assert sum(lookup_digest.digest.might_contain(h) for h in evicted) < 10
+
+
+def test_digest_delta_for_another_generation_is_not_applied():
+    """A delta that does not continue the generation held is dropped (no
+    digest, lookups all sent) rather than applied to the wrong filter."""
+    held = BloomDigest.build([b"x"])
+    entry = {"generation": 2, "count": 1, "added": [b"y".hex()]}
+    assert P2PController._apply_digest_entry(entry, held, (1, 0)) is None
+    applied = P2PController._apply_digest_entry(
+        {"generation": 1, "count": 1, "added": [b"y".hex()]}, held, (1, 0)
+    )
+    assert applied is not None and applied.might_contain(b"y")

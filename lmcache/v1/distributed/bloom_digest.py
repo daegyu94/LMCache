@@ -37,6 +37,15 @@ def _positions(chunk_hashes: list[bytes], num_bits: int) -> np.ndarray:
     return (h1 + _PROBES * h2) % np.uint64(num_bits)
 
 
+def _set_bits(bits: np.ndarray, positions: np.ndarray) -> None:
+    """Set ``positions`` (flat, uint64) in the little-endian bit array ``bits``."""
+    np.bitwise_or.at(
+        bits,
+        (positions >> np.uint64(3)).astype(np.intp),
+        (np.uint8(1) << (positions & np.uint64(7)).astype(np.uint8)),
+    )
+
+
 @dataclass(frozen=True)
 class BloomDigest:
     """An immutable Bloom filter snapshot over chunk hashes.
@@ -100,6 +109,23 @@ class BloomDigest:
         ) & 1
         return bool(hit.all(axis=1).any())
 
+    def with_added(self, chunk_hashes: list[bytes]) -> "BloomDigest":
+        """Return a copy of this digest with ``chunk_hashes`` inserted.
+
+        A receiver applies a delta this way and swaps the result in, so
+        readers of the old digest are never affected.
+
+        Args:
+            chunk_hashes: The chunk hashes to insert.
+
+        Returns:
+            The new digest.
+        """
+        bits = np.frombuffer(self.bits, dtype=np.uint8).copy()
+        if chunk_hashes:
+            _set_bits(bits, _positions(chunk_hashes, self.num_bits).ravel())
+        return BloomDigest(num_bits=self.num_bits, bits=bits.tobytes())
+
     def to_json(self) -> dict[str, object]:
         """Encode for an HTTP response.
 
@@ -156,12 +182,7 @@ class BloomFilter:
         """
         if not chunk_hashes:
             return
-        positions = _positions(chunk_hashes, self.num_bits).ravel()
-        np.bitwise_or.at(
-            self._bits,
-            (positions >> np.uint64(3)).astype(np.intp),
-            (np.uint8(1) << (positions & np.uint64(7)).astype(np.uint8)),
-        )
+        _set_bits(self._bits, _positions(chunk_hashes, self.num_bits).ravel())
 
     def snapshot(self) -> BloomDigest:
         """Return an immutable copy of the current bits.

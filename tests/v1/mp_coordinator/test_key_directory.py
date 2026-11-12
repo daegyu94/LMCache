@@ -1064,9 +1064,9 @@ def test_l1_digest_covers_keys_stored_before_and_after_first_read():
     directory = KeyDirectory()
     early, late = _wide_key(1), _wide_key(2)
     directory.consume(_batch(seq=1, keys=[early]))
-    assert directory.l1_digests()["node-a"].might_contain(early.chunk_hash)
+    assert directory.l1_digests()["node-a"].digest.might_contain(early.chunk_hash)
     directory.consume(_batch(seq=2, keys=[late]))
-    digest = directory.l1_digests()["node-a"]
+    digest = directory.l1_digests()["node-a"].digest
     assert digest.might_contain(early.chunk_hash)
     assert digest.might_contain(late.chunk_hash)
 
@@ -1075,8 +1075,8 @@ def test_l1_digest_ignores_l2_placements():
     directory = KeyDirectory()
     key = _wide_key(1)
     directory.consume(_batch(tier=Tier.L2, backend="fs", keys=[key]))
-    digest = directory.l1_digests().get("node-a")
-    assert digest is None or not digest.might_contain(key.chunk_hash)
+    view = directory.l1_digests().get("node-a")
+    assert view is None or not view.digest.might_contain(key.chunk_hash)
 
 
 def test_l1_digest_drops_evicted_keys_after_enough_churn():
@@ -1086,10 +1086,10 @@ def test_l1_digest_drops_evicted_keys_after_enough_churn():
     directory.l1_digests()
     # Evicting a small share keeps the old bits: a stale bit is only a hint.
     directory.consume(_batch(seq=2, event_type=CacheEventType.DELETE, keys=keys[:5]))
-    assert directory.l1_digests()["node-a"].might_contain(keys[0].chunk_hash)
+    assert directory.l1_digests()["node-a"].digest.might_contain(keys[0].chunk_hash)
     # Past the churn threshold the next read rebuilds from the live keys.
     directory.consume(_batch(seq=3, event_type=CacheEventType.DELETE, keys=keys[5:60]))
-    digest = directory.l1_digests()["node-a"]
+    digest = directory.l1_digests()["node-a"].digest
     assert all(digest.might_contain(k.chunk_hash) for k in keys[60:])
     assert sum(digest.might_contain(k.chunk_hash) for k in keys[:60]) <= 1
 
@@ -1097,10 +1097,10 @@ def test_l1_digest_drops_evicted_keys_after_enough_churn():
 def test_l1_digest_rebuilds_when_inserts_outgrow_the_filter():
     directory = KeyDirectory()
     directory.consume(_batch(seq=1, keys=[_wide_key(0)]))
-    small = directory.l1_digests()["node-a"]
+    small = directory.l1_digests()["node-a"].digest
     keys = [_wide_key(i) for i in range(1, 3000)]
     directory.consume(_batch(seq=2, keys=keys))
-    grown = directory.l1_digests()["node-a"]
+    grown = directory.l1_digests()["node-a"].digest
     assert grown.num_bits > small.num_bits
     assert all(grown.might_contain(k.chunk_hash) for k in keys)
 
@@ -1138,13 +1138,13 @@ def test_l1_digests_track_many_keys_across_instances_and_churn():
     digests = directory.l1_digests()
     for instance_id, instance_keys in keys.items():
         assert all(
-            digests[instance_id].might_contain(k.chunk_hash)
+            digests[instance_id].digest.might_contain(k.chunk_hash)
             for k in instance_keys[::97]
         )
 
     evicted, kept = keys["node-0"][:5_000], keys["node-0"][5_000:]
     _store_many(directory, "node-0", evicted, seq=100, et=CacheEventType.DELETE)
-    digest = directory.l1_digests()["node-0"]
+    digest = directory.l1_digests()["node-0"].digest
     assert all(digest.might_contain(k.chunk_hash) for k in kept[::97])
     assert sum(digest.might_contain(k.chunk_hash) for k in evicted) < 25
 
@@ -1159,8 +1159,8 @@ def test_rebuild_includes_changes_that_land_while_it_is_built():
     index.on_add("a", late.chunk_hash)
     index.drop("b")
     digests = index.finish(L1DigestIndex.build(jobs))
-    assert digests["a"].might_contain(late.chunk_hash)
-    assert all(digests["a"].might_contain(k.chunk_hash) for k in keys["a"])
+    assert digests["a"].digest.might_contain(late.chunk_hash)
+    assert all(digests["a"].digest.might_contain(k.chunk_hash) for k in keys["a"])
     assert "b" not in digests
 
 
@@ -1173,6 +1173,6 @@ def test_concurrent_reader_skips_a_rebuild_already_in_flight():
     second = index.begin_rebuilds(keys)
     assert "a" in first and not second
     assert "a" not in index.finish(L1DigestIndex.build(second))
-    assert index.finish(L1DigestIndex.build(first))["a"].might_contain(
+    assert index.finish(L1DigestIndex.build(first))["a"].digest.might_contain(
         _wide_key(1).chunk_hash
     )
