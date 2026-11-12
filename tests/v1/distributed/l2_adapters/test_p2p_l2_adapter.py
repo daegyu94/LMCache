@@ -4,6 +4,7 @@
 # Standard
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
+import select
 import time
 
 # Third Party
@@ -22,11 +23,13 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter as p2p_mod
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     P2PL2Adapter,
     P2PL2AdapterConfig,
     PeerL2AdapterBase,
+    PeerLookupDigest,
 )
 from lmcache.v1.multiprocess.transport.base import RequestClient
 
@@ -54,7 +57,11 @@ class _FakeFuture:
 
 
 @contextmanager
-def _adapter(lookup_timeout_s: float = 10.0, load_timeout_s: float = 10.0):
+def _adapter(
+    lookup_timeout_s: float = 10.0,
+    load_timeout_s: float = 10.0,
+    lookup_digest: PeerLookupDigest | None = None,
+):
     req_client = MagicMock(spec=RequestClient)
     tc_ctx = MagicMock()
     tc_client = MagicMock()
@@ -79,6 +86,7 @@ def _adapter(lookup_timeout_s: float = 10.0, load_timeout_s: float = 10.0):
             peer_transfer_channel_server_url="peer:7600",
             lookup_timeout_s=lookup_timeout_s,
             load_timeout_s=load_timeout_s,
+            lookup_digest=lookup_digest,
         )
         adapter = P2PL2Adapter(config)
         try:
@@ -556,3 +564,24 @@ def test_region_teardown_failure_keeps_rpc_open_for_retry() -> None:
         notifier.unregister_fd.assert_not_called()
         adapter.close()
         client.close.assert_called_once()
+
+
+def test_lookup_ruled_out_by_the_digest_is_a_miss_without_an_rpc():
+    """When the peer's digest rules out every key the lookup completes as a
+    miss at once, signalled, with no RPC; otherwise the RPC is sent."""
+    held, other = _key(0), _key(1)
+    lookup_digest = PeerLookupDigest()
+    lookup_digest.digest = BloomDigest.build([held.chunk_hash])
+    with _adapter(lookup_digest=lookup_digest) as (adapter, req_client, *_):
+        req_client.p2p_lookup_and_lock.return_value = _FakeFuture(value=7)
+        req_client.p2p_query_lookup_results.return_value = _FakeFuture(
+            value=[TransferChannelAddress(offset=100, size=10)]
+        )
+        task_id = adapter.submit_lookup_and_lock_task([other], {0: _LAYOUT})
+        req_client.p2p_lookup_and_lock.assert_not_called()
+        assert select.select([adapter.get_lookup_and_lock_event_fd()], [], [], 1.0)[0]
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None and bitmap.popcount() == 0
+
+        task_id = adapter.submit_lookup_and_lock_task([held], {0: _LAYOUT})
+        req_client.p2p_lookup_and_lock.assert_called_once()
