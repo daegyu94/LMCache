@@ -196,6 +196,12 @@ L2 for a request the L1 hits alone serve.
   it (L1 managers before L2 adapters); everything loaded from L2 stays in L1.
 - `"skip_l1"`: same plan; nothing loaded from L2 is retained. Temporary
   objects are deleted once the retrieve that requested them finishes.
+- `"replica_spread"`: L1 as in `"default"`; for L2, repeatedly pick the
+  adapter that covers the most still-needed cells, breaking ties by a hash
+  of the request's first chunk. When several P2P peers hold the same prefix,
+  `"default"` sends every read to the lowest-indexed peer; this keeps each
+  prefix on one peer and spreads different prefixes across the peers, and
+  a request reads from as few adapters as possible. Loaded keys stay in L1.
 - `"retain"`: deprecated alias of `"default"`; logs a warning.
 
 `"prefix"` fetching plans the longest prefix every row can serve under its

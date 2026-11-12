@@ -33,6 +33,7 @@ from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     DefaultPrefetchPolicy,
     PrefetchPlan,
     PrefetchPolicy,
+    ReplicaSpreadPrefetchPolicy,
     create_prefetch_policy,
     get_registered_prefetch_policies,
     register_prefetch_policy,
@@ -53,11 +54,14 @@ FULL = FULL_ATTENTION_WINDOW_CHUNKS
 # =============================================================================
 
 
-def _group(num_keys: int, gid: int = 0, window: int = FULL) -> GroupedObjectKeys:
-    """Build one key group of ``num_keys`` chunk-ordered keys."""
+def _group(
+    num_keys: int, gid: int = 0, window: int = FULL, first: int = 0
+) -> GroupedObjectKeys:
+    """Build one key group of ``num_keys`` chunk-ordered keys, the first
+    hashed from ``first``."""
     keys = [
         ObjectKey(
-            chunk_hash=ObjectKey.IntHash2Bytes(i),
+            chunk_hash=ObjectKey.IntHash2Bytes(first + i),
             model_name="m",
             kv_rank=0,
             object_group_id=gid,
@@ -570,12 +574,100 @@ class TestRetention:
 # =============================================================================
 
 
+class TestReplicaSpread:
+    def test_adapter_covering_most_cells_serves_them_all(self) -> None:
+        """A request reads from the adapter that holds all of it rather than
+        splitting across the lower-indexed one, as ``default`` would."""
+        groups = [_group(4)]
+        l2 = _state({0: [_row(4, 0, 1)], 1: [_row(4, 0, 1, 2, 3)]})
+
+        plan = _plan(
+            ReplicaSpreadPrefetchPolicy(), groups, MapState(), l2, l2_indices=(0, 1)
+        )
+
+        assert 0 not in plan.l2_planned_keys
+        assert _rows(plan.l2_planned_keys, 1) == [[0, 1, 2, 3]]
+
+    def test_full_replicas_spread_by_prefix_and_stay_put_per_prefix(self) -> None:
+        """When every adapter holds the whole request, each request reads from
+        one adapter, the same prefix always picks the same one, and different
+        prefixes use every adapter."""
+        l2 = _state({i: [_row(4, 0, 1, 2, 3)] for i in range(3)})
+        picks = []
+        for first in range(0, 400, 4):
+            groups = [_group(4, first=first)]
+            plan = _plan(
+                ReplicaSpreadPrefetchPolicy(),
+                groups,
+                MapState(),
+                l2,
+                l2_indices=(0, 1, 2),
+            )
+            used = [i for i in range(3) if i in plan.l2_planned_keys]
+            assert len(used) == 1
+            assert _rows(plan.l2_planned_keys, used[0]) == [[0, 1, 2, 3]]
+            again = _plan(
+                ReplicaSpreadPrefetchPolicy(),
+                groups,
+                MapState(),
+                l2,
+                l2_indices=(0, 1, 2),
+            )
+            assert used[0] in again.l2_planned_keys
+            picks.append(used[0])
+        assert set(picks) == {0, 1, 2}
+
+    def test_cells_no_single_adapter_holds_are_filled_from_the_next(self) -> None:
+        """After the best-covering adapter, the rest come from the adapter
+        covering the most of what is left."""
+        groups = [_group(4)]
+        l2 = _state({0: [_row(4, 3)], 1: [_row(4, 0, 1, 2)], 2: [_row(4, 2, 3)]})
+
+        plan = _plan(
+            ReplicaSpreadPrefetchPolicy(),
+            groups,
+            MapState(),
+            l2,
+            l2_indices=(0, 1, 2),
+        )
+
+        assert _rows(plan.l2_planned_keys, 1) == [[0, 1, 2]]
+        assert len([i for i in (0, 2) if i in plan.l2_planned_keys]) == 1
+
+    @pytest.mark.parametrize("fetching_policy", ["prefix", "full"])
+    def test_plan_obeys_locking_and_uniqueness(
+        self, fetching_policy: FetchingPolicy
+    ) -> None:
+        """L1 still wins, every planned cell is locked where it is planned,
+        and no cell is planned twice."""
+        groups = [_group(6, gid=0), _group(6, gid=1)]
+        l1 = _state({0: [_row(6, 0, 1), _row(6, 0)]})
+        l2 = _state(
+            {
+                0: [_row(6, 0, 1, 2, 3, 5), _row(6, 1, 3)],
+                1: [_row(6, 2, 3, 4, 5), _row(6, 2, 3, 4, 5)],
+            }
+        )
+
+        plan = _plan(
+            ReplicaSpreadPrefetchPolicy(),
+            groups,
+            l1,
+            l2,
+            fetching_policy,
+            l2_indices=(0, 1),
+        )
+
+        _assert_plan_contract(plan, l1, l2, (0,), (0, 1))
+        assert _rows(plan.l1_planned_keys, 0)[0][:2] == [0, 1]
+
+
 class TestRegistry:
     def test_builtin_policies_are_registered(self) -> None:
         """The shipped policies and the deprecated alias can be found by name."""
         names = get_registered_prefetch_policies()
 
-        assert {"default", "skip_l1", "retain"} <= set(names)
+        assert {"default", "skip_l1", "retain", "replica_spread"} <= set(names)
 
     def test_create_returns_matching_policy(self) -> None:
         """Creating by name yields an instance of the registered class."""

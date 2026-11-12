@@ -708,8 +708,12 @@ Source: ``lmcache/v1/distributed/config.py``
        keeps prefetched keys in L1.
        The ``skip_l1`` policy uses the same load plan, but prefetched keys
        are temporary (deleted after the reader finishes).
-       Choices: ``default``, ``skip_l1``.  ``retain`` is a deprecated alias
-       of ``default``.
+       The ``replica_spread`` policy keeps prefetched keys like ``default``,
+       but when several adapters (for example P2P peers) hold a key it reads
+       from the one covering the most of the request and spreads equally
+       good choices by prefix, instead of always the lowest index.
+       Choices: ``default``, ``skip_l1``, ``replica_spread``.  ``retain`` is
+       a deprecated alias of ``default``.
    * - ``--l2-prefetch-inflight-watermark``
      - ``0.5``
      - Fraction of L1 capacity, in (0, 1], that in-flight prefetch

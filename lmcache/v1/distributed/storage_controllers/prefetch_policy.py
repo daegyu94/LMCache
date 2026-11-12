@@ -16,6 +16,7 @@ after the reader that requested them has finished.
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import hashlib
 
 # First Party
 from lmcache.logging import init_logger
@@ -270,7 +271,7 @@ class DefaultPrefetchPolicy(PrefetchPolicy):
             needed = Bitmap2D(retain) & found
 
         l1_plan, needed = _plan_tier(needed, l1_locked_keys, sorted(l1_manager_descs))
-        l2_plan, _needed = _plan_tier(needed, l2_locked_keys, sorted(l2_adapter_descs))
+        l2_plan = self._plan_l2(needed, l2_locked_keys, l2_adapter_descs, key_groups)
         return PrefetchPlan(l1_planned_keys=l1_plan, l2_planned_keys=l2_plan)
 
     def plan_l1_retention(
@@ -295,6 +296,26 @@ class DefaultPrefetchPolicy(PrefetchPolicy):
             This function does not raise.
         """
         return [True] * len(keys)
+
+    def _plan_l2(
+        self,
+        needed: Bitmap2D,
+        l2_locked_keys: MapState,
+        l2_adapter_descs: dict[int, L2AdapterDescriptor],
+        key_groups: list[GroupedObjectKeys],
+    ) -> MapState:
+        """Assign the cells L1 does not serve to L2 adapters, lowest index first.
+
+        Args:
+            needed: The cells still needed after L1.
+            l2_locked_keys: L2 adapter index -> cells locked there.
+            l2_adapter_descs: Descriptors of the eligible L2 adapters.
+            key_groups: The request's keys; unused here, for subclasses.
+
+        Returns:
+            L2 adapter index -> cells to load from it.
+        """
+        return _plan_tier(needed, l2_locked_keys, sorted(l2_adapter_descs))[0]
 
 
 class BufferOnlyPrefetchPolicy(DefaultPrefetchPolicy):
@@ -335,6 +356,60 @@ RetainPrefetchPolicy = DefaultPrefetchPolicy
 # -----------------------------------------------------------------------------
 # Registry: prefetch policy name -> policy class
 # -----------------------------------------------------------------------------
+
+
+class ReplicaSpreadPrefetchPolicy(DefaultPrefetchPolicy):
+    """Like ``default``, but spread loads across L2 adapters holding copies.
+
+    ``default`` loads every cell from the lowest-indexed adapter holding it,
+    so when several P2P peers hold the same prefix, every requester reads it
+    from the same peer. This policy instead picks, one at a time, the adapter
+    that covers the most still-needed cells, so a request reads from as few
+    adapters as possible; among adapters covering equally many, it picks by
+    a hash of the request's first chunk. Requests for the same prefix
+    therefore keep reading from one peer, while different prefixes held by
+    the same peers spread across them.
+    """
+
+    def _plan_l2(
+        self,
+        needed: Bitmap2D,
+        l2_locked_keys: MapState,
+        l2_adapter_descs: dict[int, L2AdapterDescriptor],
+        key_groups: list[GroupedObjectKeys],
+    ) -> MapState:
+        """Assign the cells L1 does not serve by greedy coverage, hash on ties.
+
+        Args:
+            needed: The cells still needed after L1.
+            l2_locked_keys: L2 adapter index -> cells locked there.
+            l2_adapter_descs: Descriptors of the eligible L2 adapters.
+            key_groups: The request's keys; the first chunk's hash breaks ties.
+
+        Returns:
+            L2 adapter index -> cells to load from it.
+        """
+        seed = int.from_bytes(
+            hashlib.blake2b(key_groups[0].keys[0].chunk_hash, digest_size=8).digest(),
+            "little",
+        )
+        candidates = [i for i in sorted(l2_adapter_descs) if i in l2_locked_keys]
+        plan = MapState()
+        remaining = needed
+        while candidates and remaining.popcount() > 0:
+            coverage = {
+                i: (remaining & l2_locked_keys[i]).popcount() for i in candidates
+            }
+            best = max(coverage.values())
+            if best == 0:
+                break
+            tied = [i for i in candidates if coverage[i] == best]
+            pick = tied[seed % len(tied)]
+            plan[pick] = remaining & l2_locked_keys[pick]
+            remaining = remaining - plan[pick]
+            candidates.remove(pick)
+        return plan
+
 
 _PREFETCH_POLICY_REGISTRY: dict[str, type[PrefetchPolicy]] = {}
 
@@ -387,3 +462,4 @@ def create_prefetch_policy(name: str) -> PrefetchPolicy:
 register_prefetch_policy("default", DefaultPrefetchPolicy)
 register_prefetch_policy("skip_l1", BufferOnlyPrefetchPolicy)
 register_prefetch_policy("retain", DefaultPrefetchPolicy)
+register_prefetch_policy("replica_spread", ReplicaSpreadPrefetchPolicy)
