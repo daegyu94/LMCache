@@ -1050,3 +1050,63 @@ def test_expansion_drops_groups_once_their_copies_are_deleted():
     assert directory.get_keys_across_object_groups([_grouped_key(1, 0)]) == [
         _grouped_key(1, 0)
     ]
+
+
+# -- L1 digests ----------------------------------------------------------------
+
+
+def _wide_key(i: int) -> ObjectKey:
+    return ObjectKey(chunk_hash=i.to_bytes(8, "little"), model_name="m", kv_rank=0)
+
+
+def test_l1_digest_covers_keys_stored_before_and_after_first_read():
+    directory = KeyDirectory()
+    early, late = _wide_key(1), _wide_key(2)
+    directory.consume(_batch(seq=1, keys=[early]))
+    assert directory.l1_digests()["node-a"].might_contain(early.chunk_hash)
+    directory.consume(_batch(seq=2, keys=[late]))
+    digest = directory.l1_digests()["node-a"]
+    assert digest.might_contain(early.chunk_hash)
+    assert digest.might_contain(late.chunk_hash)
+
+
+def test_l1_digest_ignores_l2_placements():
+    directory = KeyDirectory()
+    key = _wide_key(1)
+    directory.consume(_batch(tier=Tier.L2, backend="fs", keys=[key]))
+    digest = directory.l1_digests().get("node-a")
+    assert digest is None or not digest.might_contain(key.chunk_hash)
+
+
+def test_l1_digest_drops_evicted_keys_after_enough_churn():
+    directory = KeyDirectory()
+    keys = [_wide_key(i) for i in range(100)]
+    directory.consume(_batch(seq=1, keys=keys))
+    directory.l1_digests()
+    # Evicting a small share keeps the old bits: a stale bit is only a hint.
+    directory.consume(_batch(seq=2, event_type=CacheEventType.DELETE, keys=keys[:5]))
+    assert directory.l1_digests()["node-a"].might_contain(keys[0].chunk_hash)
+    # Past the churn threshold the next read rebuilds from the live keys.
+    directory.consume(_batch(seq=3, event_type=CacheEventType.DELETE, keys=keys[5:60]))
+    digest = directory.l1_digests()["node-a"]
+    assert all(digest.might_contain(k.chunk_hash) for k in keys[60:])
+    assert sum(digest.might_contain(k.chunk_hash) for k in keys[:60]) <= 1
+
+
+def test_l1_digest_rebuilds_when_inserts_outgrow_the_filter():
+    directory = KeyDirectory()
+    directory.consume(_batch(seq=1, keys=[_wide_key(0)]))
+    small = directory.l1_digests()["node-a"]
+    keys = [_wide_key(i) for i in range(1, 3000)]
+    directory.consume(_batch(seq=2, keys=keys))
+    grown = directory.l1_digests()["node-a"]
+    assert grown.num_bits > small.num_bits
+    assert all(grown.might_contain(k.chunk_hash) for k in keys)
+
+
+def test_l1_digest_forgets_a_fenced_instance():
+    directory = KeyDirectory()
+    directory.consume(_batch(keys=[_wide_key(1)]))
+    directory.l1_digests()
+    directory.fence_instance("node-a")
+    assert "node-a" not in directory.l1_digests()

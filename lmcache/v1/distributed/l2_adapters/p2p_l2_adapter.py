@@ -94,8 +94,8 @@ class PeerLookupDigest:
             ``True`` only when a digest is present and rules out every key.
         """
         digest = self.digest
-        return digest is not None and not any(
-            digest.might_contain(key.chunk_hash) for key in keys
+        return digest is not None and not digest.might_contain_any(
+            [key.chunk_hash for key in keys]
         )
 
 

@@ -17,7 +17,6 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 # First Party
 from lmcache.v1.distributed.api import Tier
-from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.mp_coordinator.api import BlendMatch, BlendNamespace
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.schemas import (
@@ -230,23 +229,19 @@ async def l1_digests(request: Request) -> dict[str, dict[str, dict[str, object]]
     """Return a Bloom digest of each instance's L1 chunk hashes.
 
     P2P requesters poll this to skip lookup RPCs to peers that hold none of
-    a request's chunks. Rebuilt on every call: a digest of a changing
-    directory is a hint, and rebuilding avoids tracking deletions.
+    a request's chunks. The directory keeps the digests incrementally, so a
+    poll folds in recent inserts and rebuilds only instances whose keys have
+    churned.
 
     Returns:
         ``{"digests": {instance_id: BloomDigest.to_json()}}``.
     """
     directory = get_context(request).views.get(KeyDirectory)
 
-    def _build() -> dict[str, dict[str, object]]:
-        return {
-            instance_id: BloomDigest.build(hashes).to_json()
-            for instance_id, hashes in directory.l1_chunk_hashes_by_instance().items()
-        }
+    def _encode() -> dict[str, dict[str, object]]:
+        return {iid: d.to_json() for iid, d in directory.l1_digests().items()}
 
-    # shortcut: rebuilt per request; cache per directory version if N servers
-    # polling every heartbeat makes this show up in coordinator CPU.
-    digests = await asyncio.to_thread(_build)
+    digests = await asyncio.to_thread(_encode)
     return {"digests": digests}
 
 
