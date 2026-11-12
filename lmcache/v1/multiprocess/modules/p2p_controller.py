@@ -26,7 +26,11 @@ from lmcache.v1.distributed.api import (
     PrefetchHandle,
     PrefetchTaskSpec,
 )
-from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
+from lmcache.v1.distributed.bloom_digest import BloomDigest
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
+    P2PL2AdapterConfig,
+    PeerLookupDigest,
+)
 from lmcache.v1.distributed.transfer_channel import (
     delete_transfer_channel_context,
     initialize_transfer_channel_context,
@@ -138,6 +142,7 @@ class _PeerAdapter:
     ip: str
     p2p_advertised_url: str
     mq_port: int
+    lookup_digest: PeerLookupDigest | None = None
     consecutive_misses: int = 0
 
 
@@ -213,6 +218,7 @@ class P2PController(DiscoverableModule):
         self._adapters: dict[str, _PeerAdapter] = {}
 
         self._instances_url = ""
+        self._digests_url = ""
         self._http_client: httpx.Client | None = None
         self._poll_thread: PeriodicThread | None = None
 
@@ -252,6 +258,10 @@ class P2PController(DiscoverableModule):
             advertise_url=self._p2p_config.advertise_url,
         )
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
+        if self._p2p_config.lookup_digest:
+            self._digests_url = (
+                coordinator_config.url.rstrip("/") + "/directory/l1-digests"
+            )
         timeout = max(1.0, coordinator_config.heartbeat_interval)
         self._http_client = httpx.Client(timeout=timeout)
         self._poll_thread = create_periodic_thread(
@@ -543,7 +553,10 @@ class P2PController(DiscoverableModule):
             and inst.ip
             and inst.mq_port
         }
-        return self._apply_state(_P2PState.REGISTERED, upstream)
+        summary = self._apply_state(_P2PState.REGISTERED, upstream)
+        if self._digests_url:
+            self._refresh_digests()
+        return summary
 
     def _fetch_instances(self) -> list[_PeerInstance]:
         """Fetch and parse the coordinator's active-instance list.
@@ -575,6 +588,32 @@ class P2PController(DiscoverableModule):
                 )
             )
         return instances
+
+    def _refresh_digests(self) -> None:
+        """Fetch the peers' L1 digests and hand each to its adapter.
+
+        A peer absent from the response has no L1 placements in the
+        directory, so it gets an empty digest. A failed fetch clears every
+        digest, so lookups go to all peers rather than trusting stale ones.
+        """
+        assert self._http_client is not None
+        with self._orch_lock:
+            adapters = list(self._adapters.items())
+        try:
+            response = self._http_client.get(self._digests_url)
+            response.raise_for_status()
+            raw = response.json()["digests"]
+            digests = {iid: BloomDigest.from_json(d) for iid, d in raw.items()}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            logger.warning("P2P L1 digest fetch failed; sending all lookups: %s", e)
+            for _, adapter in adapters:
+                if adapter.lookup_digest is not None:
+                    adapter.lookup_digest.digest = None
+            return
+        empty = BloomDigest.build([])
+        for peer_id, adapter in adapters:
+            if adapter.lookup_digest is not None:
+                adapter.lookup_digest.digest = digests.get(peer_id, empty)
 
     def _is_self_registered(self, instances: list[_PeerInstance]) -> bool:
         """Return whether this instance appears in ``instances`` with our URL.
@@ -677,11 +716,13 @@ class P2PController(DiscoverableModule):
         Returns:
             ``True`` if the adapter was created and tracked.
         """
+        lookup_digest = PeerLookupDigest() if self._digests_url else None
         config = P2PL2AdapterConfig(
             peer_mq_server_url=(f"{self._request_scheme}://{inst.ip}:{inst.mq_port}"),
             peer_transfer_channel_server_url=inst.p2p_advertised_url,
             lookup_timeout_s=self._p2p_config.lookup_timeout,
             load_timeout_s=self._p2p_config.load_timeout,
+            lookup_digest=lookup_digest,
         )
         try:
             adapter_id = self._ctx.storage_manager.add_l2_adapter(config)
@@ -694,6 +735,7 @@ class P2PController(DiscoverableModule):
                 ip=inst.ip,
                 p2p_advertised_url=inst.p2p_advertised_url,
                 mq_port=inst.mq_port,
+                lookup_digest=lookup_digest,
             )
         logger.debug(
             "Added P2P adapter %d for peer %s (%s)",

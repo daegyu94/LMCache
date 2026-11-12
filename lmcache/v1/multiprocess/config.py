@@ -256,6 +256,10 @@ class P2PConfig:
     transfer_engine: str = "nixl"
     """Transfer-channel implementation to use."""
 
+    lookup_digest: bool = False
+    """Skip lookups to peers whose coordinator L1 digest rules out every key.
+    Needs ``--coordinator-event-reporting`` on every server."""
+
     @property
     def enabled(self) -> bool:
         """Whether P2P is enabled (an advertise URL is configured)."""
@@ -751,6 +755,15 @@ def add_p2p_args(
         default="nixl",
         help="Transfer-channel implementation to use. Default is nixl.",
     )
+    group.add_argument(
+        "--p2p-lookup-digest",
+        action="store_true",
+        default=False,
+        help="Skip lookups to peers whose L1 digest from the coordinator rules "
+        "out every requested key. Every server must run with "
+        "--coordinator-event-reporting; keys stored since the last digest poll "
+        "can be missed. Default is off.",
+    )
     return parser
 
 
@@ -771,6 +784,7 @@ def parse_args_to_p2p_config(
         lookup_timeout=getattr(args, "p2p_lookup_timeout", 30.0),
         load_timeout=getattr(args, "p2p_load_timeout", 30.0),
         transfer_engine=getattr(args, "p2p_transfer_engine", "nixl"),
+        lookup_digest=getattr(args, "p2p_lookup_digest", False),
     )
 
 

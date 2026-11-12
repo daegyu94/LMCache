@@ -38,6 +38,7 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -72,17 +73,51 @@ class _LoadTask:
     failed: bool = False
 
 
+class PeerLookupDigest:
+    """The latest Bloom digest of one peer's L1, swapped in by the P2P controller.
+
+    ``None`` (no digest yet, or the last fetch failed) sends every lookup, as
+    without a digest. Replacing the reference is atomic, so the controller's
+    poll thread and the prefetch loop share it without a lock.
+    """
+
+    def __init__(self) -> None:
+        self.digest: BloomDigest | None = None
+
+    def excludes_all(self, keys: list[ObjectKey]) -> bool:
+        """Return whether the peer certainly holds none of ``keys``.
+
+        Args:
+            keys: The keys a lookup would ask the peer for.
+
+        Returns:
+            ``True`` only when a digest is present and rules out every key.
+        """
+        digest = self.digest
+        return digest is not None and not any(
+            digest.might_contain(key.chunk_hash) for key in keys
+        )
+
+
 class PeerL2AdapterConfigBase(L2AdapterConfigBase):
     """Fields shared by every adapter that looks up and locks keys on one peer.
 
     Fields:
     - peer_mq_server_url: Peer request server URL (lookup/unlock RPCs).
     - lookup_timeout_s: deadline for a lookup result before it counts as a miss.
+    - lookup_digest: runtime-only digest of the peer's L1; a lookup it rules
+      out completes as a miss without an RPC. Not settable from a dict.
     """
 
-    def __init__(self, peer_mq_server_url: str, lookup_timeout_s: float) -> None:
+    def __init__(
+        self,
+        peer_mq_server_url: str,
+        lookup_timeout_s: float,
+        lookup_digest: PeerLookupDigest | None = None,
+    ) -> None:
         self.peer_mq_server_url = peer_mq_server_url
         self.lookup_timeout_s = lookup_timeout_s
+        self.lookup_digest = lookup_digest
 
 
 class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
@@ -101,8 +136,9 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         peer_transfer_channel_server_url: str,
         lookup_timeout_s: float = 10.0,
         load_timeout_s: float = 10.0,
+        lookup_digest: PeerLookupDigest | None = None,
     ) -> None:
-        super().__init__(peer_mq_server_url, lookup_timeout_s)
+        super().__init__(peer_mq_server_url, lookup_timeout_s, lookup_digest)
         self.peer_transfer_channel_server_url = peer_transfer_channel_server_url
         self.load_timeout_s = load_timeout_s
 
@@ -265,6 +301,15 @@ class PeerL2AdapterBase(L2AdapterInterface):
             self._lookup_tasks[task_id] = _LookupTask(
                 keys=keys, remote_task_id=-1, deadline=0.0, failed=True
             )
+            return task_id
+
+        digest = self._config.lookup_digest
+        if digest is not None and digest.excludes_all(keys):
+            self._lookup_tasks[task_id] = _LookupTask(
+                keys=keys, remote_task_id=-1, deadline=0.0, failed=True
+            )
+            # Signal now rather than waiting for the next periodic pulse.
+            self._lookup_efd.notify()
             return task_id
 
         future = self._req_client.p2p_lookup_and_lock(keys, group_layout_descs)

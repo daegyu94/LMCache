@@ -515,6 +515,21 @@ class KeyDirectory(View):
                 total += 1
             return total, page
 
+    def l1_chunk_hashes_by_instance(self) -> dict[str, list[bytes]]:
+        """Snapshot the chunk hashes each instance holds in L1.
+
+        Reads the per-instance reverse index, so the cost is proportional to
+        the L1 keys rather than the whole directory.
+
+        Returns:
+            ``instance_id`` → chunk hashes of its L1 placements.
+        """
+        with self._lock:
+            return {
+                instance_id: [key.chunk_hash for key in keys]
+                for instance_id, keys in self._l1_keys_by_instance.items()
+            }
+
     def fence_instance(self, instance_id: str) -> None:
         """Remove every **L1** placement reported by ``instance_id``.
 

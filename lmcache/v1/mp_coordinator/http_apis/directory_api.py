@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 # First Party
 from lmcache.v1.distributed.api import Tier
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.mp_coordinator.api import BlendMatch, BlendNamespace
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.schemas import (
@@ -222,6 +223,31 @@ async def list_directory_keys(
 
     # ``total`` walks every matching record — keep the scan off the event loop.
     return await asyncio.to_thread(_scan)
+
+
+@router.get("/directory/l1-digests")
+async def l1_digests(request: Request) -> dict[str, dict[str, dict[str, object]]]:
+    """Return a Bloom digest of each instance's L1 chunk hashes.
+
+    P2P requesters poll this to skip lookup RPCs to peers that hold none of
+    a request's chunks. Rebuilt on every call: a digest of a changing
+    directory is a hint, and rebuilding avoids tracking deletions.
+
+    Returns:
+        ``{"digests": {instance_id: BloomDigest.to_json()}}``.
+    """
+    directory = get_context(request).views.get(KeyDirectory)
+
+    def _build() -> dict[str, dict[str, object]]:
+        return {
+            instance_id: BloomDigest.build(hashes).to_json()
+            for instance_id, hashes in directory.l1_chunk_hashes_by_instance().items()
+        }
+
+    # shortcut: rebuilt per request; cache per directory version if N servers
+    # polling every heartbeat makes this show up in coordinator CPU.
+    digests = await asyncio.to_thread(_build)
+    return {"digests": digests}
 
 
 @router.get("/directory/stats")
