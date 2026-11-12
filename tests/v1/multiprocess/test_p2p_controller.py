@@ -24,6 +24,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchResult,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
 from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
 from lmcache.v1.multiprocess.modules import p2p_controller
@@ -700,3 +701,35 @@ def test_poll_cycle_skips_peer_without_p2p_url():
 
     ctx.storage_manager.add_l2_adapter.assert_not_called()
     assert controller.report_status()["p2p_peers"] == []
+
+
+def test_poll_cycle_peer_without_a_digest_gets_all_lookups():
+    """With lookup digests on, a peer the coordinator has a digest for gets
+    it; a peer it has none for (for example one not reporting cache events)
+    gets no digest, so its lookups are all sent rather than dropped."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    client = _enable_polling(controller, advertise_url="me:1")
+    controller._digests_url = "http://coordinator/directory/l1-digests"
+    held = b"held-chunk"
+    digests = MagicMock()
+    digests.raise_for_status.return_value = None
+    digests.json.return_value = {
+        "digests": {"peerA": BloomDigest.build([held]).to_json()}
+    }
+    instances = _instances_response(
+        [_entry("self", "me:1"), _entry("peerA", "tc:1"), _entry("peerB", "tc:2")]
+    )
+    client.get.side_effect = lambda url: digests if "digests" in url else instances
+
+    controller._poll_cycle()
+
+    configs = {
+        c.args[0].peer_transfer_channel_server_url: c.args[0]
+        for c in ctx.storage_manager.add_l2_adapter.call_args_list
+    }
+    with_digest = configs["tc:1"].lookup_digest
+    without_digest = configs["tc:2"].lookup_digest
+    assert with_digest is not None and with_digest.digest is not None
+    assert with_digest.digest.might_contain(held)
+    assert without_digest is not None and without_digest.digest is None

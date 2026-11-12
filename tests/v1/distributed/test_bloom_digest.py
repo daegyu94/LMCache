@@ -53,3 +53,14 @@ def test_lookup_digest_excludes_only_when_no_key_may_be_present() -> None:
     assert not lookup_digest.excludes_all(keys)
     lookup_digest.digest = BloomDigest.build([])
     assert lookup_digest.excludes_all(keys)
+
+
+def test_large_set_has_no_false_negatives_and_low_request_false_positives() -> None:
+    """At 200k keys every inserted hash is found, and a 16-chunk lookup for
+    keys the peer does not hold is sent in only a few percent of cases."""
+    hashes = [os.urandom(32) for _ in range(200_000)]
+    digest = BloomDigest.build(hashes)
+    assert all(digest.might_contain_any([h]) for h in hashes[::50])
+    lookups = [[os.urandom(32) for _ in range(16)] for _ in range(5_000)]
+    sent = sum(digest.might_contain_any(lookup) for lookup in lookups)
+    assert sent / len(lookups) < 0.03

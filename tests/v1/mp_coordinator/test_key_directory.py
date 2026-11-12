@@ -20,6 +20,7 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventEntry,
     CacheEventType,
 )
+from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestIndex
 from lmcache.v1.mp_coordinator.views.key_directory import KeyDirectory
 
 
@@ -1110,3 +1111,68 @@ def test_l1_digest_forgets_a_fenced_instance():
     directory.l1_digests()
     directory.fence_instance("node-a")
     assert "node-a" not in directory.l1_digests()
+
+
+def _store_many(directory: KeyDirectory, instance_id: str, keys, seq: int, et=None):
+    for start in range(0, len(keys), 5000):
+        directory.consume(
+            _batch(
+                instance_id=instance_id,
+                seq=seq + start // 5000,
+                event_type=et or CacheEventType.STORE,
+                keys=keys[start : start + 5000],
+            )
+        )
+
+
+def test_l1_digests_track_many_keys_across_instances_and_churn():
+    """Four instances with 25k keys each: every live key is covered, and once
+    a fifth of one instance is evicted its next digest rules those keys out."""
+    directory = KeyDirectory()
+    keys = {
+        f"node-{i}": [_wide_key(i * 1_000_000 + j) for j in range(25_000)]
+        for i in range(4)
+    }
+    for instance_id, instance_keys in keys.items():
+        _store_many(directory, instance_id, instance_keys, seq=1)
+    digests = directory.l1_digests()
+    for instance_id, instance_keys in keys.items():
+        assert all(
+            digests[instance_id].might_contain(k.chunk_hash)
+            for k in instance_keys[::97]
+        )
+
+    evicted, kept = keys["node-0"][:5_000], keys["node-0"][5_000:]
+    _store_many(directory, "node-0", evicted, seq=100, et=CacheEventType.DELETE)
+    digest = directory.l1_digests()["node-0"]
+    assert all(digest.might_contain(k.chunk_hash) for k in kept[::97])
+    assert sum(digest.might_contain(k.chunk_hash) for k in evicted) < 25
+
+
+def test_rebuild_includes_changes_that_land_while_it_is_built():
+    """A rebuild hashes outside the directory lock; a key stored meanwhile
+    is in the installed digest, and a fenced instance's build is dropped."""
+    index = L1DigestIndex()
+    keys = {"a": {_wide_key(i) for i in range(3)}, "b": {_wide_key(10)}}
+    jobs = index.begin_rebuilds(keys)
+    late = _wide_key(99)
+    index.on_add("a", late.chunk_hash)
+    index.drop("b")
+    digests = index.finish(L1DigestIndex.build(jobs))
+    assert digests["a"].might_contain(late.chunk_hash)
+    assert all(digests["a"].might_contain(k.chunk_hash) for k in keys["a"])
+    assert "b" not in digests
+
+
+def test_concurrent_reader_skips_a_rebuild_already_in_flight():
+    """Two readers race: the second takes no job for an instance the first
+    is rebuilding, and gets no digest for it until that build lands."""
+    index = L1DigestIndex()
+    keys = {"a": {_wide_key(1)}}
+    first = index.begin_rebuilds(keys)
+    second = index.begin_rebuilds(keys)
+    assert "a" in first and not second
+    assert "a" not in index.finish(L1DigestIndex.build(second))
+    assert index.finish(L1DigestIndex.build(first))["a"].might_contain(
+        _wide_key(1).chunk_hash
+    )

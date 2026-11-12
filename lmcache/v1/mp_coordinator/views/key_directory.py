@@ -525,14 +525,18 @@ class KeyDirectory(View):
 
         Incremental: inserts since the last call are folded in, and an
         instance's filter is rebuilt only after enough of its keys have left.
+        Rebuilds hash outside the directory lock, so ingest is not held up
+        by them; an instance whose first build is still running in another
+        call is left out.
 
         Returns:
             ``instance_id`` → digest of its L1 chunk hashes.
         """
-        # shortcut: a rebuild runs under the directory lock (~0.4 us/key, so
-        # ~60 ms for 140k keys); move it off the lock if ingest stalls show up.
         with self._lock:
-            return self._l1_digests.digests(self._l1_keys_by_instance)
+            jobs = self._l1_digests.begin_rebuilds(self._l1_keys_by_instance)
+        built = L1DigestIndex.build(jobs)
+        with self._lock:
+            return self._l1_digests.finish(built)
 
     def fence_instance(self, instance_id: str) -> None:
         """Remove every **L1** placement reported by ``instance_id``.

@@ -592,9 +592,10 @@ class P2PController(DiscoverableModule):
     def _refresh_digests(self) -> None:
         """Fetch the peers' L1 digests and hand each to its adapter.
 
-        A peer absent from the response has no L1 placements in the
-        directory, so it gets an empty digest. A failed fetch clears every
-        digest, so lookups go to all peers rather than trusting stale ones.
+        A peer absent from the response gets no digest, so its lookups are
+        all sent: absence also covers a peer that does not report cache
+        events, whose hits an empty digest would silently drop. A failed
+        fetch clears every digest for the same reason.
         """
         assert self._http_client is not None
         with self._orch_lock:
@@ -610,10 +611,9 @@ class P2PController(DiscoverableModule):
                 if adapter.lookup_digest is not None:
                     adapter.lookup_digest.digest = None
             return
-        empty = BloomDigest.build([])
         for peer_id, adapter in adapters:
             if adapter.lookup_digest is not None:
-                adapter.lookup_digest.digest = digests.get(peer_id, empty)
+                adapter.lookup_digest.digest = digests.get(peer_id)
 
     def _is_self_registered(self, instances: list[_PeerInstance]) -> bool:
         """Return whether this instance appears in ``instances`` with our URL.
