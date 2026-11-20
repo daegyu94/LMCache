@@ -254,3 +254,12 @@ def test_rate_drop_within_tolerance():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_may_hold_is_delegated_to_the_inner_adapter():
+    wrapper, inner = _make_adapter()
+    inner.may_hold = lambda keys: False
+    assert wrapper.may_hold([]) is False
+    inner.may_hold = lambda keys: True
+    assert wrapper.may_hold([]) is True
+    wrapper.close()

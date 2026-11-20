@@ -12,9 +12,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import base64
 import hashlib
+import time
 
 # Third Party
 import numpy as np
+
+# First Party
+from lmcache.v1.distributed.api import ObjectKey
 
 _BITS_PER_KEY = 14  # ~0.1% per key: a 16-chunk lookup tests 16 keys, ~1.6%
 _NUM_HASHES = 10
@@ -191,3 +195,42 @@ class BloomFilter:
             The digest.
         """
         return BloomDigest(num_bits=self.num_bits, bits=self._bits.tobytes())
+
+
+class PeerLookupDigest:
+    """The latest Bloom digest of one peer's L1, swapped in by the P2P controller.
+
+    ``None`` (no digest yet, or the last fetch failed) sends every lookup, as
+    without a digest, and so does a digest whose poll is older than
+    ``max_age``: a poll that hangs must not keep an old digest in use.
+    Replacing the reference is atomic, so the controller's poll thread and
+    the prefetch loop share it without a lock.
+
+    Args:
+        max_age: Seconds after ``polled_at`` that the digest is still used.
+
+    Attributes:
+        digest: The peer's latest digest, or ``None``.
+        polled_at: ``time.monotonic()`` when the poll that produced
+            ``digest`` was sent. Set before ``digest``.
+    """
+
+    def __init__(self, max_age: float) -> None:
+        self.digest: BloomDigest | None = None
+        self.polled_at = 0.0
+        self._max_age = max_age
+
+    def excludes_all(self, keys: list[ObjectKey]) -> bool:
+        """Return whether the peer certainly holds none of ``keys``.
+
+        Args:
+            keys: The keys a lookup would ask the peer for.
+
+        Returns:
+            ``True`` only when a digest is present, at most ``max_age`` old,
+            and rules out every key.
+        """
+        digest = self.digest
+        if digest is None or time.monotonic() - self.polled_at > self._max_age:
+            return False
+        return not digest.might_contain_any([key.chunk_hash for key in keys])

@@ -126,6 +126,13 @@ Commonly used flags include:
        (default ``30``).
    * - ``--p2p-transfer-engine ENGINE``
      - Transfer-channel implementation for P2P reads (default ``nixl``).
+   * - ``--p2p-lookup-digest``
+     - Skip lookups to peers whose L1 digest from the coordinator rules out
+       every requested key (default off). Needs
+       ``--coordinator-event-reporting`` on every server; cannot be combined
+       with ``--enable-p2p-write``. See :doc:`/mp/p2p`.
+   * - ``--p2p-lookup-digest-interval SECONDS``
+     - Seconds between L1 digest polls (default ``1``).
    * - ``--server-module JSON``
      - Import out-of-tree ``DiscoverableModule`` classes. Repeatable.
        See :doc:`/developer_guide/extending_lmcache/server_modules`.

@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the chunk-hash Bloom digest."""
+"""Tests for the chunk-hash Bloom digest and the P2P lookup skip rule."""
 
 # Standard
 import os
+import time
 
 # Third Party
 import pytest
 
 # First Party
-from lmcache.v1.distributed.bloom_digest import BloomDigest
+from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.bloom_digest import BloomDigest, PeerLookupDigest
+
+
+def _key(chunk_hash: bytes) -> ObjectKey:
+    return ObjectKey(chunk_hash=chunk_hash, kv_rank=0, model_name="m")
 
 
 def test_inserted_hashes_are_always_found() -> None:
@@ -35,6 +41,31 @@ def test_from_json_rejects_size_mismatch() -> None:
     data["num_bits"] = 4096
     with pytest.raises(ValueError):
         BloomDigest.from_json(data)
+
+
+def test_lookup_digest_excludes_only_when_no_key_may_be_present() -> None:
+    held = os.urandom(32)
+    lookup_digest = PeerLookupDigest(max_age=3.0)
+    keys = [_key(os.urandom(32)), _key(held)]
+    # No digest yet: never skip.
+    assert not lookup_digest.excludes_all(keys)
+    lookup_digest.polled_at = time.monotonic()
+    lookup_digest.digest = BloomDigest.build([held])
+    assert not lookup_digest.excludes_all(keys)
+    lookup_digest.digest = BloomDigest.build([])
+    assert lookup_digest.excludes_all(keys)
+
+
+def test_lookup_digest_older_than_max_age_excludes_nothing() -> None:
+    """A digest whose poll is older than ``max_age`` (a hung poll) is not
+    used, so the peer is asked again."""
+    lookup_digest = PeerLookupDigest(max_age=3.0)
+    lookup_digest.digest = BloomDigest.build([])
+    keys = [_key(os.urandom(32))]
+    lookup_digest.polled_at = time.monotonic() - 2.0
+    assert lookup_digest.excludes_all(keys)
+    lookup_digest.polled_at = time.monotonic() - 4.0
+    assert not lookup_digest.excludes_all(keys)
 
 
 def test_large_set_has_no_false_negatives_and_low_request_false_positives() -> None:

@@ -655,3 +655,10 @@ def test_event_fds_are_pairwise_distinct(wrapper: SerdeL2AdapterWrapper) -> None
         wrapper.get_load_event_fd(),
     }
     assert len(fds) == 3
+
+
+def test_may_hold_is_delegated_to_the_inner_adapter(
+    wrapper: SerdeL2AdapterWrapper, inner: FakeInnerAdapter
+) -> None:
+    inner.may_hold = lambda keys: False  # type: ignore[method-assign]
+    assert wrapper.may_hold([]) is False

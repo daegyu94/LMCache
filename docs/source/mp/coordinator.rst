@@ -1120,10 +1120,11 @@ namespace. Tag names must be nonempty strings and values must be strings.
 ``GET /directory/l1-digests``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A Bloom filter of each instance's L1 chunk hashes, for P2P servers that skip
-lookups to peers holding none of a request's chunks. It is a hint like the
-rest of the directory: a key stored since the last cache-event flush is not in
-it yet. The coordinator builds the filters only once something polls.
+A Bloom filter of each instance's L1 chunk hashes. P2P servers started with
+``--p2p-lookup-digest`` poll it to skip lookups to peers that hold none of a
+request's chunks. It is a hint like the rest of the directory: a key stored
+since the last cache-event flush is not in it yet. The coordinator builds the
+filters only once something polls.
 
 **Query parameters:**
 

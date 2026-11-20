@@ -300,10 +300,11 @@ def run_http_server(
     Raises:
         ValueError: If P2P is enabled without a coordinator URL, or with an L1
             tier that is not a single registerable memory region; if P2P
-            writes are enabled without P2P; or if
-            coordinator event reporting or ``--trace-level events`` is enabled
-            with observability disabled (the cache-event stream rides the
-            event bus).
+            writes are enabled without P2P; if P2P lookup digests are enabled
+            without coordinator event reporting or together with P2P writes;
+            or if coordinator event reporting or ``--trace-level events`` is
+            enabled with observability disabled (the cache-event stream rides
+            the event bus).
     """
     if mp_config.p2p_config.enabled:
         if not coordinator_config.url:
@@ -326,6 +327,21 @@ def run_http_server(
         storage_manager_config = _with_p2p_write_policies(
             storage_manager_config, mp_config.p2p_config
         )
+    if mp_config.p2p_config.lookup_digest:
+        if not coordinator_config.event_reporting:
+            raise ValueError(
+                "--p2p-lookup-digest needs --coordinator-event-reporting: peers "
+                "skip this server only if it reports its cache events, and this "
+                "server skips a peer only if that peer reports them, so run "
+                "every server with both flags."
+            )
+        if mp_config.p2p_config.enable_write:
+            raise ValueError(
+                "--p2p-lookup-digest cannot be combined with --enable-p2p-write: "
+                "a key just written into a peer is missing from that peer's "
+                "digest until the next event flush and poll, so its lookups "
+                "would skip the peer and recompute it."
+            )
     if coordinator_config.event_reporting and not obs_config.enabled:
         raise ValueError(
             "--coordinator-event-reporting rides the observability event "

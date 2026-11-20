@@ -427,6 +427,27 @@ def _needs_l2_lookup(
     return hit_length < num_chunks
 
 
+def _l1_missing_keys(
+    key_groups: list[GroupedObjectKeys], l1_locked_keys: MapState
+) -> list[ObjectKey]:
+    """Return the keys of every cell L1 does not hold, row by row.
+
+    Args:
+        key_groups: The request's key rows.
+        l1_locked_keys: The cells read-locked in each L1 manager.
+
+    Returns:
+        The keys whose cells no L1 manager holds.
+    """
+    l1_found = _merged_or_zeros(l1_locked_keys, key_groups).to_list()
+    return [
+        key
+        for group, found in zip(key_groups, l1_found, strict=True)
+        for col, key in enumerate(group.keys)
+        if not found.test(col)
+    ]
+
+
 # Class definitions
 
 
@@ -605,6 +626,9 @@ class PrefetchController(StorageControllerInterface):
 
         # Adapters being removed: adapter id -> event set once detached.
         self._draining: dict[int, threading.Event] = {}
+        # Adapter lookups left out because the adapter's may_hold ruled them
+        # out; written by the loop thread, read by report_status.
+        self._lookups_skipped_by_hint = 0
 
         # Control-plane queue for runtime add/remove, used by the internal
         # loop thread
@@ -797,6 +821,7 @@ class PrefetchController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
             "num_draining_adapters": len(self._draining),
+            "lookups_skipped_by_hint": self._lookups_skipped_by_hint,
         }
 
     def get_adapter_state_observations(
@@ -1210,15 +1235,31 @@ class PrefetchController(StorageControllerInterface):
             if self._is_l2_eligible(request, adapter_idx)
         }
 
-        # No eligible L2 adapter, or no L2 result could change the plan: serve
-        # from L1 alone, on this thread. The request was registered before
-        # locking so a failed start can be aborted; retire it here like
-        # _advance_request does.
-        if not active_adapters or not _needs_l2_lookup(
+        if active_adapters and _needs_l2_lookup(
             request.key_groups,
             request.key_states.l1_locked_keys,
             request.fetching_policy,
         ):
+            # Only keys L1 does not already serve can change the plan, so an
+            # adapter is asked only if it may hold one of those.
+            l1_missing = _l1_missing_keys(
+                request.key_groups, request.key_states.l1_locked_keys
+            )
+            asked = len(active_adapters)
+            active_adapters = {
+                adapter_idx: adapter
+                for adapter_idx, adapter in active_adapters.items()
+                if adapter.may_hold(l1_missing)
+            }
+            self._lookups_skipped_by_hint += asked - len(active_adapters)
+        else:
+            active_adapters = {}
+
+        # No adapter left to ask, or no L2 result could change the plan: serve
+        # from L1 alone, on this thread. The request was registered before
+        # locking so a failed start can be aborted; retire it here like
+        # _advance_request does.
+        if not active_adapters:
             self._plan_load(request, {})
             self._finish_request(request)
             self._retire_request(request)

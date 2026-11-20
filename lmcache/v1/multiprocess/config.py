@@ -277,12 +277,24 @@ class P2PConfig:
     """Used fraction of the local DRAM L1 at which newly written objects are
     stored into a peer instead of staying local, in (0, 1]."""
 
+    lookup_digest: bool = False
+    """Skip lookups to peers whose coordinator L1 digest rules out every key.
+    Needs ``--coordinator-event-reporting`` on every server; refused with
+    ``enable_write``, whose freshly written keys the digest lacks for a few
+    seconds."""
+
+    lookup_digest_interval: float = 1.0
+    """Seconds between L1 digest polls. A key stored on a peer since the last
+    poll is not in its digest yet, so its hit can be missed for about this
+    long plus the cache-event flush interval. A digest no poll has refreshed
+    for three intervals is dropped, so the peer is asked again."""
+
     def __post_init__(self) -> None:
-        """Validate the write settings.
+        """Validate the write and lookup-digest settings.
 
         Raises:
-            ValueError: If the store timeout is not positive or the usage
-                threshold is outside (0, 1].
+            ValueError: If the store timeout or the digest interval is not
+                positive, or the usage threshold is outside (0, 1].
         """
         if self.store_timeout <= 0:
             raise ValueError(f"P2P store timeout must be > 0, got {self.store_timeout}")
@@ -290,6 +302,11 @@ class P2PConfig:
             raise ValueError(
                 "P2P write L1 usage threshold must be in (0, 1], got "
                 f"{self.write_l1_usage_threshold}"
+            )
+        if self.lookup_digest_interval <= 0:
+            raise ValueError(
+                "P2P lookup digest interval must be > 0, got "
+                f"{self.lookup_digest_interval}"
             )
 
     @property
@@ -830,6 +847,25 @@ def add_p2p_args(
         default=30.0,
         help="Seconds before a store into a peer counts as a failure. Default is 30.",
     )
+    group.add_argument(
+        "--p2p-lookup-digest",
+        action="store_true",
+        default=False,
+        help="Skip lookups to peers whose L1 digest from the coordinator rules "
+        "out every requested key. Every server must run with "
+        "--coordinator-event-reporting; keys stored since the last digest poll "
+        "can be missed, so it cannot be combined with --enable-p2p-write. "
+        "Default is off.",
+    )
+    group.add_argument(
+        "--p2p-lookup-digest-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between L1 digest polls when --p2p-lookup-digest is on. "
+        "A key stored on a peer since the last poll can be missed for about "
+        "this long plus --coordinator-event-flush-interval; polls send only "
+        "what changed, so short intervals are cheap. Default is 1.",
+    )
     return parser
 
 
@@ -854,6 +890,8 @@ def parse_args_to_p2p_config(
         enable_write=getattr(args, "enable_p2p_write", False),
         store_timeout=getattr(args, "p2p_store_timeout", 30.0),
         write_l1_usage_threshold=getattr(args, "p2p_write_l1_usage_threshold", 0.7),
+        lookup_digest=getattr(args, "p2p_lookup_digest", False),
+        lookup_digest_interval=getattr(args, "p2p_lookup_digest_interval", 1.0),
     )
 
 

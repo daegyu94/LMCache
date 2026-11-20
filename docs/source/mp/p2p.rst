@@ -101,6 +101,16 @@ P2P is enabled per server by the ``--p2p-advertise-url`` flag. The relevant
    * - ``--p2p-store-timeout SECONDS``
      - Deadline for a store into a peer before it counts as a failure
        (default ``30``). Only used with ``--enable-p2p-write``.
+   * - ``--p2p-lookup-digest``
+     - Skip lookups to peers whose L1 digest from the coordinator rules out
+       every requested key. Off by default. Every server needs
+       ``--coordinator-event-reporting``; a key stored on a peer is missed
+       until the next event flush and digest poll (about 2 s by default).
+       Cannot be combined with ``--enable-p2p-write``, whose freshly written
+       keys would be skipped for that window.
+   * - ``--p2p-lookup-digest-interval SECONDS``
+     - Seconds between L1 digest polls (default ``1``). Only used with
+       ``--p2p-lookup-digest``.
 
 P2P also reuses the coordinator connection flags (``--coordinator-url``,
 ``--coordinator-advertise-ip``, ``--coordinator-heartbeat-interval``); the

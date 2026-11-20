@@ -188,6 +188,7 @@ def _start_server_with_p2p(
     p2p_config: P2PConfig,
     store_policy: str = "default",
     prefetch_policy: str = "default",
+    event_reporting: bool = False,
 ) -> StorageManagerConfig:
     """Run ``run_http_server`` without serving and return the storage
     manager configuration the server would start with."""
@@ -209,7 +210,9 @@ def _start_server_with_p2p(
         MPServerConfig(p2p_config=p2p_config),
         storage_manager_config,
         ObservabilityConfig(),
-        CoordinatorConfig(url="http://coordinator:9000"),
+        CoordinatorConfig(
+            url="http://coordinator:9000", event_reporting=event_reporting
+        ),
     )
     return http_server_module.app.state.configs["storage_manager"]
 
@@ -268,6 +271,33 @@ def test_p2p_write_picks_the_store_and_prefetch_policies(
 def test_p2p_write_without_p2p_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="--p2p-advertise-url"):
         _start_server_with_p2p(monkeypatch, P2PConfig(enable_write=True))
+
+
+def test_p2p_lookup_digest_without_event_reporting_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Digests are built from cache events, so the flag needs event reporting
+    (the harness coordinator has it off)."""
+    with pytest.raises(ValueError, match="--coordinator-event-reporting"):
+        _start_server_with_p2p(
+            monkeypatch,
+            P2PConfig(advertise_url="10.0.0.1:8700", lookup_digest=True),
+        )
+
+
+def test_p2p_lookup_digest_with_p2p_write_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key just written into a peer is not in that peer's digest yet, so
+    the writer would skip the peer and recompute the key it just moved."""
+    with pytest.raises(ValueError, match="--enable-p2p-write"):
+        _start_server_with_p2p(
+            monkeypatch,
+            P2PConfig(
+                advertise_url="10.0.0.1:8700", lookup_digest=True, enable_write=True
+            ),
+            event_reporting=True,
+        )
 
 
 def _make_kv_tensors(

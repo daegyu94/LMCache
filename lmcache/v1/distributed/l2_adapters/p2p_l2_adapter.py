@@ -44,6 +44,7 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
+from lmcache.v1.distributed.bloom_digest import PeerLookupDigest
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -102,11 +103,20 @@ class PeerL2AdapterConfigBase(L2AdapterConfigBase):
     Fields:
     - peer_mq_server_url: Peer request server URL (lookup/unlock RPCs).
     - lookup_timeout_s: deadline for a lookup result before it counts as a miss.
+    - lookup_digest: runtime-only digest of the peer's L1, read by
+      ``may_hold`` so the prefetch controller skips lookups it rules out.
+      Not settable from a dict.
     """
 
-    def __init__(self, peer_mq_server_url: str, lookup_timeout_s: float) -> None:
+    def __init__(
+        self,
+        peer_mq_server_url: str,
+        lookup_timeout_s: float,
+        lookup_digest: PeerLookupDigest | None = None,
+    ) -> None:
         self.peer_mq_server_url = peer_mq_server_url
         self.lookup_timeout_s = lookup_timeout_s
+        self.lookup_digest = lookup_digest
 
 
 class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
@@ -132,8 +142,9 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         write_enabled: bool = False,
         store_timeout_s: float = 10.0,
         write_l1_usage_threshold: float = 0.7,
+        lookup_digest: PeerLookupDigest | None = None,
     ) -> None:
-        super().__init__(peer_mq_server_url, lookup_timeout_s)
+        super().__init__(peer_mq_server_url, lookup_timeout_s, lookup_digest)
         self.peer_transfer_channel_server_url = peer_transfer_channel_server_url
         self.load_timeout_s = load_timeout_s
         self.write_enabled = write_enabled
@@ -327,6 +338,19 @@ class PeerL2AdapterBase(L2AdapterInterface):
     # --------------------
     # Lookup and Lock Interface
     # --------------------
+
+    def may_hold(self, keys: list[ObjectKey]) -> bool:
+        """Return ``False`` only when the peer's L1 digest rules out every key.
+
+        Args:
+            keys: The keys a lookup on this peer could still add to the plan.
+
+        Returns:
+            ``True`` without a digest (none fetched yet, or the last fetch
+            failed) or when the digest may contain any of ``keys``.
+        """
+        digest = self._config.lookup_digest
+        return digest is None or not digest.excludes_all(keys)
 
     def submit_lookup_and_lock_task(
         self,

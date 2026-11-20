@@ -25,6 +25,7 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest, PeerLookupDigest
 from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter as p2p_mod
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     P2PL2Adapter,
@@ -105,6 +106,7 @@ def _adapter(
     load_timeout_s: float = 10.0,
     write_enabled: bool = False,
     store_timeout_s: float = 10.0,
+    lookup_digest: PeerLookupDigest | None = None,
 ):
     req_client = MagicMock(spec=P2PClient)
     tc_ctx = MagicMock()
@@ -132,6 +134,7 @@ def _adapter(
             load_timeout_s=load_timeout_s,
             write_enabled=write_enabled,
             store_timeout_s=store_timeout_s,
+            lookup_digest=lookup_digest,
         )
         adapter = P2PL2Adapter(config)
         try:
@@ -927,3 +930,17 @@ def test_region_teardown_failure_keeps_rpc_open_for_retry() -> None:
         notifier.unregister_fd.assert_not_called()
         adapter.close()
         client.close.assert_called_once()
+
+
+def test_may_hold_follows_the_peer_digest():
+    """Without a digest every lookup may hit; with one, only keys it may
+    contain do."""
+    held, other = _key(0), _key(1)
+    lookup_digest = PeerLookupDigest(max_age=3.0)
+    with _adapter(lookup_digest=lookup_digest) as (adapter, *_):
+        assert adapter.may_hold([other])
+        lookup_digest.polled_at = time.monotonic()
+        lookup_digest.digest = BloomDigest.build([held.chunk_hash])
+        assert not adapter.may_hold([other])
+        assert adapter.may_hold([other, held])
+        assert not adapter.may_hold([])

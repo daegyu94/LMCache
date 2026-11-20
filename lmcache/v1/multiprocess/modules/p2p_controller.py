@@ -25,6 +25,7 @@ from lmcache.v1.distributed.api import (
     PrefetchHandle,
     PrefetchTaskSpec,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest, PeerLookupDigest
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.transfer_channel import (
@@ -146,6 +147,7 @@ class _PeerAdapter:
     ip: str
     p2p_advertised_url: str
     mq_port: int
+    lookup_digest: PeerLookupDigest | None = None
     consecutive_misses: int = 0
 
 
@@ -217,8 +219,16 @@ class P2PController(DiscoverableModule):
         self._adapters: dict[str, _PeerAdapter] = {}
 
         self._instances_url = ""
+        self._digests_url = ""
+        # Peer id -> (generation, count) of the digest its adapter holds.
+        self._digest_versions: dict[str, tuple[int, int]] = {}
+        # Digests poll every second or so; warn once per outage, not per poll.
+        self._digest_fetch_failing = False
+        # Peers already logged as having no digest; cleared when one arrives.
+        self._peers_without_digest: set[str] = set()
         self._http_client: httpx.Client | None = None
         self._poll_thread: PeriodicThread | None = None
+        self._digest_thread: PeriodicThread | None = None
 
         if p2p_config.enabled:
             self._start_orchestration(coordinator_config)
@@ -254,6 +264,10 @@ class P2PController(DiscoverableModule):
             advertise_url=self._p2p_config.advertise_url,
         )
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
+        if self._p2p_config.lookup_digest:
+            self._digests_url = (
+                coordinator_config.url.rstrip("/") + "/directory/l1-digests"
+            )
         timeout = max(1.0, coordinator_config.heartbeat_interval)
         self._http_client = httpx.Client(timeout=timeout)
         self._poll_thread = create_periodic_thread(
@@ -263,6 +277,16 @@ class P2PController(DiscoverableModule):
             level=ThreadLevel.MEDIUM,
         )
         self._poll_thread.start()
+        if self._digests_url:
+            # Separate from peer discovery: digests go stale within seconds,
+            # while the peer set changes rarely.
+            self._digest_thread = create_periodic_thread(
+                name="p2p-digest-thread",
+                interval=self._p2p_config.lookup_digest_interval,
+                execute_fn=self._digest_cycle,
+                level=ThreadLevel.MEDIUM,
+            )
+            self._digest_thread.start()
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -288,7 +312,10 @@ class P2PController(DiscoverableModule):
         }
 
     def close(self) -> None:
-        """Stop the poll thread and release peer adapters and the channel."""
+        """Stop the poll threads and release peer adapters and the channel."""
+        if self._digest_thread is not None:
+            self._digest_thread.stop()
+            self._digest_thread = None
         if self._poll_thread is not None:
             self._poll_thread.stop()
             self._poll_thread = None
@@ -640,6 +667,17 @@ class P2PController(DiscoverableModule):
         }
         return self._apply_state(_P2PState.REGISTERED, upstream)
 
+    def _digest_cycle(self) -> ThreadRunSummary:
+        """Run one digest poll for the peers that have adapters.
+
+        Returns:
+            A summary naming how many peers hold a digest afterwards.
+        """
+        self._refresh_digests()
+        return ThreadRunSummary(
+            success=True, message=f"digests={len(self._digest_versions)}"
+        )
+
     def _fetch_instances(self) -> list[_PeerInstance]:
         """Fetch and parse the coordinator's active-instance list.
 
@@ -670,6 +708,106 @@ class P2PController(DiscoverableModule):
                 )
             )
         return instances
+
+    def _refresh_digests(self) -> None:
+        """Fetch the peers' L1 digests and hand each to its adapter.
+
+        The request lists the generation and hash count this controller
+        already holds per peer, so the coordinator sends only the hashes
+        added since, or the whole filter after a rebuild.
+
+        A peer absent from the response gets no digest, so its lookups are
+        all sent: absence also covers a peer that does not report cache
+        events, whose hits an empty digest would silently drop. A failed
+        fetch, or a delta that does not match what is held, clears the
+        digest for the same reason; the next poll then fetches it whole.
+        """
+        assert self._http_client is not None
+        with self._orch_lock:
+            adapters = [
+                (peer_id, adapter.lookup_digest)
+                for peer_id, adapter in self._adapters.items()
+                if adapter.lookup_digest is not None
+            ]
+        known = ",".join(
+            f"{peer_id}:{generation}:{count}"
+            for peer_id, (generation, count) in self._digest_versions.items()
+        )
+        polled_at = time.monotonic()
+        try:
+            response = self._http_client.get(
+                self._digests_url, params={"known": known} if known else None
+            )
+            response.raise_for_status()
+            entries = response.json()["digests"]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            log = logger.debug if self._digest_fetch_failing else logger.warning
+            log("P2P L1 digest fetch failed; sending all lookups: %s", e)
+            self._digest_fetch_failing = True
+            for _, lookup_digest in adapters:
+                lookup_digest.digest = None
+            self._digest_versions.clear()
+            return
+        if self._digest_fetch_failing:
+            logger.info("P2P L1 digest fetch recovered")
+            self._digest_fetch_failing = False
+        versions: dict[str, tuple[int, int]] = {}
+        for peer_id, lookup_digest in adapters:
+            entry = entries.get(peer_id)
+            if entry is None:
+                lookup_digest.digest = None
+                if peer_id not in self._peers_without_digest:
+                    self._peers_without_digest.add(peer_id)
+                    logger.info(
+                        "No L1 digest for P2P peer %s; asking it on every lookup. "
+                        "It needs --coordinator-event-reporting, and the "
+                        "coordinator withholds it after losing its events.",
+                        peer_id,
+                    )
+                continue
+            self._peers_without_digest.discard(peer_id)
+            try:
+                version = (int(entry["generation"]), int(entry["count"]))
+                lookup_digest.polled_at = polled_at
+                lookup_digest.digest = self._apply_digest_entry(
+                    entry, lookup_digest.digest, self._digest_versions.get(peer_id)
+                )
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning(
+                    "Bad P2P L1 digest for %s; sending all lookups: %s", peer_id, e
+                )
+                lookup_digest.digest = None
+                continue
+            if lookup_digest.digest is not None:
+                versions[peer_id] = version
+        self._digest_versions = versions
+
+    @staticmethod
+    def _apply_digest_entry(
+        entry: dict,
+        current: BloomDigest | None,
+        held: tuple[int, int] | None,
+    ) -> BloomDigest | None:
+        """Turn one response entry into the peer's new digest.
+
+        Args:
+            entry: A full or delta entry from ``/directory/l1-digests``.
+            current: The digest currently held for the peer.
+            held: The generation and count ``current`` corresponds to.
+
+        Returns:
+            The new digest, or ``None`` when a delta does not apply to what
+            is held.
+
+        Raises:
+            ValueError: If a full entry is malformed or a hash is not hex.
+            KeyError: If a required field is missing.
+        """
+        if "bits" in entry:
+            return BloomDigest.from_json(entry)
+        if current is None or held is None or held[0] != entry["generation"]:
+            return None
+        return current.with_added([bytes.fromhex(h) for h in entry["added"]])
 
     def _is_self_registered(self, instances: list[_PeerInstance]) -> bool:
         """Return whether this instance appears in ``instances`` with our URL.
@@ -775,6 +913,12 @@ class P2PController(DiscoverableModule):
         # First Party
         from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
 
+        # Three missed polls in a row mean the coordinator is slow or hung.
+        lookup_digest = (
+            PeerLookupDigest(max_age=3 * self._p2p_config.lookup_digest_interval)
+            if self._digests_url
+            else None
+        )
         config = P2PL2AdapterConfig(
             peer_mq_server_url=f"grpc://{inst.ip}:{inst.mq_port}",
             peer_transfer_channel_server_url=inst.p2p_advertised_url,
@@ -783,6 +927,7 @@ class P2PController(DiscoverableModule):
             write_enabled=self._p2p_config.enable_write,
             store_timeout_s=self._p2p_config.store_timeout,
             write_l1_usage_threshold=self._p2p_config.write_l1_usage_threshold,
+            lookup_digest=lookup_digest,
         )
         try:
             adapter_id = self._ctx.storage_manager.add_l2_adapter(config)
@@ -795,6 +940,7 @@ class P2PController(DiscoverableModule):
                 ip=inst.ip,
                 p2p_advertised_url=inst.p2p_advertised_url,
                 mq_port=inst.mq_port,
+                lookup_digest=lookup_digest,
             )
         logger.debug(
             "Added P2P adapter %d for peer %s (%s)",

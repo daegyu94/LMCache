@@ -320,6 +320,10 @@ class FaultInjectL2Adapter(L2AdapterInterface):
         """Delegate the lookup-and-lock task to the inner adapter (not faulted)."""
         return self._inner.submit_lookup_and_lock_task(keys, group_layout_descs)
 
+    def may_hold(self, keys: list[ObjectKey]) -> bool:
+        """Delegate the lookup hint to the inner adapter (not faulted)."""
+        return self._inner.may_hold(keys)
+
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         """Delegate to the inner adapter; lookup results are passed through.
 

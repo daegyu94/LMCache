@@ -693,6 +693,72 @@ class TestMultiAdapterPrefetch:
             a.close()
 
 
+class HintedAdapter(MockL2Adapter):
+    """A MockL2Adapter whose ``may_hold`` answers from a known key set, and
+    which records what it was asked and how many lookups it received."""
+
+    def __init__(self, held: list[ObjectKey]) -> None:
+        super().__init__(MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0))
+        self.held = set(held)
+        self.asked: list[list[ObjectKey]] = []
+        self.lookups = 0
+
+    def may_hold(self, keys: list[ObjectKey]) -> bool:
+        self.asked.append(list(keys))
+        return any(key in self.held for key in keys)
+
+    def submit_lookup_and_lock_task(self, keys, group_layout_descs):
+        self.lookups += 1
+        return super().submit_lookup_and_lock_task(keys, group_layout_descs)
+
+
+class TestMayHold:
+    def test_only_keys_l1_does_not_hold_decide_the_lookup(self, l1_manager):
+        """An adapter holding only the prefix L1 already serves gets no
+        lookup; the adapter holding the rest does."""
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        write_keys_to_l1(l1_manager, keys[:2], layout)
+        prefix_holder, suffix_holder = HintedAdapter(keys[:2]), HintedAdapter(keys[2:])
+        store_keys_in_l2(prefix_holder, keys[:2], layout)
+        store_keys_in_l2(suffix_holder, keys[2:], layout)
+        ctrl = make_controller(l1_manager, [prefix_holder, suffix_holder])
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+        result = wait_for_result(ctrl, req_id)
+        ctrl.stop()
+
+        assert row_bits(result) == [0, 1, 2, 3]
+        assert prefix_holder.asked == [keys[2:]]
+        assert prefix_holder.lookups == 0
+        assert suffix_holder.lookups == 1
+        assert_l2_unlocked(suffix_holder)
+        l1_manager.finish_read(keys)
+        for adapter in (prefix_holder, suffix_holder):
+            adapter.close()
+
+    def test_every_adapter_ruled_out_serves_from_l1(self, l1_manager):
+        """With every adapter ruled out, the request is served from L1 alone."""
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, keys[:1], layout)
+        adapter = HintedAdapter(keys[:1])
+        store_keys_in_l2(adapter, keys[:1], layout)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+        result = wait_for_result(ctrl, req_id)
+        ctrl.stop()
+
+        assert row_bits(result) == [0]
+        assert adapter.lookups == 0
+        assert ctrl.report_status()["lookups_skipped_by_hint"] == 1
+        l1_manager.finish_read(keys[:1])
+        adapter.close()
+
+
 # =============================================================================
 # No hits and L1-only paths
 # =============================================================================

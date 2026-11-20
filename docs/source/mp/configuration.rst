@@ -391,6 +391,16 @@ is set, which additionally requires a coordinator URL via
    * - ``--p2p-store-timeout``
      - ``30.0``
      - Seconds before a store into a peer counts as a failure.
+   * - ``--p2p-lookup-digest``
+     - off
+     - Skip lookups to peers whose L1 digest from the coordinator rules out
+       every requested key. Needs ``--coordinator-event-reporting`` on every
+       server. A key stored on a peer is missed until the next event flush
+       and digest poll (about 2 s with the defaults). Cannot be combined
+       with ``--enable-p2p-write``.
+   * - ``--p2p-lookup-digest-interval``
+     - ``1.0``
+     - Seconds between L1 digest polls when ``--p2p-lookup-digest`` is on.
 
 L1 Memory Manager
 ------------------

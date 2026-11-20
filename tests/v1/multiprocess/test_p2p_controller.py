@@ -4,9 +4,12 @@ Tests for P2PController lookup jobs, locks, discovery and adapter lifecycle.
 """
 
 # Standard
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+import os
+import random
 
 # Third Party
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 import torch
@@ -22,11 +25,15 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchResult,
 )
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
+from lmcache.v1.mp_coordinator.app import create_app
+from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
 from lmcache.v1.multiprocess.modules import p2p_controller
+from lmcache.v1.multiprocess.modules import p2p_controller as p2p_controller_module
 from lmcache.v1.multiprocess.modules.p2p_controller import (
     _MAX_MISSES,
     P2PController,
@@ -737,3 +744,294 @@ def test_poll_cycle_skips_peer_without_p2p_url():
 
     ctx.storage_manager.add_l2_adapter.assert_not_called()
     assert controller.report_status()["p2p_peers"] == []
+
+
+def test_poll_cycle_peer_without_a_digest_gets_all_lookups():
+    """With lookup digests on, a peer the coordinator has a digest for gets
+    it; a peer it has none for (for example one not reporting cache events)
+    gets no digest, so its lookups are all sent rather than dropped."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    client = _enable_polling(controller, advertise_url="me:1")
+    controller._digests_url = "http://coordinator/directory/l1-digests"
+    held = b"held-chunk"
+    digests = MagicMock()
+    digests.raise_for_status.return_value = None
+    digests.json.return_value = {
+        "digests": {
+            "peerA": {
+                "generation": 1,
+                "count": 0,
+                **BloomDigest.build([held]).to_json(),
+            }
+        }
+    }
+    instances = _instances_response(
+        [_entry("self", "me:1"), _entry("peerA", "tc:1"), _entry("peerB", "tc:2")]
+    )
+    client.get.side_effect = lambda url, params=None: (
+        digests if "digests" in url else instances
+    )
+
+    controller._poll_cycle()
+    with patch.object(p2p_controller_module.logger, "info") as info:
+        for _ in range(3):
+            controller._digest_cycle()
+
+    # The peer without a digest is pointed out once, not on every poll.
+    assert [c.args[1:] for c in info.call_args_list] == [("peerB",)]
+    configs = {
+        c.args[0].peer_transfer_channel_server_url: c.args[0]
+        for c in ctx.storage_manager.add_l2_adapter.call_args_list
+    }
+    with_digest = configs["tc:1"].lookup_digest
+    without_digest = configs["tc:2"].lookup_digest
+    assert with_digest is not None and with_digest.digest is not None
+    assert with_digest.digest.might_contain(held)
+    assert without_digest is not None and without_digest.digest is None
+
+
+def test_digest_polls_send_deltas_that_reproduce_the_coordinators_digest():
+    """Against a real coordinator app: the first poll fetches the whole
+    filter, the next one only the hashes added since, and the result matches
+    the coordinator's own digest bit for bit; after enough evictions the
+    rebuilt filter is fetched whole again and rules the evicted keys out."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"node-a": _peer("node-a")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    hashes = [os.urandom(32) for _ in range(3_000)]
+    seq = iter(range(1, 10_000))
+
+    def post(event_type: str, chunk_hashes: list[bytes]) -> None:
+        for start in range(0, len(chunk_hashes), 500):
+            entries = [
+                {
+                    "key": {"chunk_hash_hex": h.hex(), "model_name": "m", "kv_rank": 0},
+                    "size_bytes": 1,
+                }
+                for h in chunk_hashes[start : start + 500]
+            ]
+            batch = {
+                "instance_id": "node-a",
+                "incarnation": 1,
+                "seq": next(seq),
+                "event_type": event_type,
+                "tier": "l1",
+                "backend": "dram",
+                "entries": entries,
+            }
+            assert coord.post("/events", json={"batches": [batch]}).status_code == 200
+
+    config = MPCoordinatorConfig(health_check_interval=0.0, eviction_check_interval=0.0)
+    with TestClient(create_app(config)) as coord:
+        sizes = []
+        real_get = coord.get
+
+        def get(url, params=None):
+            response = real_get(url, params=params)
+            sizes.append(len(response.content))
+            return response
+
+        controller._http_client = MagicMock(get=get)
+
+        def coordinator_bits() -> bytes:
+            entry = real_get("/directory/l1-digests").json()["digests"]["node-a"]
+            return BloomDigest.from_json(entry).bits
+
+        post("store", hashes)
+        controller._refresh_digests()
+        assert lookup_digest.digest.bits == coordinator_bits()
+
+        new = [os.urandom(32) for _ in range(50)]
+        post("store", new)
+        controller._refresh_digests()
+        assert sizes[-1] < sizes[0] / 3  # a delta, not the whole filter
+        assert lookup_digest.digest.bits == coordinator_bits()
+        assert all(lookup_digest.digest.might_contain(h) for h in new)
+
+        evicted = hashes[:1_000]
+        post("delete", evicted)
+        controller._refresh_digests()
+        assert lookup_digest.digest.bits == coordinator_bits()
+        assert sum(lookup_digest.digest.might_contain(h) for h in evicted) < 10
+
+
+def test_polled_digest_is_used_for_three_poll_intervals():
+    """A digest is trusted for three ``--p2p-lookup-digest-interval``s after
+    the poll that fetched it; if no poll succeeds since (a hung coordinator),
+    the peer is asked again."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"node-a": _peer("node-a")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    missing = [ObjectKey(chunk_hash=os.urandom(32), model_name="m", kv_rank=0)]
+
+    with _coordinator() as coord:
+        controller._http_client = MagicMock(get=coord.get)
+        _post_l1_events(coord, "node-a", 1, 1, "store", [os.urandom(32)])
+        controller._refresh_digests()
+    polled_at = lookup_digest.polled_at
+
+    assert lookup_digest.excludes_all(missing)
+    lookup_digest.polled_at = polled_at - 2.9  # interval is 1 s
+    assert lookup_digest.excludes_all(missing)
+    lookup_digest.polled_at = polled_at - 3.1
+    assert not lookup_digest.excludes_all(missing)
+
+
+def test_digest_delta_for_another_generation_is_not_applied():
+    """A delta that does not continue the generation held is dropped (no
+    digest, lookups all sent) rather than applied to the wrong filter."""
+    held = BloomDigest.build([b"x"])
+    entry = {"generation": 2, "count": 1, "added": [b"y".hex()]}
+    assert P2PController._apply_digest_entry(entry, held, (1, 0)) is None
+    applied = P2PController._apply_digest_entry(
+        {"generation": 1, "count": 1, "added": [b"y".hex()]}, held, (1, 0)
+    )
+    assert applied is not None and applied.might_contain(b"y")
+
+
+def test_digest_fetch_outage_warns_once_and_clears_digests():
+    """While the coordinator is unreachable every peer loses its digest (all
+    lookups sent), and the outage is warned about once, not on every poll."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "http://coordinator/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    lookup_digest.digest = BloomDigest.build([b"x"])
+    controller._http_client = MagicMock()
+    controller._http_client.get.side_effect = httpx.ConnectError("refused")
+
+    with patch.object(p2p_controller_module.logger, "warning") as warning:
+        for _ in range(5):
+            controller._digest_cycle()
+
+    assert lookup_digest.digest is None
+    assert warning.call_count == 1
+
+
+def _post_l1_events(
+    coord: TestClient,
+    instance_id: str,
+    incarnation: int,
+    seq: int,
+    event_type: str,
+    chunk_hashes: list[bytes],
+) -> None:
+    batch = {
+        "instance_id": instance_id,
+        "incarnation": incarnation,
+        "seq": seq,
+        "event_type": event_type,
+        "tier": "l1",
+        "backend": "dram",
+        "entries": [
+            {
+                "key": {"chunk_hash_hex": h.hex(), "model_name": "m", "kv_rank": 0},
+                "size_bytes": 1,
+            }
+            for h in chunk_hashes
+        ],
+    }
+    assert coord.post("/events", json={"batches": [batch]}).status_code == 200
+
+
+def _coordinator() -> TestClient:
+    config = MPCoordinatorConfig(health_check_interval=0.0, eviction_check_interval=0.0)
+    return TestClient(create_app(config))
+
+
+def test_digest_never_rules_out_a_key_a_peer_holds_across_random_churn():
+    """Random stores, evictions, re-stores and peer restarts against a real
+    coordinator, polled in between: after every poll, each key a peer holds
+    is either may-contained by the requester's copy of its digest, or the
+    peer has no digest (so it is asked)."""
+    rng = random.Random(6611)
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    controller._digests_url = "/directory/l1-digests"
+    peers = ["node-a", "node-b"]
+    controller._apply_state(
+        _P2PState.REGISTERED, {p: _peer(p, url=f"{p}:7600") for p in peers}
+    )
+    lookup_digests = {
+        call.args[0].peer_transfer_channel_server_url[:-5]: call.args[0].lookup_digest
+        for call in ctx.storage_manager.add_l2_adapter.call_args_list
+    }
+    universe = [os.urandom(32) for _ in range(400)]
+    held: dict[str, set[bytes]] = {p: set() for p in peers}
+    incarnation = {p: 1 for p in peers}
+    seq = {p: 0 for p in peers}
+    checked = 0
+
+    with _coordinator() as coord:
+        controller._http_client = MagicMock(get=coord.get)
+        for _ in range(300):
+            peer = rng.choice(peers)
+            action = rng.random()
+            if action < 0.02:
+                # Restart: the new incarnation starts with an empty L1.
+                incarnation[peer] += 1
+                seq[peer] = 0
+                held[peer].clear()
+                stored = rng.sample(universe, 5)
+                event, chunk_hashes = "store", stored
+                held[peer].update(stored)
+            elif action < 0.6 or not held[peer]:
+                chunk_hashes = rng.sample(universe, rng.randint(1, 30))
+                event = "store"
+                held[peer].update(chunk_hashes)
+            else:
+                chunk_hashes = rng.sample(
+                    sorted(held[peer]), rng.randint(1, len(held[peer]))
+                )
+                event = "delete"
+                held[peer].difference_update(chunk_hashes)
+            seq[peer] += 1
+            _post_l1_events(
+                coord, peer, incarnation[peer], seq[peer], event, chunk_hashes
+            )
+            if rng.random() < 0.3:
+                controller._refresh_digests()
+                for p in peers:
+                    digest = lookup_digests[p].digest
+                    assert digest is None or all(
+                        digest.might_contain(h) for h in held[p]
+                    )
+                    checked += digest is not None
+    assert checked > 100  # the property was checked, not skipped
+
+
+def test_digest_after_coordinator_restart_never_applies_old_deltas():
+    """A restarted coordinator (no checkpoint) that first hears a peer
+    midway withholds its digest, and once the peer restarts it sends a whole
+    filter under a new generation, which replaces the one held."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    controller._digests_url = "/directory/l1-digests"
+    controller._apply_state(_P2PState.REGISTERED, {"node-a": _peer("node-a")})
+    lookup_digest = ctx.storage_manager.add_l2_adapter.call_args.args[0].lookup_digest
+    before, after = os.urandom(32), os.urandom(32)
+
+    with _coordinator() as coord:
+        controller._http_client = MagicMock(get=coord.get)
+        _post_l1_events(coord, "node-a", 1, 1, "store", [before])
+        controller._refresh_digests()
+        assert lookup_digest.digest is not None
+        assert lookup_digest.digest.might_contain(before)
+
+    with _coordinator() as coord:
+        controller._http_client = MagicMock(get=coord.get)
+        _post_l1_events(coord, "node-a", 1, 2, "store", [after])
+        controller._refresh_digests()
+        assert lookup_digest.digest is None  # asked on every lookup
+
+        _post_l1_events(coord, "node-a", 2, 1, "store", [after])
+        controller._refresh_digests()
+        assert lookup_digest.digest is not None
+        assert lookup_digest.digest.might_contain(after)
+        assert not lookup_digest.digest.might_contain(before)

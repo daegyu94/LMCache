@@ -361,6 +361,23 @@ class L2AdapterInterface(ABC):
         """
         pass
 
+    def may_hold(self, keys: list[ObjectKey]) -> bool:
+        """Return whether this adapter may hold any of ``keys``.
+
+        A local, cheap hint the prefetch controller checks before submitting a
+        lookup: ``False`` skips this adapter's lookup for the request. A wrong
+        ``False`` loses hits, so return it only when certain. The default
+        never skips.
+
+        Args:
+            keys: The keys a lookup on this adapter could still add to the
+                request's plan.
+
+        Returns:
+            ``False`` only if the adapter certainly holds none of ``keys``.
+        """
+        return True
+
     #####################
     # Memory Tags Interface
     #####################

@@ -117,6 +117,57 @@ On the owner, `P2P_LOOKUP_AND_LOCK` drops finished lookups older than
 per timeout. Their read locks are
 left to expire by TTL; a late query gets `None` and counts as a miss.
 
+## Lookup digests (`--p2p-lookup-digest`)
+
+Without digests, every L1 miss sends a lookup to every peer. With
+`--p2p-lookup-digest`, the P2P controller polls the coordinator's
+`GET /directory/l1-digests` every `--p2p-lookup-digest-interval` seconds
+(default 1) on its own thread, and hands each peer adapter a Bloom filter of
+that peer's L1 chunk hashes (`PeerLookupDigest`, swapped by reference, no
+lock). Before submitting lookups, the prefetch controller calls
+`may_hold(keys)` on every eligible adapter with the keys local L1 does not
+hold; `PeerL2AdapterBase` answers `False` only when the digest rules out all
+of them, and that adapter is not asked. Skips are counted in the prefetch
+controller's `lookups_skipped_by_hint` status field.
+
+```
+coordinator: cache events -> KeyDirectory -> per-instance Bloom filter
+                                                   |  GET /directory/l1-digests?known=...
+P2P controller (digest thread, 1 s) <--------------+  full filter or added hashes
+      | sets PeerLookupDigest.digest
+prefetch controller: L1 miss -> adapter.may_hold(missing keys)?  no -> skip peer
+                                                                 yes -> lookup RPC
+```
+
+The skip happens before `submit_lookup_and_lock_task`, so it does not depend
+on how the adapter issues its lookup RPCs.
+
+The digest is a hint and fails open:
+
+- A peer with no digest gets every lookup: before the first poll, after a
+  failed poll, when a delta does not continue the generation held, when
+  no poll has succeeded for 3 x `--p2p-lookup-digest-interval` (a hung
+  coordinator), and when the coordinator leaves the peer out (it does not
+  report events, or the coordinator lost some of its events). The
+  controller logs once per peer that it has no digest.
+- A false positive costs the lookup that would have been sent anyway.
+- A false negative costs a hit: a key stored on a peer is missing from the
+  requester's copy until the peer's next cache-event flush
+  (`--coordinator-event-flush-interval`) and the next digest poll, so for
+  about 2 s with the defaults the request recomputes it.
+
+The server refuses to start with `--p2p-lookup-digest` in two cases:
+
+- Without `--coordinator-event-reporting`. A server that does not report is
+  never skipped by its peers (it has no digest), and it can still skip them,
+  so this is a fleet-consistency check: the usual mistake is to leave
+  reporting off everywhere, which makes the flag do nothing.
+- With `--enable-p2p-write`. A writer stores a key into a peer instead of
+  keeping it, and multi-turn reuse often comes within seconds, inside the
+  freshness window above. The writer would then skip the peer that holds
+  exactly the keys it moved, and recompute them. A writer-side set of
+  recently stored hashes could lift this later.
+
 ## Store
 
 ### Writes disabled (default)
