@@ -247,6 +247,12 @@ cheap indicator of whether the chunk's tokens are known. Full token ids
 are deliberately not inlined (a page repeats each chunk across its
 ranks/groups; fetch content via `/directory/lookup` for exactly the keys
 that need it).
+- `GET /directory/l1-digests?known=<id>:<generation>:<count>,...` — a
+Bloom filter of each instance's L1 chunk hashes, for P2P requesters that
+skip lookups to peers holding none of a request's chunks (see *L1 digests*
+below). Each entry carries `generation` and `count`, plus either the whole
+filter (`num_bits`, base64 `bits`) or, when `known` names the same
+generation, `added`: the hex chunk hashes folded in after `count`.
 - `GET /directory/stats` — key/placement counts, per-tier placement counts and
 reported logical bytes, per-instance L1 key counts (the fencing index), and the
 blend-index counts; per-key L2 detail lives on the keys listing endpoint.
@@ -275,6 +281,60 @@ stream: `/events` offers it to the gate, which fans admitted
 batches out to every consumer ([ingest.md](../ingest.md)) — this
 directory, and the eviction manager's per-salt usage view and LRU (see
 [usage_and_eviction.md](../usage_and_eviction.md)).
+
+## L1 digests
+
+`l1_digests()` keeps one Bloom filter per instance over the chunk hashes of
+its L1 keys (`l1_digest_index.py`, filter in
+`lmcache/v1/distributed/bloom_digest.py`). It is a hint: a stale bit costs a
+P2P requester one lookup RPC it would have sent anyway, a missing bit costs
+a hit, so every rule below errs toward set bits.
+
+- **Lazy.** Nothing is kept until the first read, so a fleet that never
+  polls pays only a dict lookup per L1 event. After the first read the
+  filters are kept and updated for good.
+- **Inserts** are buffered under the directory lock and folded in on the
+  next read, one vectorized insert per poll.
+- **Removals** are counted. Once they exceed 10% of the keys the filter was
+  built from, or the keys outgrow its capacity (2x the keys at build), the
+  next read rebuilds it from `_l1_keys_by_instance` (the Summary Cache
+  scheme).
+- **Rebuilds off the lock.** The read copies the key set under the lock,
+  hashes without it, and installs under it again; changes that land in
+  between are recorded against the rebuild and applied on install. 8
+  instances x 140k keys hold the lock for ~25 ms (copying the sets) and
+  hash for ~1.2 s outside it. The hashing is a Python loop in a worker
+  thread, so it still competes for the GIL with ingest and every other
+  route.
+- **Generations.** Each install starts a new generation, and the hashes
+  folded in after it are logged in order, so a reader that holds
+  generation `g` up to `count` hashes needs only the rest. Generations
+  start at a random 31-bit epoch per coordinator process, so a delta is
+  never applied onto a filter from an earlier run.
+- **Withheld on loss.** The endpoint leaves out an instance whose stream
+  cursor has `gap_detected` (lost batches, reported drops, or a stream first
+  seen midway, as after a restart without a checkpoint): its digest may lack
+  keys it holds, and a requester asks a peer it has no digest for. The
+  cursor clears on the instance's next incarnation, which also fences its
+  L1 keys and drops its digest. The gate notices a loss only when a later
+  batch arrives (a skipped `seq` or a higher `dropped_events`), so the
+  digest is withheld from that batch on: an instance that goes idle right
+  after a failed flush keeps serving an incomplete digest until it next
+  emits events. Closing that would need sequence numbers on heartbeats.
+- **Restore and fencing.** `restore()` clears every digest and
+  `fence_instance` drops the instance's, so both rebuild from the keys.
+
+The filter uses 14 bits per key at capacity and 10 hashes (false-positive
+rate ~0.12% per key at capacity, ~2% for a 16-chunk lookup, far lower
+right after a rebuild). Each chunk hash is
+re-hashed with BLAKE2b, since the configured chunk-hash algorithm need not
+give uniform bits. The filter tests chunk hashes only, so keys that differ
+in model, rank or object group share bits: more false positives, never a
+false negative.
+
+Memory per instance is the filter (`14 x 2 x chunk hashes / 8` bytes,
+~0.5 MB for 140k), its served copy, and the log of hashes folded in since the last
+build (one reference per insert, reset on rebuild).
 
 ## Deliberately out of scope (follow-ups)
 - **Stream-level follow-ups** (replay on `gap_detected`, registry-driven

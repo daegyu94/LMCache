@@ -1117,6 +1117,35 @@ namespace. Tag names must be nonempty strings and values must be strings.
       -H 'Content-Type: application/json' \
       -d '{"keys": [{"chunk_hash_hex": "aa12...", "model_name": "m", "kv_rank": 0}]}'
 
+``GET /directory/l1-digests``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A Bloom filter of each instance's L1 chunk hashes, for P2P servers that skip
+lookups to peers holding none of a request's chunks. It is a hint like the
+rest of the directory: a key stored since the last cache-event flush is not in
+it yet. The coordinator builds the filters only once something polls.
+
+**Query parameters:**
+
+- ``known`` -- comma-separated ``instance_id:generation:count`` for the
+  digests the caller already holds. For those, only the chunk hashes added
+  since are sent.
+
+**Response:** ``{"digests": {instance_id: entry}}``. Every entry has
+``generation`` and ``count``; a full entry adds ``num_bits`` and base64
+``bits``, a delta adds ``added`` (hex chunk hashes). An instance whose cache
+events the coordinator knows it lost is left out, so requesters ask it on
+every lookup.
+
+**Status codes:**
+
+- ``200``: digests returned.
+- ``400``: ``known`` is malformed.
+
+.. code-block:: bash
+
+    curl -s http://localhost:9300/directory/l1-digests | jq '.digests | keys'
+
 Cache control
 -------------
 

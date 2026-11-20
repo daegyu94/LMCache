@@ -34,6 +34,7 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventType,
 )
 from lmcache.v1.mp_coordinator.blend_index import BlendIndex, BlendIndexStats
+from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestIndex, L1DigestView
 from lmcache.v1.mp_coordinator.metric_sources import register_metric_source
 from lmcache.v1.mp_coordinator.persistence.durable_component import (
     DurableComponent,
@@ -205,6 +206,9 @@ class KeyDirectory(View):
         # index that makes fencing proportional to the instance's own
         # keys instead of a full directory scan.
         self._l1_keys_by_instance: dict[str, set[ObjectKey]] = {}
+        # Bloom digests of those keys for P2P lookup skipping; built on the
+        # first read, then kept current by the add/remove hooks below.
+        self._l1_digests = L1DigestIndex()
         # chunk hash → tokens + keys, for chunk hashes of >= 1 record.
         self._token_bindings: dict[bytes, _TokenBinding] = {}
         # Derived from the bindings; owns its own lock (order: self → index).
@@ -527,6 +531,26 @@ class KeyDirectory(View):
                 total += 1
             return total, page
 
+    def l1_digests(self) -> dict[str, L1DigestView]:
+        """Return a Bloom digest of each instance's L1 chunk hashes.
+
+        Incremental: inserts since the last call are folded in, and an
+        instance's filter is rebuilt only after enough of its keys have left.
+        Rebuilds hash outside the directory lock, which is held only to copy
+        key sets (~25 ms for 8 x 140k keys); the ~1 s of hashing still
+        competes with ingest for the GIL. An instance whose first build is
+        still running in another call is left out.
+
+        Returns:
+            ``instance_id`` → its digest, with what is needed to send only
+            the hashes added since a generation the reader already has.
+        """
+        with self._lock:
+            jobs = self._l1_digests.begin_rebuilds(self._l1_keys_by_instance)
+        built = L1DigestIndex.build(jobs)
+        with self._lock:
+            return self._l1_digests.finish(built)
+
     def fence_instance(self, instance_id: str) -> None:
         """Remove every **L1** placement reported by ``instance_id``.
 
@@ -539,6 +563,7 @@ class KeyDirectory(View):
         with self._lock:
             removed = self._drop_l1_placements(instance_id)
             self._l1_keys_by_instance.pop(instance_id, None)
+            self._l1_digests.drop(instance_id)
         if removed:
             logger.info(
                 "Fenced instance %s: dropped %d L1 placement(s)",
@@ -674,6 +699,8 @@ class KeyDirectory(View):
                 self._l1_keys_by_instance[instance_id] = {
                     key_table[position] for position in positions_
                 }
+            # Digests rebuild from the restored keys on their next read.
+            self._l1_digests.clear()
 
     def stats(self) -> DirectoryStats:
         """Return a point-in-time summary of directory contents.
@@ -751,8 +778,9 @@ class KeyDirectory(View):
             if entry.token_ids:
                 self._create_token_binding(key, entry)
             record.last_access = max(record.last_access, batch.ts)
-            if batch.tier == Tier.L1:
+            if batch.tier == Tier.L1 and key not in l1_keys:
                 l1_keys.add(key)
+                self._l1_digests.on_add(batch.instance_id, key.chunk_hash)
         elif batch.event_type == CacheEventType.DELETE:
             record = self._directory.get(key)
             if record is None:
@@ -772,7 +800,9 @@ class KeyDirectory(View):
                 p.tier == Tier.L1 and p.instance_id == batch.instance_id
                 for p in record.placements
             ):
-                l1_keys.discard(key)
+                if key in l1_keys:
+                    l1_keys.discard(key)
+                    self._l1_digests.on_remove(batch.instance_id)
         elif batch.event_type == CacheEventType.ACCESS:
             record = self._directory.get(key)
             if record is not None:

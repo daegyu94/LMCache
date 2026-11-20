@@ -37,6 +37,7 @@ shape.
 | `GET /quota` | operator | fleet-wide usage summary |
 | `POST /events` | mp → coordinator | fleet cache-event ingest (gate → key directory + eviction fan-out) |
 | `GET /directory/keys` | operator/tools | paginated key listing with tier/instance/backend filters |
+| `GET /directory/l1-digests` | mp → coordinator | Bloom digests of each instance's L1 chunk hashes, sent as deltas (see `views/key_directory.md`) |
 | `POST /directory/blend-lookup` | mp → coordinator | fragment lookup: cached chunks contained in a request's tokens |
 | `POST /cache/prefetches` | operator/scheduler | submit warm prefetch to a named server |
 | `GET /cache/prefetches/{instance_id}/{request_id}` | operator/scheduler | poll a warm prefetch |

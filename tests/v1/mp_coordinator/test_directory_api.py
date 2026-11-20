@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.bloom_digest import BloomDigest
 from lmcache.v1.mp_coordinator.app import create_app
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.mp_coordinator.schemas import encode_tokens
@@ -641,3 +642,87 @@ def test_overlapping_blend_matches_count_no_more_chunks_than_requested():
     assert len(data["matches"]) == 2
     non_prefix = stats["lookups"]["non_prefix"]
     assert (non_prefix["chunks_requested"], non_prefix["chunks_found"]) == (1, 1)
+
+
+def test_l1_digests_leave_out_an_instance_with_lost_events():
+    """An instance whose event stream has a gap may hold keys its digest
+    lacks, so the endpoint leaves it out and requesters ask it every time."""
+    with _client() as client:
+        _post_events(client, [_batch(instance_id="node-a", seq=1)])
+        _post_events(client, [_batch(instance_id="node-b", seq=1)])
+        assert client.get("/directory/l1-digests").json()["digests"].keys() == {
+            "node-a",
+            "node-b",
+        }
+        # seq 2 never arrives.
+        _post_events(client, [_batch(instance_id="node-a", seq=3)])
+        assert client.get("/directory/l1-digests").json()["digests"].keys() == {
+            "node-b"
+        }
+
+
+def test_l1_digests_leave_out_a_stream_joined_midway():
+    """A coordinator that first hears from an instance mid-stream (it
+    restarted without a checkpoint) misses the keys stored before, so that
+    instance gets no digest."""
+    with _client() as client:
+        _post_events(client, [_batch(instance_id="node-a", seq=5)])
+        _post_events(client, [_batch(instance_id="node-b", seq=1)])
+        assert client.get("/directory/l1-digests").json()["digests"].keys() == {
+            "node-b"
+        }
+
+
+def _hash_entries(hashes: list[str]) -> list[dict]:
+    return [{"key": _key(h), "size_bytes": 1} for h in hashes]
+
+
+def test_l1_digests_reject_a_malformed_known():
+    with _client() as client:
+        assert client.get("/directory/l1-digests?known=node-a:1").status_code == 400
+        assert client.get("/directory/l1-digests?known=node-a:x:0").status_code == 400
+
+
+def test_l1_digest_delta_continues_the_generation_and_a_rebuild_resends_it_whole():
+    """A caller naming the generation it holds gets only the hashes added
+    since; once evictions force a rebuild it gets the new filter whole, under
+    a new generation, and the evicted keys are ruled out."""
+    hashes = [f"{i:064x}" for i in range(200)]
+    with _client() as client:
+        _post_events(client, [_batch(seq=1, entries=_hash_entries(hashes[:100]))])
+        first = client.get("/directory/l1-digests").json()["digests"]["node-a"]
+        assert "bits" in first
+        known = f"node-a:{first['generation']}:{first['count']}"
+
+        _post_events(client, [_batch(seq=2, entries=_hash_entries(hashes[100:110]))])
+        delta = client.get(f"/directory/l1-digests?known={known}").json()["digests"]
+        delta = delta["node-a"]
+        assert delta["generation"] == first["generation"]
+        assert "bits" not in delta
+        assert sorted(delta["added"]) == hashes[100:110]
+
+        _post_events(
+            client,
+            [_batch(seq=3, event_type="delete", entries=_hash_entries(hashes[:50]))],
+        )
+        known = f"node-a:{delta['generation']}:{delta['count']}"
+        rebuilt = client.get(f"/directory/l1-digests?known={known}").json()
+        rebuilt = rebuilt["digests"]["node-a"]
+        assert rebuilt["generation"] != first["generation"]
+        assert "bits" in rebuilt
+
+
+def test_l1_digest_survives_an_instance_restart_without_old_keys():
+    """A new incarnation fences the old keys: the digest is rebuilt from the
+    new incarnation's stores only."""
+    old, new = f"{1:064x}", f"{2:064x}"
+    with _client() as client:
+        _post_events(client, [_batch(seq=1, entries=_hash_entries([old]))])
+        client.get("/directory/l1-digests")
+        _post_events(
+            client, [_batch(incarnation=2, seq=1, entries=_hash_entries([new]))]
+        )
+        entry = client.get("/directory/l1-digests").json()["digests"]["node-a"]
+        digest = BloomDigest.from_json(entry)
+        assert digest.might_contain(bytes.fromhex(new))
+        assert not digest.might_contain(bytes.fromhex(old))

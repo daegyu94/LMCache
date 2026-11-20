@@ -20,6 +20,7 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventEntry,
     CacheEventType,
 )
+from lmcache.v1.mp_coordinator.l1_digest_index import L1DigestIndex
 from lmcache.v1.mp_coordinator.views.key_directory import KeyDirectory
 
 
@@ -1050,3 +1051,179 @@ def test_expansion_drops_groups_once_their_copies_are_deleted():
     assert directory.get_keys_across_object_groups([_grouped_key(1, 0)]) == [
         _grouped_key(1, 0)
     ]
+
+
+# -- L1 digests ----------------------------------------------------------------
+
+
+def _wide_key(i: int) -> ObjectKey:
+    return ObjectKey(chunk_hash=i.to_bytes(8, "little"), model_name="m", kv_rank=0)
+
+
+def test_l1_digest_covers_keys_stored_before_and_after_first_read():
+    directory = KeyDirectory()
+    early, late = _wide_key(1), _wide_key(2)
+    directory.consume(_batch(seq=1, keys=[early]))
+    assert directory.l1_digests()["node-a"].digest.might_contain(early.chunk_hash)
+    directory.consume(_batch(seq=2, keys=[late]))
+    digest = directory.l1_digests()["node-a"].digest
+    assert digest.might_contain(early.chunk_hash)
+    assert digest.might_contain(late.chunk_hash)
+
+
+def test_l1_digest_ignores_l2_placements():
+    directory = KeyDirectory()
+    key = _wide_key(1)
+    directory.consume(_batch(tier=Tier.L2, backend="fs", keys=[key]))
+    view = directory.l1_digests().get("node-a")
+    assert view is None or not view.digest.might_contain(key.chunk_hash)
+
+
+def test_l1_digest_drops_evicted_keys_after_enough_churn():
+    directory = KeyDirectory()
+    keys = [_wide_key(i) for i in range(100)]
+    directory.consume(_batch(seq=1, keys=keys))
+    directory.l1_digests()
+    # Evicting a small share keeps the old bits: a stale bit is only a hint.
+    directory.consume(_batch(seq=2, event_type=CacheEventType.DELETE, keys=keys[:5]))
+    assert directory.l1_digests()["node-a"].digest.might_contain(keys[0].chunk_hash)
+    # Past the churn threshold the next read rebuilds from the live keys.
+    directory.consume(_batch(seq=3, event_type=CacheEventType.DELETE, keys=keys[5:60]))
+    digest = directory.l1_digests()["node-a"].digest
+    assert all(digest.might_contain(k.chunk_hash) for k in keys[60:])
+    assert sum(digest.might_contain(k.chunk_hash) for k in keys[:60]) <= 1
+
+
+def test_l1_digest_rebuilds_when_inserts_outgrow_the_filter():
+    directory = KeyDirectory()
+    directory.consume(_batch(seq=1, keys=[_wide_key(0)]))
+    small = directory.l1_digests()["node-a"].digest
+    keys = [_wide_key(i) for i in range(1, 3000)]
+    directory.consume(_batch(seq=2, keys=keys))
+    grown = directory.l1_digests()["node-a"].digest
+    assert grown.num_bits > small.num_bits
+    assert all(grown.might_contain(k.chunk_hash) for k in keys)
+
+
+def test_l1_digest_counts_a_chunk_once_across_kv_ranks():
+    """A chunk is one key per KV rank; the filter is sized for distinct
+    chunks and a delta carries each new chunk once."""
+
+    def ranked(i: int, rank: int) -> ObjectKey:
+        return ObjectKey(
+            chunk_hash=i.to_bytes(8, "little"),
+            model_name="m",
+            kv_rank=ObjectKey.ComputeKVRank(8, rank, 8, rank),
+        )
+
+    directory = KeyDirectory()
+    built = [ranked(i, r) for i in range(200) for r in range(8)]
+    directory.consume(_batch(seq=1, keys=built))
+    single = KeyDirectory()
+    single.consume(_batch(seq=1, keys=[ranked(i, 0) for i in range(200)]))
+    assert (
+        directory.l1_digests()["node-a"].digest.num_bits
+        == single.l1_digests()["node-a"].digest.num_bits
+    )
+
+    directory.consume(_batch(seq=2, keys=[ranked(500, r) for r in range(8)]))
+    view = directory.l1_digests()["node-a"]
+    assert view.added[: view.count] == [(500).to_bytes(8, "little")]
+
+
+def test_l1_digest_generations_differ_across_coordinator_runs():
+    """Generations never repeat, even in a restarted coordinator, so a
+    requester cannot apply a delta onto a filter from another run."""
+    first, second = KeyDirectory(), KeyDirectory()
+    for directory in (first, second):
+        directory.consume(_batch(keys=[_wide_key(1)]))
+    assert (
+        first.l1_digests()["node-a"].generation
+        != second.l1_digests()["node-a"].generation
+    )
+
+
+def test_l1_digest_forgets_a_fenced_instance():
+    directory = KeyDirectory()
+    directory.consume(_batch(keys=[_wide_key(1)]))
+    directory.l1_digests()
+    directory.fence_instance("node-a")
+    assert "node-a" not in directory.l1_digests()
+
+
+def _store_many(directory: KeyDirectory, instance_id: str, keys, seq: int, et=None):
+    for start in range(0, len(keys), 5000):
+        directory.consume(
+            _batch(
+                instance_id=instance_id,
+                seq=seq + start // 5000,
+                event_type=et or CacheEventType.STORE,
+                keys=keys[start : start + 5000],
+            )
+        )
+
+
+def test_l1_digests_track_many_keys_across_instances_and_churn():
+    """Four instances with 25k keys each: every live key is covered, and once
+    a fifth of one instance is evicted its next digest rules those keys out."""
+    directory = KeyDirectory()
+    keys = {
+        f"node-{i}": [_wide_key(i * 1_000_000 + j) for j in range(25_000)]
+        for i in range(4)
+    }
+    for instance_id, instance_keys in keys.items():
+        _store_many(directory, instance_id, instance_keys, seq=1)
+    digests = directory.l1_digests()
+    for instance_id, instance_keys in keys.items():
+        assert all(
+            digests[instance_id].digest.might_contain(k.chunk_hash)
+            for k in instance_keys[::97]
+        )
+
+    evicted, kept = keys["node-0"][:5_000], keys["node-0"][5_000:]
+    _store_many(directory, "node-0", evicted, seq=100, et=CacheEventType.DELETE)
+    digest = directory.l1_digests()["node-0"].digest
+    assert all(digest.might_contain(k.chunk_hash) for k in kept[::97])
+    assert sum(digest.might_contain(k.chunk_hash) for k in evicted) < 25
+
+
+def test_l1_digest_covers_keys_stored_while_nobody_reads():
+    """Inserts buffered past the filter's capacity are dropped from the
+    buffer; the next read rebuilds from the keys, so none is missing."""
+    directory = KeyDirectory()
+    directory.consume(_batch(seq=1, keys=[_wide_key(0)]))
+    directory.l1_digests()
+    keys = [_wide_key(i) for i in range(1, 3000)]
+    for seq, key in enumerate(keys, start=2):
+        directory.consume(_batch(seq=seq, keys=[key]))
+    digest = directory.l1_digests()["node-a"].digest
+    assert all(digest.might_contain(k.chunk_hash) for k in keys)
+
+
+def test_rebuild_includes_changes_that_land_while_it_is_built():
+    """A rebuild hashes outside the directory lock; a key stored meanwhile
+    is in the installed digest, and a fenced instance's build is dropped."""
+    index = L1DigestIndex()
+    keys = {"a": {_wide_key(i) for i in range(3)}, "b": {_wide_key(10)}}
+    jobs = index.begin_rebuilds(keys)
+    late = _wide_key(99)
+    index.on_add("a", late.chunk_hash)
+    index.drop("b")
+    digests = index.finish(L1DigestIndex.build(jobs))
+    assert digests["a"].digest.might_contain(late.chunk_hash)
+    assert all(digests["a"].digest.might_contain(k.chunk_hash) for k in keys["a"])
+    assert "b" not in digests
+
+
+def test_concurrent_reader_skips_a_rebuild_already_in_flight():
+    """Two readers race: the second takes no job for an instance the first
+    is rebuilding, and gets no digest for it until that build lands."""
+    index = L1DigestIndex()
+    keys = {"a": {_wide_key(1)}}
+    first = index.begin_rebuilds(keys)
+    second = index.begin_rebuilds(keys)
+    assert "a" in first and not second
+    assert "a" not in index.finish(L1DigestIndex.build(second))
+    assert index.finish(L1DigestIndex.build(first))["a"].digest.might_contain(
+        _wide_key(1).chunk_hash
+    )
