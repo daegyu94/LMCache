@@ -77,9 +77,10 @@ def _event_module(
     world_size: int = 1,
     groups: int = 1,
     shard_replication_desc: ShardReplicationDesc = DEFAULT_SHARD_REPLICATION_DESC,
+    layouts: LayoutDescRegistry | None = None,
 ) -> tuple[KVEventModule, EventBus]:
     bus = bus or EventBus(EventBusConfig())
-    layouts = LayoutDescRegistry()
+    layouts = layouts or LayoutDescRegistry()
     for model in ("model", "other"):
         layouts.register(
             model,
@@ -550,6 +551,39 @@ def test_cpu_events_require_registered_shards_of_replicated_groups(
     _publish_kv(bus, EventType.L1_KEYS_EVICTED, keys=keys[-1:])
     removed = module.read_kv_events("model", stored.next_cursor, 8)
     assert [r.kind for r in removed.events] == ["removed"]
+
+
+def test_cpu_events_follow_the_current_registration() -> None:
+    """Unkeyed copies never complete a chunk, and re-registration changes the
+    required shards for later events."""
+    layouts = LayoutDescRegistry()
+    module, bus = _event_module(
+        world_size=2,
+        shard_replication_desc=ShardReplicationDesc((2,), (1,)),
+        layouts=layouts,
+    )
+    keys = [_event_key(1, rank=rank, world_size=2) for rank in range(2)]
+    _bind_kv(bus, keys[:1])
+    _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[1:])
+    assert not module.read_kv_events("model", 0, 8).events
+    _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[:1])
+    _publish_kv(bus, EventType.L1_KEYS_EVICTED, keys=keys[1:])
+    stored = module.read_kv_events("model", 0, 8)
+    assert [r.kind for r in stored.events] == ["stored"]
+    layouts.unregister("model", 2)
+    layouts.register(
+        "model",
+        2,
+        MemoryLayoutDesc([torch.Size([1])], [torch.float16]),
+        chunk_size=256,
+        hash_algorithm="blake3",
+    )
+    _publish_kv(bus, EventType.L1_WRITE_FINISHED, l1_tag="second", keys=keys[:1])
+    removed = module.read_kv_events("model", stored.next_cursor, 8)
+    assert [r.kind for r in removed.events] == ["removed"]
+    _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[1:])
+    restored = module.read_kv_events("model", removed.next_cursor, 8)
+    assert [r.kind for r in restored.events] == ["stored"]
 
 
 @pytest.mark.parametrize("tagged_first", [False, True])

@@ -2,9 +2,12 @@
 
 `KVEventModule` publishes a chunk only after every required `(kv_rank,
 object_group_id)` has a committed readable L1 copy. `CommittedKVResidency`
-tracks L1 owners per `ObjectKey`. The registration's object groups and shard
-replication describe the required set: one object per distinct DCP shard in
-each TP-replicated group, or one per rank for an unreplicated group. Residency
+tracks L1 owners per chunk scope (below) and `(kv_rank, object_group_id)`
+slot, so a completeness check is one subset test against the required slots,
+cached per registered geometry, without building probe keys. The
+registration's object groups and shard replication describe the required
+set: one object per distinct DCP shard in each TP-replicated group, or one
+per rank for an unreplicated group. Residency
 and lookup share `get_kv_worker_ids` to enumerate those keyed workers within
 the key's encoded world size. Neither subscriber count nor the number of ranks
 observed so far proves completeness.
@@ -29,7 +32,7 @@ For each `(model_name, world_size, cache_salt, identity_tags, chunk_hash)`:
 
 Different L1 managers may supply different required objects. Distinct models,
 world sizes, salts, identity tags, and object groups cannot satisfy each other's
-requirements. Completeness probes preserve the incoming key's identity, so a
+requirements. Completeness is checked within the incoming key's scope, so a
 pinned revision or other `lmcache.tag.*` value does not hide a committed chunk.
 Owner entries disappear when their last copy is evicted. Announcement state
 disappears when a chunk loses readiness. The existing token cache and event log

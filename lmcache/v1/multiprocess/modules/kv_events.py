@@ -4,6 +4,7 @@
 # Standard
 from collections import OrderedDict, deque
 from collections.abc import Sequence
+from functools import lru_cache
 from itertools import islice
 import threading
 import time
@@ -16,7 +17,11 @@ from lmcache.v1.common.custom_types import (
     KVEventBatch,
     KVEventRecord,
 )
-from lmcache.v1.distributed.api import ObjectKey, get_kv_worker_ids
+from lmcache.v1.distributed.api import (
+    ObjectKey,
+    ShardReplicationDesc,
+    get_kv_worker_ids,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.config import MPServerConfig
@@ -42,6 +47,7 @@ from lmcache.v1.transport.futures import MessagingStream
 _KIND_LOST = "lost"
 _TOKEN_BINDING_CACHE_SIZE = 65536
 _ChunkKey = tuple[str, int, str, tuple[tuple[str, str], ...], bytes]
+_Slot = tuple[int, int]
 
 
 def _chunk_key(key: ObjectKey) -> _ChunkKey:
@@ -55,11 +61,36 @@ def _chunk_key(key: ObjectKey) -> _ChunkKey:
     )
 
 
+@lru_cache(maxsize=64)
+def _required_slots(
+    world_size: int, groups: tuple[int, ...], replication: ShardReplicationDesc
+) -> frozenset[_Slot]:
+    """Return the ``(kv_rank, object_group_id)`` slots a complete chunk needs.
+
+    Args:
+        world_size: KV world size encoded in the chunk's keys.
+        groups: Registered object group IDs.
+        replication: Registered TP/DCP shard replication of those groups.
+
+    Returns:
+        One slot per keyed worker of each group. Cached by value, so a changed
+        registration selects a different entry instead of a stale one.
+    """
+    return frozenset(
+        (ObjectKey.ComputeKVRank(world_size, rank, world_size, rank), group)
+        for group in groups
+        for rank in get_kv_worker_ids(
+            world_size, replication.tp_replicas(group), replication.dcp_shards(group)
+        )
+    )
+
+
 class CommittedKVResidency:
     """Project committed L1 copies onto complete chunks.
 
     The owning KVEventModule serializes every call under its event lock.
-    Owners are retained only while their ObjectKey has a readable copy.
+    Owners are indexed by chunk, then by ``(kv_rank, object_group_id)`` slot,
+    and retained only while that object has a readable copy.
 
     Args:
         layouts: Registered geometry supplying object groups and their TP/DCP
@@ -68,7 +99,7 @@ class CommittedKVResidency:
 
     def __init__(self, layouts: LayoutDescRegistry) -> None:
         self._layouts = layouts
-        self._owners: dict[ObjectKey, set[str]] = {}
+        self._owners: dict[_ChunkKey, dict[_Slot, set[str]]] = {}
 
     def commit(self, key: ObjectKey, l1_tag: str) -> None:
         """Record a completed readable copy; duplicate notifications are idempotent.
@@ -77,7 +108,8 @@ class CommittedKVResidency:
             key: The committed object, including rank, group, salt and identity tags.
             l1_tag: The L1 manager that completed the write.
         """
-        self._owners.setdefault(key, set()).add(l1_tag)
+        slots = self._owners.setdefault(_chunk_key(key), {})
+        slots.setdefault((key.kv_rank, key.object_group_id), set()).add(l1_tag)
 
     def evict(self, key: ObjectKey, l1_tag: str) -> None:
         """Forget one L1 copy, removing owner state when its final copy is gone.
@@ -86,11 +118,19 @@ class CommittedKVResidency:
             key: The object removed from L1.
             l1_tag: The L1 manager that removed it. Unknown copies are ignored.
         """
-        owners = self._owners.get(key)
-        if owners is not None:
-            owners.discard(l1_tag)
-            if not owners:
-                del self._owners[key]
+        chunk = _chunk_key(key)
+        slots = self._owners.get(chunk)
+        if slots is None:
+            return
+        slot = (key.kv_rank, key.object_group_id)
+        owners = slots.get(slot)
+        if owners is None:
+            return
+        owners.discard(l1_tag)
+        if not owners:
+            del slots[slot]
+            if not slots:
+                del self._owners[chunk]
 
     def is_committed(self, key: ObjectKey) -> bool:
         """Return whether every distinct registered group shard has an L1 copy.
@@ -107,20 +147,9 @@ class CommittedKVResidency:
         geometry = self._layouts.find_group_shard_geometry(key.model_name, world_size)
         if not world_size or geometry is None:
             return False
-        groups, replication = geometry
-        return all(
-            ObjectKey(
-                identity=key.identity,
-                kv_rank=ObjectKey.ComputeKVRank(world_size, rank, world_size, rank),
-                object_group_id=group,
-            )
-            in self._owners
-            for group in groups
-            for rank in get_kv_worker_ids(
-                world_size,
-                replication.tp_replicas(group),
-                replication.dcp_shards(group),
-            )
+        slots = self._owners.get(_chunk_key(key))
+        return slots is not None and slots.keys() >= _required_slots(
+            world_size, *geometry
         )
 
     def clear(self) -> None:
