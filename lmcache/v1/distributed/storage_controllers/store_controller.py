@@ -465,7 +465,7 @@ class StoreController(StorageControllerInterface):
             if desc is None:
                 continue
             observations.append(
-                (count, {"l2_name": desc.type_name, "adapter_index": idx})
+                (count, {**desc.metric_attributes, "adapter_index": idx})
             )
         return observations
 
@@ -814,7 +814,7 @@ class StoreController(StorageControllerInterface):
                     metadata={
                         "adapter_index": adapter_index,
                         "task_id": task_id,
-                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
+                        **self._adapter_descriptors[adapter_index].metric_attributes,
                         "key_count": len(successful_keys),
                         "total_bytes": total_bytes,
                         "key_count_per_salt": Counter(
@@ -878,11 +878,10 @@ class StoreController(StorageControllerInterface):
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
 
-        l2_name = self._adapter_descriptors[adapter_index].type_name
         completion_meta: dict[str, object] = {
             "adapter_index": adapter_index,
             "task_id": task_id,
-            "l2_name": l2_name,
+            **self._adapter_descriptors[adapter_index].metric_attributes,
             "bytes_transferred": task.l2_bytes_transferred,
         }
         if success:

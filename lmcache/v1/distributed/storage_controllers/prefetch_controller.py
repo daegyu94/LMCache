@@ -842,7 +842,7 @@ class PrefetchController(StorageControllerInterface):
             if desc is None:
                 continue
             observations.append(
-                (count, {"l2_name": desc.type_name, "adapter_index": idx})
+                (count, {**desc.metric_attributes, "adapter_index": idx})
             )
         return observations
 
@@ -857,7 +857,10 @@ class PrefetchController(StorageControllerInterface):
             if desc is None:
                 continue
             observations.append(
-                (reserved_bytes, {"l2_name": desc.type_name, "adapter_index": idx})
+                (
+                    reserved_bytes,
+                    {**desc.metric_attributes, "adapter_index": idx},
+                )
             )
         return observations
 
@@ -1493,7 +1496,7 @@ class PrefetchController(StorageControllerInterface):
                         "request_id": request.request_id,
                         "adapter_index": l2_idx,
                         "task_id": task_id,
-                        "l2_name": self._adapter_descriptors[l2_idx].type_name,
+                        **self._adapter_descriptors[l2_idx].metric_attributes,
                         "key_count": len(keys),
                         "total_bytes": total_bytes,
                     },
@@ -1666,7 +1669,7 @@ class PrefetchController(StorageControllerInterface):
                         "request_id": request.request_id,
                         "adapter_index": adapter_idx,
                         "task_id": task_id,
-                        "l2_name": self._adapter_descriptors[adapter_idx].type_name,
+                        **self._adapter_descriptors[adapter_idx].metric_attributes,
                     },
                 )
             )
@@ -1690,7 +1693,15 @@ class PrefetchController(StorageControllerInterface):
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.L2_PREFETCH_FAILED,
-                        metadata={"reason": "not_found", "keys": failed_keys},
+                        metadata={
+                            "reason": "not_found",
+                            "keys": failed_keys,
+                            # Only ``peer``: adding ``l2_name`` would change
+                            # the existing series of non-P2P adapters.
+                            **self._adapter_descriptors[
+                                adapter_idx
+                            ].config.get_metric_attributes(),
+                        },
                     )
                 )
 

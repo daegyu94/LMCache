@@ -783,6 +783,7 @@ class P2PController(DiscoverableModule):
             write_enabled=self._p2p_config.enable_write,
             store_timeout_s=self._p2p_config.store_timeout,
             write_l1_usage_threshold=self._p2p_config.write_l1_usage_threshold,
+            peer_instance_id=inst.instance_id,
         )
         try:
             adapter_id = self._ctx.storage_manager.add_l2_adapter(config)

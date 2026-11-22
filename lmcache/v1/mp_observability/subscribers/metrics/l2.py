@@ -5,9 +5,6 @@
 # Future
 from __future__ import annotations
 
-# Standard
-from typing import Any
-
 # Third Party
 from opentelemetry import metrics
 
@@ -16,17 +13,8 @@ from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
 from lmcache.v1.mp_observability.subscribers.metrics.utils import (
     emit_salt_counts,
+    l2_adapter_attrs,
 )
-
-
-def _l2_name_attrs(event: Event) -> dict[str, Any]:
-    """Build ``{"l2_name": ...}`` if the event carries an ``l2_name``
-    metadata key, else ``{}``.  Keeps the counter dimensionless when
-    the emission site hasn't been updated to carry the label yet."""
-    l2_name = event.metadata.get("l2_name")
-    if l2_name is None:
-        return {}
-    return {"l2_name": str(l2_name)}
 
 
 class L2MetricsSubscriber(EventSubscriber):
@@ -47,7 +35,8 @@ class L2MetricsSubscriber(EventSubscriber):
 
     The ``l2_name``-labeled counters (``l2_store_completed``, ``l2_load_completed``)
     let dashboards compute per-backend IOPS via
-    ``rate(<counter>_total{l2_name="..."}[1m])``.
+    ``rate(<counter>_total{l2_name="..."}[1m])``.  P2P adapters also carry
+    ``peer`` (the peer's instance id), so each peer gets its own series.
     """
 
     def __init__(self) -> None:
@@ -138,7 +127,7 @@ class L2MetricsSubscriber(EventSubscriber):
         )
 
     def _on_store_completed(self, event: Event) -> None:
-        attrs = _l2_name_attrs(event)
+        attrs = l2_adapter_attrs(event)
         self._store_completed.add(1, attributes=attrs)
         emit_salt_counts(
             self._store_completed_objects,
@@ -146,7 +135,7 @@ class L2MetricsSubscriber(EventSubscriber):
         )
 
     def _on_load_task_completed(self, event: Event) -> None:
-        self._load_completed.add(1, attributes=_l2_name_attrs(event))
+        self._load_completed.add(1, attributes=l2_adapter_attrs(event))
 
     def _on_lookup_submitted(self, event: Event) -> None:
         self._prefetch_lookup_submitted.add(1)

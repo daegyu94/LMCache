@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Integration tests for the four L1/L2 state metrics.
+"""Integration tests for the four L1/L2 state metrics and the adapter
+labels on per-adapter L2 metrics.
 
 Drives real controllers through real state changes and reads back values
 via a process-shared ``InMemoryMetricReader``.  Assertions are on deltas
@@ -28,6 +29,7 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
 )
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
 from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
     PrefetchController,
 )
@@ -45,6 +47,8 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
 )
 from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
+from lmcache.v1.mp_observability.event_bus import EventBusConfig, init_event_bus
+from lmcache.v1.mp_observability.subscribers.metrics.l2 import L2MetricsSubscriber
 
 # Importing this sets the process-wide MeterProvider with an
 # InMemoryMetricReader; controllers bind their instruments to it.
@@ -98,6 +102,15 @@ def single_row_spec(keys, layout) -> PrefetchTaskSpec:
 
 def make_descriptor(index: int) -> L2AdapterDescriptor:
     config = MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+    return L2AdapterDescriptor(index=index, config=config)
+
+
+def make_p2p_descriptor(index: int, peer_instance_id: str) -> L2AdapterDescriptor:
+    config = P2PL2AdapterConfig(
+        peer_mq_server_url=f"grpc://peer{index}:7500",
+        peer_transfer_channel_server_url=f"peer{index}:7600",
+        peer_instance_id=peer_instance_id,
+    )
     return L2AdapterDescriptor(index=index, config=config)
 
 
@@ -196,6 +209,18 @@ def l1_manager():
     mgr = create_l1_manager(config)
     yield mgr
     mgr.close()
+
+
+@pytest.fixture
+def l2_metrics():
+    """Enable the global event bus with the L2 metrics subscriber.
+    Controllers pick up the bus when built, so build them after this."""
+    bus = init_event_bus(EventBusConfig(enabled=True))
+    bus.register_subscriber(L2MetricsSubscriber())
+    bus.start()
+    yield
+    bus.stop()
+    init_event_bus(EventBusConfig(enabled=False))
 
 
 # =============================================================================
@@ -449,3 +474,56 @@ def test_peer_l1_gauges_are_separate_and_removed_on_close() -> None:
             )
             == 0
         )
+
+
+# =============================================================================
+# Per-adapter L2 metric labels
+# =============================================================================
+
+
+class TestL2AdapterMetricLabels:
+    """Per-adapter L2 counters carry ``peer`` for P2P adapters only."""
+
+    def test_p2p_peers_have_separate_series(self, l1_manager, l2_metrics):
+        # Mock adapters move the data; the descriptors' configs alone decide
+        # the labels, as they do for real P2P adapters.
+        adapters = [make_adapter() for _ in range(3)]
+        descriptors = [
+            make_descriptor(0),
+            make_p2p_descriptor(1, "peer-a"),
+            make_p2p_descriptor(2, "peer-b"),
+        ]
+        metric = "lmcache_mp.l2_load_completed"
+        series = {
+            "mock": {"l2_name": "mock"},
+            "peer-a": {"l2_name": "p2p", "peer": "peer-a"},
+            "peer-b": {"l2_name": "p2p", "peer": "peer-b"},
+        }
+        layout = make_layout()
+        keys = [make_object_key(500 + i) for i in range(4)]
+        store_keys_in_l2(adapters[1], keys, layout)
+        before = {name: _value_for(metric, attrs) for name, attrs in series.items()}
+
+        def delta(name: str) -> float:
+            return _value_for(metric, series[name]) - before[name]
+
+        ctrl = PrefetchController(
+            l1_managers=[l1_manager],
+            l1_manager_descriptors=[make_l1_descriptor()],
+            l2_adapters=adapters,
+            adapter_descriptors=descriptors,
+            policy=BufferOnlyPrefetchPolicy(),
+        )
+        ctrl.start()
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys, layout))
+        assert wait_for_condition(
+            lambda: ctrl.query_prefetch_result(req_id) is not None
+        )
+        assert wait_for_condition(lambda: delta("peer-a") == 1)
+        assert delta("peer-b") == 0
+        assert delta("mock") == 0
+
+        l1_manager.finish_read(keys)
+        ctrl.stop()
+        for a in adapters:
+            a.close()

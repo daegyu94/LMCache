@@ -385,6 +385,17 @@ class L2AdapterConfigBase(ABC):
             MemoryTags(MemorySegment.CXL, MemoryResidency.LOCAL),
         )
 
+    def get_metric_attributes(self) -> dict[str, str]:
+        """
+        Return the metric attributes, beyond ``l2_name``, that tell this
+        adapter instance apart from others of the same type.
+
+        Returns:
+            Attribute name to value. Empty by default, so most adapter
+            types are labeled by ``l2_name`` alone.
+        """
+        return {}
+
 
 # -----------------------------------------------------------------------------
 # Main config: list of adapter configs (order = adapter order)

@@ -51,6 +51,17 @@ class L2AdapterDescriptor:
         """
         return get_type_name_for_config(self.config)
 
+    @property
+    def metric_attributes(self) -> dict[str, str]:
+        """
+        Attributes that label this adapter's L2 metrics.
+
+        Returns:
+            ``{"l2_name": <type_name>}`` plus the config's
+            ``get_metric_attributes()`` (e.g. ``peer`` for P2P adapters).
+        """
+        return {"l2_name": self.type_name, **self.config.get_metric_attributes()}
+
 
 @dataclass(frozen=True)
 class L1ManagerDescriptor:

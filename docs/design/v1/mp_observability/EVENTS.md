@@ -112,6 +112,11 @@ covers only loaded (succeeded) keys.
 aggregate across adapters.  Throughput subscribers that need per-adapter
 attribution (e.g. `L2ThroughputSubscriber`) consume these task-level
 events; key-count counters continue to consume the request-level events.
+`L2_STORE_SUBMITTED`, `L2_STORE_COMPLETED`, `L2_LOAD_TASK_SUBMITTED`, and
+`L2_LOAD_TASK_COMPLETED` also carry `peer` (`str`) when the adapter is a P2P
+adapter of a peer the coordinator discovered: the peer's coordinator
+instance id, taken from `L2AdapterDescriptor.metric_attributes`. Other
+adapters, including statically configured P2P adapters, omit it.
 
 ---
 
@@ -133,7 +138,7 @@ Health-monitoring event for the L2 prefetch path. See LM-291.
 
 | EventType | Metadata keys | Types | Vocabulary |
 |---|---|---|---|
-| `L2_PREFETCH_FAILED` | `reason`, `keys` | `str`, `list[ObjectKey]` | `reason` ∈ {`l1_oom`, `l1_contended`, `not_found`} |
+| `L2_PREFETCH_FAILED` | `reason`, `keys`, `peer` (optional) | `str`, `list[ObjectKey]`, `str` | `reason` ∈ {`l1_oom`, `l1_contended`, `not_found`}; `peer` is set only for `not_found` on a P2P adapter |
 
 Producers (all in `PrefetchController`):
 - `reason=l1_oom` — emitted when `reserve_write` of a load's L1 staging buffer returns `OUT_OF_MEMORY`. The affected cells drop their L2 lock and the request is re-planned on what was reserved.

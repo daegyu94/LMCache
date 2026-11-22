@@ -507,7 +507,8 @@ def _peer(
 
 
 def test_reconcile_adds_new_peer() -> None:
-    """A newly discovered peer gets one P2P L2 adapter with the right urls."""
+    """A newly discovered peer gets one P2P L2 adapter with the right urls
+    and its instance id as the metric label."""
     controller, ctx = _make_controller()
     ctx.storage_manager.add_l2_adapter.return_value = 7
 
@@ -518,6 +519,7 @@ def test_reconcile_adds_new_peer() -> None:
     assert isinstance(config, P2PL2AdapterConfig)
     assert config.peer_mq_server_url == "grpc://10.0.0.2:5555"
     assert config.peer_transfer_channel_server_url == "tc-host:9"
+    assert config.get_metric_attributes() == {"peer": "peerA"}
     assert controller.report_status()["p2p_peers"] == ["peerA"]
 
 

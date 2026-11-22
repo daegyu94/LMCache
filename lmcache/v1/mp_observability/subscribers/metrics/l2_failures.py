@@ -18,6 +18,7 @@ lands; once it does, it becomes an additive third value of the same tag
 with no breaking change to dashboards.
 
 All emissions carry ``model_name`` extracted from each ``ObjectKey``.
+``not_found`` failures on a P2P adapter also carry ``peer``.
 """
 
 # Future
@@ -33,6 +34,7 @@ from opentelemetry import metrics
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
+from lmcache.v1.mp_observability.subscribers.metrics.utils import l2_adapter_attrs
 
 
 class L2FailureMetricsSubscriber(EventSubscriber):
@@ -56,8 +58,9 @@ class L2FailureMetricsSubscriber(EventSubscriber):
     def _on_prefetch_failed(self, event: Event) -> None:
         reason: str = event.metadata["reason"]
         keys: list[ObjectKey] = event.metadata["keys"]
+        adapter_attrs = l2_adapter_attrs(event)
         for model_name, count in Counter(k.model_name for k in keys).items():
             self._prefetch_counter.add(
                 count,
-                {"reason": reason, "model_name": model_name},
+                {"reason": reason, "model_name": model_name, **adapter_attrs},
             )

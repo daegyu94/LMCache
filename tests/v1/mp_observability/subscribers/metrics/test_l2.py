@@ -23,6 +23,13 @@ from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 from lmcache.v1.mp_observability.subscribers.metrics.l2 import (
     L2MetricsSubscriber,
 )
+from lmcache.v1.mp_observability.subscribers.metrics.l2_failures import (
+    L2FailureMetricsSubscriber,
+)
+from lmcache.v1.mp_observability.subscribers.metrics.l2_throughput import (
+    L2ThroughputSubscriber,
+)
+from tests.v1.mp_observability.subscribers.metrics.counter_helpers import make_key
 from tests.v1.mp_observability.subscribers.metrics.otel_setup import reader as _reader
 
 # Time for the drain thread to process queued events.
@@ -735,3 +742,84 @@ class TestL2CacheSaltTagging:
         key_b = (("cache_salt", "tenant-b"),)
         assert after.get(key_a, 0) >= before.get(key_a, 0) + 4
         assert after.get(key_b, 0) >= before.get(key_b, 0) + 5
+
+
+# ---------------------------------------------------------------------------
+# ``peer`` label pass-through (P2P adapters)
+# ---------------------------------------------------------------------------
+
+
+def _point_counts() -> dict[tuple[str, tuple], float]:
+    """``{(metric, sorted_attrs): value or histogram count}`` for all points."""
+    data = _reader.get_metrics_data()
+    result: dict[tuple[str, tuple], float] = {}
+    if data is None:
+        return result
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                for dp in metric.data.data_points:
+                    key = (metric.name, tuple(sorted(dict(dp.attributes).items())))
+                    value = dp.count if hasattr(dp, "count") else dp.value
+                    result[key] = result.get(key, 0) + value
+    return result
+
+
+@pytest.mark.parametrize(
+    "adapter_meta",
+    [
+        {"l2_name": "peer-label-fs"},
+        {"l2_name": "p2p", "peer": "peer-x"},
+    ],
+    ids=["non_p2p", "p2p"],
+)
+def test_adapter_labels_pass_through_unchanged(adapter_meta):
+    """Per-adapter L2 metrics carry exactly the adapter labels of the event:
+    ``peer`` when present, and the ``l2_name``-only set when absent."""
+    callbacks: dict[EventType, list] = {}
+    for sub in (
+        L2MetricsSubscriber(),
+        L2ThroughputSubscriber(),
+        L2FailureMetricsSubscriber(),
+    ):
+        for event_type, callback in sub.get_subscriptions().items():
+            callbacks.setdefault(event_type, []).append(callback)
+
+    def feed(event_type: EventType, t: float, metadata: dict) -> None:
+        event = Event(event_type=event_type, timestamp=t, metadata=metadata)
+        for callback in callbacks.get(event_type, []):
+            callback(event)
+
+    task = {"adapter_index": 0, "task_id": 1, **adapter_meta}
+    load_task = {"request_id": 1, **task}
+    keys = [make_key("peer-label-model", i) for i in range(2)]
+    before = _point_counts()
+    feed(EventType.L2_STORE_SUBMITTED, 1.0, {**task, "total_bytes": 1_000})
+    feed(
+        EventType.L2_STORE_COMPLETED,
+        2.0,
+        {**task, "bytes_transferred": 1_000, "succeeded_count": 1, "failed_count": 0},
+    )
+    feed(EventType.L2_LOAD_TASK_SUBMITTED, 1.0, {**load_task, "total_bytes": 1_000})
+    feed(EventType.L2_LOAD_TASK_COMPLETED, 2.0, load_task)
+    peer_meta = {k: v for k, v in adapter_meta.items() if k == "peer"}
+    feed(
+        EventType.L2_PREFETCH_FAILED,
+        2.0,
+        {"reason": "not_found", "keys": keys, **peer_meta},
+    )
+    after = _point_counts()
+
+    def delta(metric: str, attrs: dict) -> float:
+        key = (metric, tuple(sorted(attrs.items())))
+        return after.get(key, 0) - before.get(key, 0)
+
+    for metric in (
+        "lmcache_mp.l2_store_completed",
+        "lmcache_mp.l2_load_completed",
+        "lmcache_mp.l2_store_throughput",
+        "lmcache_mp.l2_load_throughput",
+    ):
+        assert delta(metric, adapter_meta) == 1, metric
+    failure_attrs = {"reason": "not_found", "model_name": "peer-label-model"}
+    assert delta("lmcache_mp.l2_prefetch_failure", {**failure_attrs, **peer_meta}) == 2

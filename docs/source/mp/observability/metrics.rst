@@ -179,7 +179,7 @@ L2 Metrics
      - Counter (attr: ``cache_salt``)
      - Number of chunks submitted for L2 store, grouped by tenant.
    * - ``lmcache_mp.l2_store_completed``
-     - Counter (attr: ``l2_name``)
+     - Counter (attrs: ``l2_name``, ``peer``)
      - Number of L2 store requests completed, labeled by adapter type.
    * - ``lmcache_mp.l2_store_completed_objects``
      - Counter (attr: ``cache_salt``)
@@ -201,7 +201,7 @@ L2 Metrics
      - Counter (attr: ``cache_salt``)
      - Number of chunks successfully loaded from L2, grouped by tenant.
    * - ``lmcache_mp.l2_load_completed``
-     - Counter (attr: ``l2_name``)
+     - Counter (attrs: ``l2_name``, ``peer``)
      - Number of per-adapter L2 load requests completed, labeled by adapter type.
    * - ``lmcache_mp.l2_evicted_objects``
      - Counter (attr: ``cache_salt``)
@@ -212,6 +212,17 @@ The ``l2_name``-labeled counters (``l2_store_completed`` and
 demand via ``rate(lmcache_mp_l2_store_completed_requests_total{l2_name="..."}[1m])``
 (and the equivalent for loads).  No separate ``*_iops`` metric is exported;
 keeping the raw counter lets dashboard users pick their own window.
+
+Every P2P peer is a separate L2 adapter with ``l2_name="p2p"``, so the
+per-adapter L2 metrics of a P2P adapter (the ``l2_name``-labeled counters,
+the L1↔L2 throughput histograms, the in-flight gauges, and ``not_found``
+prefetch failures) also carry ``peer``: the peer's ``--instance-id``.
+``peer`` is set only for peers the coordinator discovers; statically
+configured P2P adapters (``--l2-adapter``) and other adapter types do not
+get the label.  A removed peer's counter and histogram series stay until the
+server restarts, and the default ``--instance-id`` is a new UUID on every
+start, so give each server a stable ``--instance-id`` to keep one series
+per peer, or drop ``peer`` at scrape time.
 
 Failure & Health Counters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -249,7 +260,8 @@ Prometheus ``/metrics`` endpoint.
      - Counter
      - Chunks that L2 reported present at lookup but failed to land in L1.
        Tagged by ``reason`` ∈ {``l1_oom``, ``not_found``} plus
-       ``model_name``. ``l1_oom`` means L1 had no room to receive the
+       ``model_name``, and ``peer`` for ``not_found`` on a P2P adapter
+       (a timed-out P2P load counts here). ``l1_oom`` means L1 had no room to receive the
        prefetched object; ``not_found`` means the adapter returned no
        data despite a positive lookup (e.g. concurrent delete).
 
@@ -623,10 +635,11 @@ latency*, not raw transfer rate. Use these histograms to compare
 adapter types and catch regressions; use the L0↔L1 histograms when you
 need pure copy-time throughput.
 
-All L1↔L2 throughput histograms carry a single ``l2_name`` OTel
+All L1↔L2 throughput histograms carry an ``l2_name`` OTel
 attribute — the registered adapter type (e.g. ``"fs"``, ``"nixl_store"``,
 ``"mooncake_store"``) — enabling per-backend slicing in Prometheus (e.g.
 ``lmcache_mp_l2_store_throughput_GB_per_second{l2_name="nixl_store"}``).
+P2P adapters also carry ``peer``.
 
 .. list-table::
    :header-rows: 1
@@ -741,17 +754,17 @@ Adapters with no in-flight work emit no datapoint for that scrape.
        mean either "not configured" or "adapter errored on this
        scrape" — cross-check with the L2 store/load counters.
    * - ``lmcache_mp.num_inflight_l2_stores``
-     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``)
+     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``, ``peer``)
      - L2 store tasks currently executing, per adapter.  Sustained
        non-zero values indicate the adapter cannot keep up with the
        L1 → L2 write rate.
    * - ``lmcache_mp.num_inflight_l2_loads``
-     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``)
+     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``, ``peer``)
      - L2 → L1 prefetch load tasks currently executing, per adapter.
        Pair with ``num_inflight_l2_stores`` to see whether read or write
        traffic dominates a given backend.
    * - ``lmcache_mp.inflight_load_memory_usage_bytes``
-     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``)
+     - ObservableGauge (attrs: ``l2_name``, ``adapter_index``, ``peer``)
      - L1 bytes reserved by in-flight L2 → L1 prefetch loads, per
        adapter.  Rising in-flight bytes alongside rising
        ``l1_memory_usage_bytes`` is a signal that prefetch reservations

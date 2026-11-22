@@ -3,7 +3,8 @@
 """L1↔L2 throughput metrics subscriber.
 
 Emits two OTel histograms in GB/s, labeled by ``l2_name`` (the registered
-adapter type, e.g. ``"fs"``, ``"nixl_store"``):
+adapter type, e.g. ``"fs"``, ``"nixl_store"``) and, for P2P adapters,
+``peer`` (the peer's instance id):
   - ``lmcache_mp.l2_store_throughput``  — L1→L2 store
   - ``lmcache_mp.l2_load_throughput``   — L2→L1 load
 
@@ -35,6 +36,7 @@ from opentelemetry import metrics
 # First Party
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
+from lmcache.v1.mp_observability.subscribers.metrics.utils import l2_adapter_attrs
 
 
 class L2ThroughputSubscriber(EventSubscriber):
@@ -183,9 +185,4 @@ class L2ThroughputSubscriber(EventSubscriber):
         if dt <= 0:
             return
 
-        l2_name = event.metadata.get("l2_name")
-        attrs: dict[str, Any] = {}
-        if l2_name is not None:
-            attrs["l2_name"] = str(l2_name)
-
-        hist.record(effective_bytes / dt / 1e9, attributes=attrs)
+        hist.record(effective_bytes / dt / 1e9, attributes=l2_adapter_attrs(event))

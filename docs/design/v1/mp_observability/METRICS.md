@@ -181,7 +181,7 @@ contribute to histograms; counters above always count all events.
 |---|---|---|---|---|
 | `lmcache_mp.l2_store_submitted` | `lmcache_mp_l2_store_submitted_requests_total` | Counter | `L2_STORE_SUBMITTED` | +1 per event |
 | `lmcache_mp.l2_store_submitted_objects` | `lmcache_mp_l2_store_submitted_objects_chunks_total` | Counter (attr: `cache_salt`) | `L2_STORE_SUBMITTED` | `+count` per `cache_salt` via `key_count_per_salt` |
-| `lmcache_mp.l2_store_completed` | `lmcache_mp_l2_store_completed_requests_total` | Counter (attr: `l2_name`) | `L2_STORE_COMPLETED` | +1 per event |
+| `lmcache_mp.l2_store_completed` | `lmcache_mp_l2_store_completed_requests_total` | Counter (attrs: `l2_name`, `peer`) | `L2_STORE_COMPLETED` | +1 per event |
 | `lmcache_mp.l2_store_completed_objects` | `lmcache_mp_l2_store_completed_objects_chunks_total` | Counter (attr: `cache_salt`) | `L2_STORE_COMPLETED` | `+count` per `cache_salt` via `key_count_per_salt` |
 
 **What it answers:** How many chunks are being pushed to L2? What fraction fail?
@@ -197,7 +197,7 @@ contribute to histograms; counters above always count all events.
 | `lmcache_mp.l2_prefetch_load_submitted` | `lmcache_mp_l2_prefetch_load_submitted_requests_total` | Counter | `L2_PREFETCH_LOAD_SUBMITTED` | `+adapter_count` (per-adapter task count) |
 | `lmcache_mp.l2_prefetch_load_submitted_objects` | `lmcache_mp_l2_prefetch_load_submitted_objects_chunks_total` | Counter (attr: `cache_salt`) | `L2_PREFETCH_LOAD_SUBMITTED` | `+count` per `cache_salt` via `key_count_per_salt` |
 | `lmcache_mp.l2_prefetch_load_completed` | `lmcache_mp_l2_prefetch_load_completed_chunks_total` | Counter (attr: `cache_salt`) | `L2_PREFETCH_LOAD_COMPLETED` | `+count` per `cache_salt` via `key_count_per_salt` |
-| `lmcache_mp.l2_load_completed` | `lmcache_mp_l2_load_completed_requests_total` | Counter (attr: `l2_name`) | `L2_LOAD_TASK_COMPLETED` | +1 per event |
+| `lmcache_mp.l2_load_completed` | `lmcache_mp_l2_load_completed_requests_total` | Counter (attrs: `l2_name`, `peer`) | `L2_LOAD_TASK_COMPLETED` | +1 per event |
 
 **What it answers:** How effective is L2 prefetching? What is the L2 hit rate?
 
@@ -211,6 +211,24 @@ the dashboard with
 `rate(lmcache_mp_l2_store_completed_requests_total{l2_name="..."}[1m])`
 (and the equivalent for loads).  No separate `*_iops` metric is exported — the
 raw counter keeps the window choice in the dashboard.
+
+**Per-peer P2P series.**  Each P2P peer is its own L2 adapter, and all of
+them share `l2_name="p2p"`.  Per-adapter metrics of a P2P adapter therefore
+also carry `peer`, the peer's coordinator instance id (`--instance-id`), so
+a slow, failing, or hot peer shows up on its own series.  `peer` is set
+only for peers the coordinator discovers; statically configured P2P
+adapters (`--l2-adapter`) and non-P2P adapters keep their `l2_name`-only
+series.  The instance id is used rather than the peer URL
+because the P2P controller keys its adapters by it and recreates an
+adapter when a peer's URL changes, and it equals the peer's own
+`service.instance.id` resource attribute, so a peer's series can be joined
+with that peer's own metrics.  Cardinality is bounded by the number of
+peer ids seen during the process lifetime: counters and histograms keep a
+removed peer's series until restart (the OTel SDK cannot drop an attribute
+set), while the in-flight gauges stop reporting it at once.  The default
+`--instance-id` is a fresh UUID per start, so set it to a stable name to
+keep one series per peer across peer restarts, or drop `peer` at scrape
+time.
 
 ---
 
@@ -304,7 +322,7 @@ sum(rate(lmcache_mp_lookup_early_exit_requests_total[5m])) by (reason)
 
 | OTel metric name | Prometheus name | Type | Source event | Calculation | Tags |
 |---|---|---|---|---|---|
-| `lmcache_mp.l2_prefetch_failure` | `lmcache_mp_l2_prefetch_failure_chunks_total` | Counter | `L2_PREFETCH_FAILED` | `+count` per `(reason, model_name)` bucket | `reason` ∈ {`l1_oom`, `not_found`}, `model_name` |
+| `lmcache_mp.l2_prefetch_failure` | `lmcache_mp_l2_prefetch_failure_chunks_total` | Counter | `L2_PREFETCH_FAILED` | `+count` per `(reason, model_name)` bucket | `reason` ∈ {`l1_oom`, `not_found`}, `model_name`; `peer` on `not_found` from a P2P adapter (covers P2P load timeouts) |
 
 **What it answers:** For keys L2 reported present at lookup but failed to land in L1: was L1 full (`l1_oom`), or did the adapter fail to produce the data (`not_found`)?
 
@@ -508,10 +526,11 @@ time. Treat the value as *bytes / end-to-end latency*, not raw transfer
 rate — useful for comparing adapter types and tracking regressions, not
 for validating peak fabric bandwidth.
 
-All throughput histograms carry a single `l2_name` OTel attribute — the
+All throughput histograms carry an `l2_name` OTel attribute — the
 registered adapter type (e.g. `"fs"`, `"nixl_store"`, `"mooncake_store"`)
 — enabling per-adapter-type slicing in Prometheus (e.g.
-`lmcache_mp_l2_store_throughput_gbs{l2_name="nixl_store"}`).
+`lmcache_mp_l2_store_throughput_gbs{l2_name="nixl_store"}`).  P2P adapters
+also carry `peer` (see "Per-peer P2P series" above).
 
 **Store-path fast-path accounting.** Some adapters skip the write when
 a key is already present in the backend, collapsing
@@ -623,9 +642,9 @@ the same backend type — same shape as the existing
 | `lmcache_mp.l1_memory_usage_bytes` | `lmcache_mp_l1_memory_usage_bytes` | ObservableGauge | `BaseL1Manager.get_memory_usage()` | Bytes currently held in L1 at scrape time |
 | `lmcache_mp.l1_staging_bytes` | `lmcache_mp_l1_staging_bytes` | ObservableGauge | `BaseL1Manager.get_staging_memory_usage()` | Bytes held by L1 staging objects (write-reserved, not yet admitted: in-flight stores and L2 prefetch loads) at scrape time; a subset of `l1_memory_usage_bytes` |
 | `lmcache_mp.l2_usage_bytes` | `lmcache_mp_l2_usage_bytes` | ObservableGauge (attr: `l2_name`) | `StorageManager.get_l2_usages()` (calls `L2AdapterInterface.get_usage().total_bytes_used`) | Per-adapter bytes currently held in L2 at scrape time; one observation per configured adapter.  Adapters whose `get_usage()` raises are skipped silently. |
-| `lmcache_mp.num_inflight_l2_stores` | `lmcache_mp_num_inflight_l2_stores` | ObservableGauge (attrs: `l2_name`, `adapter_index`) | `StoreController.get_inflight_count_by_adapter()` | Snapshot of in-flight L2 store tasks grouped by adapter |
-| `lmcache_mp.num_inflight_l2_loads` | `lmcache_mp_num_inflight_l2_loads` | ObservableGauge (attrs: `l2_name`, `adapter_index`) | `PrefetchController.get_inflight_load_state_by_adapter()` | Per-adapter count from the same snapshot |
-| `lmcache_mp.inflight_load_memory_usage_bytes` | `lmcache_mp_inflight_load_memory_usage_bytes` | ObservableGauge (attrs: `l2_name`, `adapter_index`) | `PrefetchController.get_inflight_load_state_by_adapter()` | Per-adapter reserved bytes from the same snapshot |
+| `lmcache_mp.num_inflight_l2_stores` | `lmcache_mp_num_inflight_l2_stores` | ObservableGauge (attrs: `l2_name`, `adapter_index`, `peer`) | `StoreController.get_inflight_count_by_adapter()` | Snapshot of in-flight L2 store tasks grouped by adapter |
+| `lmcache_mp.num_inflight_l2_loads` | `lmcache_mp_num_inflight_l2_loads` | ObservableGauge (attrs: `l2_name`, `adapter_index`, `peer`) | `PrefetchController.get_inflight_load_state_by_adapter()` | Per-adapter count from the same snapshot |
+| `lmcache_mp.inflight_load_memory_usage_bytes` | `lmcache_mp_inflight_load_memory_usage_bytes` | ObservableGauge (attrs: `l2_name`, `adapter_index`, `peer`) | `PrefetchController.get_inflight_load_state_by_adapter()` | Per-adapter reserved bytes from the same snapshot |
 
 **What `l1_memory_usage_bytes` answers:** How full is the L1 cache? Helps
 size L1 against working set and detect leaks (steadily climbing without

@@ -121,6 +121,8 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
     - store_timeout_s: deadline for a store before it counts as a failure.
     - write_l1_usage_threshold: used fraction of the local DRAM L1 at which
       the ``p2p`` store policy starts storing objects into this peer.
+    - peer_instance_id: the peer's coordinator instance id, set by the P2P
+      controller; labels this adapter's L2 metrics as ``peer``.
     """
 
     def __init__(
@@ -132,6 +134,7 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         write_enabled: bool = False,
         store_timeout_s: float = 10.0,
         write_l1_usage_threshold: float = 0.7,
+        peer_instance_id: str = "",
     ) -> None:
         super().__init__(peer_mq_server_url, lookup_timeout_s)
         self.peer_transfer_channel_server_url = peer_transfer_channel_server_url
@@ -139,6 +142,7 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         self.write_enabled = write_enabled
         self.store_timeout_s = store_timeout_s
         self.write_l1_usage_threshold = write_l1_usage_threshold
+        self.peer_instance_id = peer_instance_id
 
     @classmethod
     def from_dict(cls, d: dict) -> "P2PL2AdapterConfig":
@@ -203,6 +207,20 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
             "DRAM L1 at which the p2p store policy stores into this peer "
             "(optional, default 0.7)"
         )
+
+    def get_metric_attributes(self) -> dict[str, str]:
+        """Label this adapter's metrics with the peer it connects to.
+
+        The instance id, not the URL, is used: the P2P controller keys its
+        adapters by it and recreates an adapter when the peer's URL changes,
+        and it matches the peer's own ``service.instance.id``.
+
+        Returns:
+            ``{"peer": peer_instance_id}``, or ``{}`` when no id is set.
+        """
+        if not self.peer_instance_id:
+            return {}
+        return {"peer": self.peer_instance_id}
 
 
 def _unregister_from_notifier(fd: int) -> None:
