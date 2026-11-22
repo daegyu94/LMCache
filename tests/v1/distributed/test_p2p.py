@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import argparse
 
 # Third Party
@@ -24,6 +24,8 @@ from lmcache.v1.distributed.config import (
     L1MemoryManagerConfig,
     StorageManagerConfig,
 )
+from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2Adapter
 from lmcache.v1.distributed.p2p import P2PClient
 from lmcache.v1.mp_observability.config import ObservabilityConfig
 from lmcache.v1.multiprocess import server as server_module
@@ -34,8 +36,15 @@ from lmcache.v1.multiprocess.config import (
     add_p2p_args,
     parse_args_to_p2p_config,
 )
-from lmcache.v1.multiprocess.engine_module import modules_for_service
-from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
+from lmcache.v1.multiprocess.engine_module import (
+    ModuleBuildContext,
+    modules_for_service,
+)
+from lmcache.v1.multiprocess.modules.p2p_controller import (
+    P2PController,
+    _P2PState,
+    _PeerInstance,
+)
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.server import MPCacheServer
 from lmcache.v1.multiprocess.transport.grpc_impl import server_builder
@@ -300,3 +309,69 @@ def test_independent_peer_channel(
         worker_client.close()
         worker.close()
         engine.close()
+
+
+def test_peer_adapter_authenticates_with_server_key_files(
+    unused_tcp_port_factory: Callable[[], int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server configured only with ``--api-key-file`` builds peer adapters
+    whose lookup RPCs pass the peer's authentication."""
+    for name in ("LMCACHE_API_KEY", "LMCACHE_API_KEY_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    keys = [ObjectKey(b"chunk", "model", 0)]
+    layouts = {0: MemoryLayoutDesc([torch.Size([2, 4])], [torch.float16])}
+
+    class Peer(P2PController):
+        @request_handler(HandlerType.BLOCKING)
+        def p2p_lookup_and_lock(
+            self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
+        ) -> int:
+            return 7
+
+        @request_handler(HandlerType.BLOCKING)
+        def p2p_query_lookup_results(
+            self, task_id: int
+        ) -> list[TransferChannelAddress] | None:
+            return [TransferChannelAddress(offset=0, size=16)]
+
+    key_file = tmp_path / "key"
+    key_file.write_text("secret\n")
+    peer_port = unused_tcp_port_factory()
+    config = MPServerConfig(
+        transport="grpc",
+        host="127.0.0.1",
+        port=peer_port,
+        api_key_files=[str(key_file)],
+    )
+    peer = Peer(MagicMock(), P2PConfig(), CoordinatorConfig(), instance_id="peer")
+    peer_server = build_grpc_request_server([peer], config, rpc_client=P2PClient)
+    peer_server.start()
+
+    ctx = MagicMock()
+    controller = P2PController.create(
+        ModuleBuildContext(ctx, config, CoordinatorConfig())
+    )
+    assert isinstance(controller, P2PController)
+    controller._apply_state(
+        _P2PState.REGISTERED,
+        {
+            "peer": _PeerInstance(
+                instance_id="peer",
+                ip="127.0.0.1",
+                p2p_advertised_url="127.0.0.1:7600",
+                mq_port=peer_port,
+            )
+        },
+    )
+    adapter_config = ctx.storage_manager.add_l2_adapter.call_args.args[0]
+    with patch.object(p2p_l2_adapter, "get_transfer_channel_context"):
+        adapter = P2PL2Adapter(adapter_config)
+    try:
+        task_id = adapter.submit_lookup_and_lock_task(keys, layouts)
+        hits = adapter.query_lookup_and_lock_result(task_id)
+        assert hits is not None and hits.popcount() == 1
+    finally:
+        adapter.close()
+        peer_server.close(wait=True)

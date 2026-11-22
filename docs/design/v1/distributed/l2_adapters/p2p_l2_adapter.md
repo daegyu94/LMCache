@@ -273,7 +273,10 @@ store policy sends objects to this adapter (see
 The adapters the P2P controller creates for discovered peers take the three
 values from the server's P2P flags: `--enable-p2p-write`,
 `--p2p-store-timeout` and `--p2p-write-l1-usage-threshold`. Without
-`--enable-p2p-write` they do not write.
+`--enable-p2p-write` they do not write. They also carry the server's
+`--api-key-file` paths and send the first key on every peer RPC, because peers
+of one fleet accept the same keys. An adapter configured from JSON has no key
+files and authenticates through `LMCACHE_API_KEY` or `LMCACHE_API_KEY_FILE`.
 
 ## close()
 

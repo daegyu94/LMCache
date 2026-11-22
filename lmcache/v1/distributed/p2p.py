@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 # Standard
+from collections.abc import Sequence
 from typing import Any, Callable, TypeVar
 
 # Third Party
@@ -79,14 +80,21 @@ class P2PClient:
 
     Args:
         server_url: Peer endpoint using grpc:// or grpc+unix://.
-        api_key: Optional credential; shared environment sources apply if omitted.
+        api_key: Optional credential; takes precedence over ``key_files``.
+        key_files: The server's API key files; the first key is sent. Shared
+            environment sources apply if both are omitted.
 
     Raises:
         ValueError: The endpoint is not gRPC or the credential is invalid.
     """
 
-    def __init__(self, server_url: str, api_key: str | None = None) -> None:
-        key = load_request_client_api_key(api_key)
+    def __init__(
+        self,
+        server_url: str,
+        api_key: str | None = None,
+        key_files: Sequence[str] = (),
+    ) -> None:
+        key = load_request_client_api_key(api_key, key_files)
         channel: grpc.Channel = grpc.insecure_channel(
             parse_grpc_target(server_url),
             options=GRPC_CHANNEL_OPTIONS,
