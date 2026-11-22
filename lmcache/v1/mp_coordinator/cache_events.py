@@ -37,7 +37,11 @@ from lmcache.v1.mp_coordinator.api import (
 )
 from lmcache.v1.mp_coordinator.schemas import CacheEventsRequest
 from lmcache.v1.mp_observability.event import Event, EventType
-from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
+from lmcache.v1.mp_observability.event_bus import (
+    EventBus,
+    EventCallback,
+    EventSubscriber,
+)
 from lmcache.v1.mp_observability.trace.lifecycle import get_active_trace_recorder
 from lmcache.v1.mp_observability.trace.recorder import EventsTraceRecorder
 from lmcache.v1.multiprocess.config import (
@@ -537,6 +541,10 @@ class CacheEventSubscriber(EventSubscriber):
         # ahead of the write-finished events), used to stamp STORE
         # entries. LRU-bounded; a miss stamps nothing.
         self._token_bindings: OrderedDict[bytes, _ChunkTokens] = OrderedDict()
+        # Set by register(): bus drops before registration hid no event
+        # from this subscriber, so only later drops are reported.
+        self._bus: EventBus | None = None
+        self._bus_drops_at_register = 0
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         """Return the bus events this subscriber consumes."""
@@ -556,6 +564,16 @@ class CacheEventSubscriber(EventSubscriber):
             EventType.L1_EVICTION_LOOP_TICK: self._on_tick,
         }
 
+    def register(self, bus: EventBus) -> None:
+        """Subscribe to *bus* and count its queue drops as lost events.
+
+        Args:
+            bus: The event bus to subscribe to.
+        """
+        super().register(bus)
+        self._bus = bus
+        self._bus_drops_at_register = bus.dropped_events_count()
+
     def flush(self) -> None:
         """Drain the buffer and publish one batch per pending batch.
 
@@ -568,7 +586,7 @@ class CacheEventSubscriber(EventSubscriber):
         capacity = self._pending_capacity
         self._pending_capacity = None
         ts = time.time()
-        dropped_events = self._sink.dropped_events
+        dropped_events = self._dropped_events()
         # Declaration first, so a flush that also carries placements gives
         # the coordinator its denominator before the bytes it divides.
         batches = self._capacity_batches(capacity, ts, dropped_events)
@@ -616,7 +634,7 @@ class CacheEventSubscriber(EventSubscriber):
             capacity: The declaration to expand, or ``None`` for no
                 declaration this flush.
             ts: Emitter wall-clock seconds to stamp the batches with.
-            dropped_events: The sink's dropped-event count to stamp.
+            dropped_events: The dropped-event count to stamp.
 
         Returns:
             One batch per compartment, seq-numbered from the current
@@ -647,6 +665,17 @@ class CacheEventSubscriber(EventSubscriber):
         ``EventBus.stop()`` after the final drain."""
         self.flush()
         self._sink.close()
+
+    def _dropped_events(self) -> int:
+        """Return events lost by the sink plus events the bus discarded.
+
+        A full bus queue discards events of every type, not only the ones
+        this subscriber consumes, so the count errs toward reporting a gap.
+        """
+        bus_drops = 0
+        if self._bus is not None:
+            bus_drops = self._bus.dropped_events_count() - self._bus_drops_at_register
+        return self._sink.dropped_events + bus_drops
 
     # -- Event handlers (bus drain thread) ------------------------------------
 

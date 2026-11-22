@@ -96,8 +96,12 @@ One `CacheEventSubscriber` per MP-server process owns the buffer, the
   carries `dropped_events`: the cumulative number of entries this
   incarnation's sink failed to deliver (a refused or undelivered Kafka
   record, a failed HTTP post), read from `CacheEventSink.dropped_events`
-  when the batch is built. A loss is therefore reported by the next batch
-  that gets through. An HTTP request that timed out after the coordinator
+  when the batch is built, plus the events the event bus discarded
+  (`EventBus.dropped_events_count()`) since the subscriber registered. A
+  full bus queue discards events of every type, so a bus drop may flag a
+  gap that lost no placement; erring that way keeps the directory from
+  claiming a slice is complete when it is not. A loss is therefore
+  reported by the next batch that gets through. An HTTP request that timed out after the coordinator
   applied it is counted too, so the number is an upper bound. The field is
   optional on the wire (default `0`), so older emitters and trace files
   still parse.

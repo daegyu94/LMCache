@@ -205,9 +205,9 @@ class CacheEventBatch:
         dropped_events: Events (entries) this emitter incarnation had
             dropped before they reached the coordinator, as of when the
             batch was built: a full Kafka buffer, a failed delivery, a
-            failed HTTP post. Cumulative, so a loss is reported by the
-            next batch that does get through. ``0`` from emitters that do
-            not report it.
+            failed HTTP post, a full event-bus queue. Cumulative, so a
+            loss is reported by the next batch that does get through.
+            ``0`` from emitters that do not report it.
     """
 
     instance_id: str

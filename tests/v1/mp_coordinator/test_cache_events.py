@@ -42,6 +42,9 @@ from lmcache.v1.mp_coordinator.cache_events import (
     TraceCacheEventSink,
 )
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
+from lmcache.v1.mp_coordinator.ingest.event_broadcaster import CacheEventBroadcaster
+from lmcache.v1.mp_coordinator.ingest.event_gate import EventGate
+from lmcache.v1.mp_coordinator.persistence.quiesce import QuiesceLock
 from lmcache.v1.mp_coordinator.views.key_directory import KeyDirectory
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
@@ -633,6 +636,34 @@ def test_batches_before_any_loss_carry_no_dropped_events():
 
     [[batch]] = sink.published
     assert batch.dropped_events == 0
+
+
+def test_bus_queue_drops_after_registration_make_the_coordinator_flag_a_gap():
+    """An event the bus discarded never reaches the subscriber, so the
+    next batch must report it and the coordinator's gate must mark the
+    stream as incomplete. Drops before registration hid nothing."""
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+    # Not started, so the one-slot queue stays full and later publishes drop.
+    bus = EventBus(EventBusConfig(enabled=True, max_queue_size=1))
+    store = Event(
+        event_type=EventType.L1_WRITE_FINISHED,
+        metadata={"keys": [_key(1)], "meta": [_meta(100)]},
+    )
+    bus.publish(store)
+    bus.publish(store)
+    bus.register_subscriber(subscriber)
+    bus.publish(store)
+    assert bus.dropped_events_count() == 2
+
+    _dispatch(subscriber, store)
+    subscriber.flush()
+
+    [batches] = sink.published
+    assert [batch.dropped_events for batch in batches] == [1]
+    gate = EventGate(CacheEventBroadcaster(), QuiesceLock())
+    gate.ingest_batches(batches)
+    assert gate.stats().streams["node-a"].gap_detected is True
 
 
 def test_negative_flush_interval_rejected():
