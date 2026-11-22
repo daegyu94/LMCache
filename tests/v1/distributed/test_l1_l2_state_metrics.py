@@ -25,6 +25,9 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.l1_manager import create_l1_manager
 from lmcache.v1.distributed.l1_manager.base import BaseL1Manager
+from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
+    FaultInjectL2Adapter,
+)
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
@@ -47,8 +50,12 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
 )
 from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBusConfig, init_event_bus
 from lmcache.v1.mp_observability.subscribers.metrics.l2 import L2MetricsSubscriber
+from lmcache.v1.mp_observability.subscribers.metrics.l2_failures import (
+    L2FailureMetricsSubscriber,
+)
 
 # Importing this sets the process-wide MeterProvider with an
 # InMemoryMetricReader; controllers bind their instruments to it.
@@ -213,12 +220,14 @@ def l1_manager():
 
 @pytest.fixture
 def l2_metrics():
-    """Enable the global event bus with the L2 metrics subscriber.
-    Controllers pick up the bus when built, so build them after this."""
+    """Enable the global event bus with the L2 metrics and failure
+    subscribers, and yield it. Controllers pick up the bus when built, so
+    build them after this."""
     bus = init_event_bus(EventBusConfig(enabled=True))
     bus.register_subscriber(L2MetricsSubscriber())
+    bus.register_subscriber(L2FailureMetricsSubscriber())
     bus.start()
-    yield
+    yield bus
     bus.stop()
     init_event_bus(EventBusConfig(enabled=False))
 
@@ -527,3 +536,95 @@ class TestL2AdapterMetricLabels:
         ctrl.stop()
         for a in adapters:
             a.close()
+
+    def test_store_side_carries_peer(self, l1_manager, l2_metrics):
+        # Slow enough that the store is observably in flight.
+        adapter = make_adapter(bandwidth_gb=0.001)
+        peer = {"l2_name": "p2p", "peer": "peer-s"}
+        submitted: list[Event] = []
+        l2_metrics.subscribe(EventType.L2_STORE_SUBMITTED, submitted.append)
+        before = _value_for("lmcache_mp.l2_store_completed", peer)
+
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_p2p_descriptor(0, "peer-s")],
+            policy=DefaultStorePolicy([l1_manager]),
+        )
+        ctrl.start()
+        write_keys_to_l1(l1_manager, [make_object_key(600)], make_layout())
+
+        assert wait_for_condition(lambda: ctrl.get_inflight_stores_observations())
+        assert ctrl.get_inflight_stores_observations()[0][1] == {
+            **peer,
+            "adapter_index": 0,
+        }
+        assert wait_for_condition(
+            lambda: _value_for("lmcache_mp.l2_store_completed", peer) == before + 1
+        )
+        assert submitted[0].metadata["peer"] == "peer-s"
+
+        ctrl.stop()
+        adapter.close()
+
+    def test_load_side_carries_peer(self, l1_manager, l2_metrics):
+        # Slow enough that the load is observably in flight.
+        adapter = make_adapter(bandwidth_gb=0.001)
+        attrs = {"l2_name": "p2p", "peer": "peer-l", "adapter_index": 0}
+        submitted: list[Event] = []
+        l2_metrics.subscribe(EventType.L2_LOAD_TASK_SUBMITTED, submitted.append)
+        layout = make_layout()
+        keys = [make_object_key(700)]
+        store_keys_in_l2(adapter, keys, layout)
+
+        ctrl = PrefetchController(
+            l1_managers=[l1_manager],
+            l1_manager_descriptors=[make_l1_descriptor()],
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_p2p_descriptor(0, "peer-l")],
+            policy=BufferOnlyPrefetchPolicy(),
+        )
+        ctrl.start()
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys, layout))
+
+        assert wait_for_condition(lambda: ctrl.get_inflight_loads_observations())
+        assert ctrl.get_inflight_loads_observations()[0][1] == attrs
+        assert ctrl.get_inflight_load_bytes_observations()[0][1] == attrs
+        assert wait_for_condition(
+            lambda: ctrl.query_prefetch_result(req_id) is not None
+        )
+        assert wait_for_condition(lambda: bool(submitted))
+        assert submitted[0].metadata["peer"] == "peer-l"
+
+        l1_manager.finish_read(keys)
+        ctrl.stop()
+        adapter.close()
+
+    def test_not_found_failure_carries_peer(self, l1_manager, l2_metrics):
+        layout = make_layout()
+        keys = [make_object_key(800)]
+        inner = make_adapter()
+        store_keys_in_l2(inner, keys, layout)
+        # The key is found at lookup but its load fails.
+        adapter = FaultInjectL2Adapter(inner, rate=0.0, seed=0, gap_indices=(0,))
+        attrs = {"reason": "not_found", "model_name": "test_model", "peer": "peer-f"}
+        before = _value_for("lmcache_mp.l2_prefetch_failure", attrs)
+
+        ctrl = PrefetchController(
+            l1_managers=[l1_manager],
+            l1_manager_descriptors=[make_l1_descriptor()],
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_p2p_descriptor(0, "peer-f")],
+            policy=BufferOnlyPrefetchPolicy(),
+        )
+        ctrl.start()
+        req_id = ctrl.submit_prefetch_request(single_row_spec(keys, layout))
+        assert wait_for_condition(
+            lambda: ctrl.query_prefetch_result(req_id) is not None
+        )
+        assert wait_for_condition(
+            lambda: _value_for("lmcache_mp.l2_prefetch_failure", attrs) == before + 1
+        )
+
+        ctrl.stop()
+        adapter.close()
