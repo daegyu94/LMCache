@@ -84,13 +84,15 @@ static size_t effective_read_budget(int num_read_workers, size_t budget) {
 FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
                          size_t read_ahead_size, int num_read_workers,
-                         size_t read_max_bytes_in_flight)
+                         size_t read_max_bytes_in_flight,
+                         bool invalidate_failed_reads)
     : ConnectorBase(num_workers),
       base_path_(std::move(base_path)),
       relative_tmp_dir_(std::move(relative_tmp_dir)),
       use_odirect_(use_odirect),
       disk_block_size_(0),
       read_ahead_size_(read_ahead_size),
+      invalidate_failed_reads_(invalidate_failed_reads),
       read_max_bytes_in_flight_(
           effective_read_budget(num_read_workers, read_max_bytes_in_flight)) {
   if (num_read_workers < 0) {
@@ -175,6 +177,11 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
       n = read_all(fd, buf, len);
     }
     if (n != len) {
+      // Only a short read invalidates, never an errno: EIO can be
+      // transient (NFS, Lustre, FUSE, multipath); buffered reads report
+      // metadata corruption as EIO too; and unlinking a file with corrupt
+      // metadata shut XFS down in manual testing.
+      invalidate_if_unchanged(key, file_path, fd);
       throw std::runtime_error("incomplete read for " + file_path.string() +
                                ": expected " + std::to_string(len) + ", got " +
                                std::to_string(n));
@@ -250,6 +257,30 @@ bool FSConnector::do_single_delete(WorkerFSConn& conn, const std::string& key) {
   auto file_path = conn.base_path / filename;
   std::error_code ec;
   return std::filesystem::remove(file_path, ec);
+}
+
+bool FSConnector::take_invalidated(const std::string& key) {
+  std::lock_guard<std::mutex> lk(invalidated_mu_);
+  return invalidated_keys_.erase(key) > 0;
+}
+
+void FSConnector::invalidate_if_unchanged(const std::string& key,
+                                          const std::filesystem::path& path,
+                                          int fd) {
+  if (!invalidate_failed_reads_) {
+    return;
+  }
+  // Unlink only the inode that failed: a concurrent store may already have
+  // renamed a good copy over it.  A rename landing between stat() and
+  // unlink() is still removed, which costs one miss, never wrong bytes.
+  struct stat read_st, path_st;
+  if (::fstat(fd, &read_st) != 0 || ::stat(path.c_str(), &path_st) != 0 ||
+      read_st.st_dev != path_st.st_dev || read_st.st_ino != path_st.st_ino ||
+      ::unlink(path.c_str()) != 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(invalidated_mu_);
+  invalidated_keys_.insert(key);
 }
 
 // ---------------------------------------------------------------

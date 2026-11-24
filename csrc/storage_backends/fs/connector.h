@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -57,14 +58,21 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   // read_max_bytes_in_flight: bytes kept outstanding, connector-wide.
   //   Zero selects kDefaultReadMaxBytesInFlight when num_read_workers is
   //   positive.
+  // invalidate_failed_reads: unlink a file whose read comes up short, so
+  //   lookups miss it and the next store writes it anew.  Off for directories
+  //   other instances write to.
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
               size_t read_ahead_size = 0, int num_read_workers = 0,
-              size_t read_max_bytes_in_flight = 0);
+              size_t read_max_bytes_in_flight = 0,
+              bool invalidate_failed_reads = false);
   ~FSConnector() override;
 
   // The byte budget in force, or 0 when there is no read pool.
   size_t read_budget_bytes() const;
+
+  // Whether a failed read of `key` unlinked its file; clears the record.
+  bool take_invalidated(const std::string& key);
 
   // Dispatched directly to the read pool when one is configured, so lookups
   // and reads do not queue behind background writes on the shared workers.
@@ -136,12 +144,19 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   // held together with comp_mu_.
   void finish_key(std::unique_lock<std::mutex>& lk, PoolBatch& batch,
                   size_t idx, uint8_t ok);
+  // Unlinks `path` if it is still the file `fd` read and records `key` for
+  // take_invalidated(); no-op unless invalidate_failed_reads is set.
+  void invalidate_if_unchanged(const std::string& key,
+                               const std::filesystem::path& path, int fd);
 
   std::string base_path_;
   std::string relative_tmp_dir_;
   bool use_odirect_;
   size_t disk_block_size_;
   size_t read_ahead_size_;
+  bool invalidate_failed_reads_;
+  std::mutex invalidated_mu_;
+  std::unordered_set<std::string> invalidated_keys_;  // see take_invalidated
 
   // Read pool.  read_conns_ is sized once and never resized, so reader
   // references stay valid; read_max_bytes_in_flight_ is 0 without a pool

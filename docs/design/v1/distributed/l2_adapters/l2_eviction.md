@@ -53,6 +53,17 @@ The controller and each adapter communicate through two channels:
    keys from its storage and fires an `on_l2_keys_deleted` callback, which the
    bridge forwards to the policy so it removes them from its tracking state.
 
+An adapter may also report a key deleted outside `delete()` when its backend
+removed an entry that no reader can load. `fs_native` does this on its load
+path: a file that reads short is unlinked and `NativeConnectorL2Adapter` fires
+`on_l2_keys_deleted` for it. This ignores lookup locks on purpose: a lock
+promises that a key stays loadable, which a broken file cannot do, and other
+holders would fail their load anyway. Two races remain. A store that renames a
+good copy into place between the connector's identity check and its unlink
+loses that copy, which costs one miss. A re-store whose completion is handled
+before the invalidating load's completion leaves a live file that accounting
+and the policy no longer track until the key is stored again.
+
 ## Configuration
 
 Eviction is configured as an optional `"eviction"` sub-object in each adapter's

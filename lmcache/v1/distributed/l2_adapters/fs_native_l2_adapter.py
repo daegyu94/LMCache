@@ -226,6 +226,8 @@ def _create_fs_native_l2_adapter(
         config.read_ahead_size or 0,
         config.num_read_workers,
         config.read_max_bytes_in_flight,
+        # Another instance may be rewriting files in a shared directory.
+        not config.shared,
     )
     effective_read_budget = native_client.read_budget_bytes()
     logger.info(

@@ -69,6 +69,19 @@ I/O queue depth on a single Python thread.
    If unsure, start with ``use_odirect: false`` and confirm correctness
    before enabling ``O_DIRECT``.
 
+**Files that fail to load:** a load that reads fewer bytes than expected
+removes the file and reports the key as deleted to eviction and usage
+accounting.  Lookups then miss it and the next store of the key writes a new
+file; without this, a truncated file left by a crash would stay a lookup hit
+that fails every load.  The file is removed only if it is still the one that
+was read, so a copy a concurrent store renamed into place is kept, except in
+a window of microseconds that costs one miss.  A read that fails with an
+error, including ``EIO`` and filesystem corruption reports, fails only that
+load and keeps the file: ``EIO`` can be transient on network, FUSE and
+multipath storage, and removing a file with corrupt metadata can make XFS
+shut the filesystem down.  With ``"shared": true`` nothing is removed,
+because other instances write the directory.
+
 **Configuration examples:**
 
 .. code-block:: bash

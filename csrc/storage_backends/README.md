@@ -84,7 +84,10 @@ each step.
 
 Create your connector directory (e.g., `csrc/storage_backends/mybackend/`)
 and inherit from `ConnectorBase<YourConnectionType>`. You need to
-override 4 required methods (and optionally `do_single_delete` for eviction):
+override 4 required methods (and optionally `do_single_delete` for eviction).
+A connector that removes entries no reader can load may also bind
+`take_invalidated(key) -> bool` (see `fs/`): `NativeConnectorL2Adapter` calls it
+for each key whose load failed and reports the key deleted when it returns true.
 
 ```cpp
 // csrc/storage_backends/mybackend/connector.h

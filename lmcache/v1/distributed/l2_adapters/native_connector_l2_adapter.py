@@ -194,6 +194,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Delete capability detection
         self._has_delete = callable(getattr(native_client, "submit_batch_delete", None))
+        # Connectors that drop an entry whose read failed (fs_native) expose
+        # take_invalidated(key_string) so the drop is reported as a delete.
+        self._take_invalidated = getattr(native_client, "take_invalidated", None)
 
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
@@ -485,6 +488,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             keys_accessed: list[ObjectKey] = []
             keys_deleted: list[ObjectKey] = []
             sizes_deleted: list[int] = []
+            keys_invalidated: list[ObjectKey] = []
             # Events for synchronous ``delete()`` callers. We set these
             # AFTER firing ``_notify_keys_deleted`` below so that when
             # the caller unblocks and calls ``get_usage()``, the base
@@ -558,6 +562,17 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     bitmap.set(i)
                                     if lookup_keys is not None:
                                         loaded_keys.append(lookup_keys[i])
+                                elif (
+                                    self._take_invalidated is not None
+                                    and lookup_keys is not None
+                                    and self._take_invalidated(
+                                        _object_key_to_string(lookup_keys[i])
+                                    )
+                                ):
+                                    key = lookup_keys[i]
+                                    keys_invalidated.append(key)
+                                    sizes_deleted.append(self._key_sizes.pop(key, 0))
+                                    keys_deleted.append(key)
                         elif ok:
                             # Fallback for connectors that
                             # do not report per-key results
@@ -591,6 +606,11 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 self._notify_keys_stored(keys_stored, sizes_stored)
             if keys_accessed:
                 self._notify_keys_accessed(keys_accessed)
+            for key in keys_invalidated:
+                logger.warning(
+                    "Removed L2 entry %s: its load read short",
+                    key,
+                )
             if keys_deleted:
                 self._notify_keys_deleted(keys_deleted, sizes_deleted)
             # Unblock any synchronous ``delete()`` callers only AFTER
