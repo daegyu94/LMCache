@@ -655,3 +655,18 @@ def test_event_fds_are_pairwise_distinct(wrapper: SerdeL2AdapterWrapper) -> None
         wrapper.get_load_event_fd(),
     }
     assert len(fds) == 3
+
+
+def test_space_exhaustion_of_the_inner_adapter_is_reported(
+    l1: DramL1Manager,
+    inner: FakeInnerAdapter,
+    serde: FakeSerde,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = SerdeL2AdapterWrapper(inner, serde, l1)
+    try:
+        assert wrapper.space_exhausted_count() == 0
+        monkeypatch.setattr(inner, "space_exhausted_count", lambda: 3)
+        assert wrapper.space_exhausted_count() == 3
+    finally:
+        wrapper.close()

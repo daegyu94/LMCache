@@ -148,6 +148,24 @@ that adapter's `trigger_watermark`, the policy's
 `get_eviction_actions(eviction_ratio)` is called and the resulting keys are
 passed to `adapter.delete()`.
 
+An adapter whose free space can fragment (raw-block) may fail stores while
+usage is below the watermark. Its `space_exhausted_count()` counts stores
+rejected for lack of space that eviction could provide: free space split
+into short ranges, but also a full device whose salts are all under quotas
+that add up to more than the device. It never decreases, so any number of
+readers may poll it. When the count grew since the previous pass, the
+controller evicts anyway: one `eviction_ratio` round globally, or, with
+per-`cache_salt` quotas and no salt over its quota, one round from the salt
+that uses the largest share of its quota and has evictable (unlocked) data,
+so the others stay isolated. The salt is not necessarily the one whose store
+failed. Eviction stops as soon as stores fit; `report_status()` counts the
+rounds that freed bytes as `space_exhausted_rounds`. The base default is
+always 0, so other adapters keep usage-only eviction.
+
+`adapter.delete()` runs on the controller thread under `_states_lock`. For
+raw-block it writes nothing, except with `use_uring_cmd`, where it writes one
+header per deleted object before returning.
+
 ### Eviction Policy (`eviction_policy/`)
 
 The eviction policy is a pure data structure — it tracks keys and decides which
@@ -204,8 +222,12 @@ To support eviction in a new adapter:
    storage utilization as a fraction in [0, 1]. `projected` may equal `current`
    if in-flight deletions are not tracked.
 
+7. **Optionally override `space_exhausted_count()`** when stores can fail for lack
+   of contiguous space below the watermark; wrappers forward it to the inner
+   adapter.
+
 Adapters that do not support eviction (e.g., a remote adapter with unbounded
-capacity) can omit steps 2–6 and rely on the base class no-op defaults.
+capacity) can omit steps 2–7 and rely on the base class no-op defaults.
 
 ## Adapter Support Matrix
 
@@ -266,9 +288,10 @@ for each L2AdapterEvictionState:
   state.adapter.get_usage()
     → (current_usage, _)
     │
-    ├─ current_usage < watermark → skip this adapter
+    ├─ current_usage < watermark and space_exhausted_count() unchanged
+    │      → skip this adapter
     │
-    └─ current_usage ≥ watermark
+    └─ current_usage ≥ watermark, or space_exhausted_count() grew
          │
          ▼
     state.policy.get_eviction_actions(eviction_ratio)

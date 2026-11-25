@@ -586,6 +586,20 @@ class L2AdapterInterface(ABC):
             f"{type(self).__name__} does not implement list_l2_keys"
         )
 
+    def space_exhausted_count(self) -> int:
+        """Return how many stores have failed for lack of space so far.
+
+        An adapter whose free space can fragment counts stores that found no
+        room although evicting could make room, which can happen while usage
+        is below the eviction watermark. The eviction controller runs one
+        eviction round when the count grew since its previous pass. The count
+        never decreases, so any number of callers may read it.
+
+        Returns:
+            The count. The default is always 0: usage alone decides eviction.
+        """
+        return 0
+
     def get_usage(self) -> AdapterUsage:
         """
         Return the current L2 storage utilization as an ``AdapterUsage``.

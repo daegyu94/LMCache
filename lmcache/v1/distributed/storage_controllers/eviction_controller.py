@@ -6,6 +6,7 @@ from __future__ import annotations
 # Standard
 from abc import abstractmethod
 from collections import Counter
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 import threading
 import time
@@ -20,6 +21,7 @@ from lmcache.v1.distributed.internal_api import (
     EvictionAction,
     EvictionDestination,
     L1ManagerInterface,
+    L2AdapterListener,
 )
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
@@ -198,6 +200,31 @@ class L1EvictionController(EvictionController):
             self._l1_manager.delete(action.keys)
 
 
+class _DeletionTally(L2AdapterListener):
+    """Counts the keys an adapter reports deleted."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._total = 0
+
+    @property
+    def total(self) -> int:
+        """Keys deleted since registration."""
+        with self._lock:
+            return self._total
+
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]):
+        """Ignored."""
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]):
+        """Ignored."""
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+        """Count the deleted keys."""
+        with self._lock:
+            self._total += len(keys)
+
+
 class L2AdapterEvictionState:
     """Per-adapter eviction state: its own policy, listener, and config."""
 
@@ -213,6 +240,13 @@ class L2AdapterEvictionState:
         self.eviction_policy = CreateEvictionPolicy(eviction_config)
         self.listener = L2EvictionPolicy(self.eviction_policy)
         adapter.register_listener(self.listener)
+        # Keys the adapter actually deleted: delete() skips locked keys.
+        self.deleted = _DeletionTally()
+        adapter.register_listener(self.deleted)
+        # The adapter's space_exhausted_count() at the previous pass.
+        self.seen_space_exhausted_count = adapter.space_exhausted_count()
+        # Rounds run below the watermark because stores found no space.
+        self.space_exhausted_rounds = 0
 
 
 class L2EvictionController(StorageControllerInterface):
@@ -229,6 +263,13 @@ class L2EvictionController(StorageControllerInterface):
     Otherwise it uses the adapter's aggregate ``usage_fraction``
     against the configured watermark — unchanged from the pre-PR5
     behavior.
+
+    In both modes, an adapter whose ``space_exhausted_count()`` grew since
+    the previous pass (a store found no room although eviction could make
+    some) gets one ``eviction_ratio`` round below the watermark: globally,
+    or, when no salt is over its quota, from the salt using the largest
+    share of its quota that has evictable data. ``report_status()`` counts
+    the rounds that freed bytes as ``space_exhausted_rounds``.
     """
 
     def __init__(
@@ -292,6 +333,7 @@ class L2EvictionController(StorageControllerInterface):
                     "total_bytes_used": usage.total_bytes_used,
                     "total_capacity_bytes": usage.total_capacity_bytes,
                     "num_cache_salt_buckets": len(usage.bytes_by_cache_salt),
+                    "space_exhausted_rounds": state.space_exhausted_rounds,
                 }
             )
         return {
@@ -327,7 +369,9 @@ class L2EvictionController(StorageControllerInterface):
         # False`` should already have been filtered out at construction
         # time in ``StorageManager``; this check is a defensive belt.
         current_usage = state.adapter.get_usage().usage_fraction
-        if current_usage < 0 or current_usage < watermark:
+        # Fragmented free space can make stores fail below the watermark.
+        exhausted = self._space_exhausted_since_last_pass(state)
+        if current_usage < 0 or (current_usage < watermark and not exhausted):
             logger.debug(
                 "L2 usage %.2f below watermark %.2f; skipping eviction.",
                 current_usage,
@@ -335,14 +379,26 @@ class L2EvictionController(StorageControllerInterface):
             )
             return
 
-        logger.info(
-            "L2 usage %.2f above watermark %.2f; triggering eviction.",
-            current_usage,
-            watermark,
-        )
+        if current_usage >= watermark:
+            logger.info(
+                "L2 usage %.2f above watermark %.2f; triggering eviction.",
+                current_usage,
+                watermark,
+            )
+        else:
+            # Once per pass while stores fail; space_exhausted_rounds counts it.
+            logger.debug(
+                "L2 usage %.2f below watermark %.2f, but stores find no space; "
+                "triggering eviction.",
+                current_usage,
+                watermark,
+            )
+        deleted = state.deleted.total
         actions = state.eviction_policy.get_eviction_actions(eviction_ratio)
         for action in actions:
             self._execute_eviction_action(state.adapter, action)
+        if current_usage < watermark and state.deleted.total > deleted:
+            state.space_exhausted_rounds += 1
 
     def _check_and_evict_by_cache_salt(self, state: L2AdapterEvictionState):
         """Per-``cache_salt`` eviction driven by :class:`QuotaManager`.
@@ -360,11 +416,17 @@ class L2EvictionController(StorageControllerInterface):
         Adapters with non-trivial per-call overhead (NIXL handle setup,
         FS sync, etc.) see this as a real win when many salts go over
         budget in the same cycle.
+
+        When no salt is over budget but the adapter's stores found no space
+        since the previous pass, the salt using the largest share of its
+        quota gives up one round; if that frees nothing (its keys are
+        locked), the next salt in that order does.
         """
         assert self._quota_manager is not None
         watermark = state.eviction_config.trigger_watermark
         eviction_ratio = state.eviction_config.eviction_ratio
         usage = state.adapter.get_usage()
+        exhausted = self._space_exhausted_since_last_pass(state)
 
         # destination -> accumulated keys across all over-budget salts.
         pending: dict[EvictionDestination, list[ObjectKey]] = {}
@@ -397,11 +459,55 @@ class L2EvictionController(StorageControllerInterface):
             for action in actions:
                 pending.setdefault(action.destination, []).extend(action.keys)
 
+        deleted = state.deleted.total
         for destination, keys in pending.items():
             self._execute_eviction_action(
                 state.adapter,
                 EvictionAction(keys=keys, destination=destination),
             )
+
+        # Over-quota salts whose keys are all locked free nothing either.
+        if exhausted and state.deleted.total == deleted:
+            # Stores find no space although every salt is under its quota
+            # (free space split into short ranges, or quotas adding up to more
+            # than the device). One salt gives up a round, the closest to its
+            # quota whose eviction frees anything (locked keys are skipped),
+            # so the others stay isolated.
+            for cache_salt in self._salts_by_quota_share(usage.bytes_by_cache_salt):
+                deleted = state.deleted.total
+                for action in state.eviction_policy.get_eviction_actions(
+                    eviction_ratio, cache_salt=cache_salt
+                ):
+                    self._execute_eviction_action(state.adapter, action)
+                if state.deleted.total > deleted:
+                    state.space_exhausted_rounds += 1
+                    logger.debug(
+                        "L2 stores find no space below every quota; evicted "
+                        "ratio=%.2f from cache_salt=%r, the closest to its "
+                        "quota with evictable data.",
+                        eviction_ratio,
+                        cache_salt,
+                    )
+                    break
+
+    def _space_exhausted_since_last_pass(self, state: L2AdapterEvictionState) -> bool:
+        """Return whether a store found no space since the previous pass."""
+        count = state.adapter.space_exhausted_count()
+        grew = count > state.seen_space_exhausted_count
+        state.seen_space_exhausted_count = count
+        return grew
+
+    def _salts_by_quota_share(
+        self, bytes_by_cache_salt: Mapping[str, int]
+    ) -> list[str]:
+        """Return the salts with data and a quota, largest share of it first."""
+        assert self._quota_manager is not None
+        shares = []
+        for cache_salt, user_bytes in bytes_by_cache_salt.items():
+            limit = self._quota_manager.get_limit_bytes(cache_salt)
+            if user_bytes > 0 and limit > 0:
+                shares.append((user_bytes / limit, cache_salt))
+        return [cache_salt for _, cache_salt in sorted(shares, reverse=True)]
 
     def _execute_eviction_action(
         self, adapter: L2AdapterInterface, action: EvictionAction

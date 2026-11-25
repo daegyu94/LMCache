@@ -753,7 +753,11 @@ Source: ``lmcache/v1/distributed/config.py``
        (see :ref:`mp-http-quota-api`); a ``cache_salt`` with no
        registered quota has an effective limit of ``0`` bytes,
        so its data is evicted at the next eviction cycle
-       (allowlist semantics).
+       (allowlist semantics). On raw-block, when stores find no
+       room although no salt is above ``trigger_watermark``
+       times its quota (or the salts above it free nothing),
+       the salt using the largest share of its quota gives up
+       one round instead.
    * - ``--eviction-trigger-watermark``
      - ``0.8``
      - Memory usage ratio (0.0--1.0) that triggers eviction.

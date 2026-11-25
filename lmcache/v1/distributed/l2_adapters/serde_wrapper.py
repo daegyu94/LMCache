@@ -326,6 +326,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
     def get_usage(self) -> AdapterUsage:
         return self._inner.get_usage()
 
+    def space_exhausted_count(self) -> int:
+        """Return the inner adapter's count of stores that found no space."""
+        return self._inner.space_exhausted_count()
+
     def delete(self, keys: list[ObjectKey]) -> None:
         self._inner.delete(keys)
 

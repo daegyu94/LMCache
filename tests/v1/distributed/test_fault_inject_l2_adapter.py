@@ -252,5 +252,15 @@ def test_rate_drop_within_tolerance():
         adapter.close()
 
 
+def test_space_exhaustion_of_the_inner_adapter_is_reported(monkeypatch):
+    wrapper, inner = _make_adapter()
+    try:
+        assert wrapper.space_exhausted_count() == 0
+        monkeypatch.setattr(inner, "space_exhausted_count", lambda: 3)
+        assert wrapper.space_exhausted_count() == 3
+    finally:
+        wrapper.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

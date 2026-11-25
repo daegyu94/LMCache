@@ -1075,6 +1075,12 @@ does not reject writes — any over-budget ``cache_salt`` is evicted at
 the next eviction cycle (~1 s).
 A ``cache_salt`` with no registered quota has an effective limit of
 ``0`` bytes, so its data is cleared next cycle (allowlist semantics).
+Quotas bound each salt, they do not reserve space: on an L2 adapter whose
+stores can find no room although no salt is above ``trigger_watermark``
+times its quota (raw-block, when its free space is fragmented or the quotas
+add up to more than the device), the salt using the largest share of its
+quota that has unlocked data gives up one round, once per cycle in which
+stores failed.
 
 These endpoints are no-ops on engines that did not start with
 ``--eviction-policy IsolatedLRU``: the ``QuotaManager`` is still

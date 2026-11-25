@@ -262,6 +262,82 @@ class TestPolicyDispatch:
         # watermark → no eviction.
         assert after == before
 
+    def test_global_eviction_runs_below_the_watermark_when_space_is_exhausted(
+        self, isolated_lru_setup, monkeypatch
+    ):
+        """An adapter whose stores find no room below the watermark (free
+        space split into short ranges) still gets an eviction round."""
+        adapter, policy, _qm, _controller, state = isolated_lru_setup
+        # First Party
+        from lmcache.v1.distributed.eviction_policy.lru import (
+            LRUEvictionPolicy,
+        )
+
+        state.eviction_policy = LRUEvictionPolicy()
+        adapter.register_listener(L2EvictionPolicy(state.eviction_policy))
+        controller = L2EvictionController([state], quota_manager=None)
+        for i in range(4):
+            _store_sync(adapter, _key(i, "alice"), _memory_obj())
+        before = adapter.get_usage().total_bytes_used
+        assert adapter.get_usage().usage_fraction < 0.8
+
+        controller._check_and_evict(state)
+        assert adapter.get_usage().total_bytes_used == before
+
+        monkeypatch.setattr(adapter, "space_exhausted_count", lambda: 1)
+        controller._check_and_evict(state)
+        after = adapter.get_usage().total_bytes_used
+        assert after < before
+        # No store failed since that pass: no further round.
+        controller._check_and_evict(state)
+        assert adapter.get_usage().total_bytes_used == after
+        status = controller.report_status()["adapters"][0]
+        assert status["space_exhausted_rounds"] == 1
+
+    def test_only_the_salt_closest_to_its_quota_gives_up_a_round(
+        self, isolated_lru_setup, monkeypatch
+    ):
+        """Under per-salt quotas, a store that finds no space although every
+        salt is under its quota takes one round from the salt that uses the
+        largest share of its quota; the others keep their data."""
+        adapter, policy, qm, controller, state = isolated_lru_setup
+        qm.set_quota("alice", 10 << 20)
+        qm.set_quota("bob", 10 << 20)
+        for i in range(4):
+            _store_sync(adapter, _key(i, "alice"), _memory_obj())
+        for i in range(2):
+            _store_sync(adapter, _key(10 + i, "bob"), _memory_obj())
+        before = dict(adapter.get_usage().bytes_by_cache_salt)
+
+        monkeypatch.setattr(adapter, "space_exhausted_count", lambda: 1)
+        controller._check_and_evict(state)
+        after = dict(adapter.get_usage().bytes_by_cache_salt)
+        assert after["alice"] < before["alice"]
+        assert after["bob"] == before["bob"]
+        controller._check_and_evict(state)
+        assert dict(adapter.get_usage().bytes_by_cache_salt) == after
+        status = controller.report_status()["adapters"][0]
+        assert status["space_exhausted_rounds"] == 1
+
+    def test_exhausted_space_adds_no_round_when_a_salt_is_over_quota(
+        self, isolated_lru_setup, monkeypatch
+    ):
+        """A salt over its quota (bob has none) already gives up space this
+        pass; the salts under their quota keep theirs."""
+        adapter, policy, qm, controller, state = isolated_lru_setup
+        qm.set_quota("alice", 10 << 20)
+        for i in range(4):
+            _store_sync(adapter, _key(i, "alice"), _memory_obj())
+        _store_sync(adapter, _key(10, "bob"), _memory_obj())
+        before = dict(adapter.get_usage().bytes_by_cache_salt)
+
+        monkeypatch.setattr(adapter, "space_exhausted_count", lambda: 1)
+        controller._check_and_evict(state)
+        after = dict(adapter.get_usage().bytes_by_cache_salt)
+        assert after["alice"] == before["alice"]
+        assert after.get("bob", 0) < before["bob"]
+        assert controller.report_status()["adapters"][0]["space_exhausted_rounds"] == 0
+
     def test_isolated_lru_without_quota_manager_falls_through_to_global(
         self, isolated_lru_setup
     ):
