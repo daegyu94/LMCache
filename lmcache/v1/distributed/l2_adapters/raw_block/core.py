@@ -201,6 +201,8 @@ class _Inflight:
     # after that store's whole write, which may cover a hazard start in its
     # payload too.
     after_fence: bool = False
+    # The store whose fence this one was carved from.
+    carved_from: Optional["_Inflight"] = None
 
 
 @dataclass(slots=True)
@@ -767,12 +769,14 @@ class RawBlockCore:
                 header_first=inflight.header_first,
             )
 
+            settle: list[_Inflight] = []
             with self._lock:
-                entry = self._finish_write_locked(key.encoded, success)
+                entry = self._finish_write_locked(key.encoded, success, settle)
                 if entry is not None:
                     results[i] = True
                     stored_keys.append(key.encoded)
                     stored_bytes.append(entry.length)
+            self._settle_failed_writes(settle)
 
         return RawBlockPutManyResult(
             results=results,
@@ -1637,7 +1641,8 @@ class RawBlockCore:
             )
 
         # Build header/payload write entries outside the lock. Preparation
-        # failures happen before device submission and are isolated per key.
+        # failures happen before device submission and fail their key, with
+        # the stores carved from it or it from.
         assert self._io_engine is not None
         offsets: list[int] = []
         buffers: list[Any] = []
@@ -1651,8 +1656,9 @@ class RawBlockCore:
         prepared_plan: list[tuple[int, RawBlockKeySpec]] = []
         write_succeeded = True
         with ExitStack() as released_buffers:
+            prepared: dict[int, tuple[Any, int, Any, int, int]] = {}
+            failed_roots: set[int] = set()
             for i, key, obj, inflight, placement_id in write_plan:
-                offset = inflight.offset
                 try:
                     header_buf = released_buffers.enter_context(
                         self._io_engine.lease_buffer(self.header_bytes)
@@ -1675,13 +1681,31 @@ class RawBlockCore:
                         key.encoded,
                         e,
                     )
-                    with self._lock:
-                        self._finish_write_locked(key.encoded, False)
+                    failed_roots.add(id(inflight.carved_from or inflight))
                     continue
+                prepared[id(inflight)] = (
+                    header_buf,
+                    hdr_total,
+                    buf,
+                    payload_len,
+                    total_len,
+                )
+            # A store and those carved from its fence fail together: either
+            # alone would leave a hazard's later bytes written (or free for
+            # another store) while its first byte is not.
+            if failed_roots:
+                with self._lock:
+                    for _, key, _, inflight, _ in write_plan:
+                        if id(inflight.carved_from or inflight) in failed_roots:
+                            self._finish_write_locked(key.encoded, False)
 
-                # Queue the key only once every fallible step has succeeded, so a
-                # failed key never leaves a header behind for space that the
-                # rollback above just freed.
+            for i, key, obj, inflight, placement_id in write_plan:
+                if id(inflight.carved_from or inflight) in failed_roots:
+                    continue
+                header_buf, hdr_total, buf, payload_len, total_len = prepared[
+                    id(inflight)
+                ]
+                offset = inflight.offset
                 header = (offset, header_buf, hdr_total, hdr_total, placement_id)
                 if inflight.after_fence:
                     last.append(header)
@@ -1740,15 +1764,17 @@ class RawBlockCore:
 
         # Commit successful writes, or roll back submitted keys if the device
         # write failed.
+        settle: list[_Inflight] = []
         with self._lock:
             for i, key in prepared_plan:
-                entry = self._finish_write_locked(key.encoded, write_succeeded)
+                entry = self._finish_write_locked(key.encoded, write_succeeded, settle)
                 if entry is not None:
                     results[i] = True
                     stored_keys.append(key.encoded)
                     stored_bytes.append(entry.length)
             for i, encoded_key in batch_duplicates:
                 results[i] = encoded_key in self._index
+        self._settle_failed_writes(settle)
 
         return RawBlockPutManyResult(
             results=results, stored_keys=stored_keys, stored_bytes=stored_bytes
@@ -1882,11 +1908,13 @@ class RawBlockCore:
             after the fences of other writes were released.
         """
         length = self._alloc_len(payload_len)
-        carved = self._carve_locked(batch, length)
+        carved, source = self._carve_locked(batch, length)
         offset = carved
         if offset is None:
-            own = sum(1 for other in batch if other.fence is not None)
-            if self._fence_count > own:
+            # Only a caller that holds no fence waits: two batches each
+            # holding one and waiting for the other's would time out.
+            holds_fence = any(other.fence is not None for other in batch)
+            if self._fence_count and not holds_fence:
                 offset = self._allocate_locked(length, placement_id, count=False)
                 if offset is None:
                     # Space a write in flight holds back may be what this
@@ -1924,14 +1952,22 @@ class RawBlockCore:
         )
         if carved is not None:
             inflight.after_fence = True
+            inflight.carved_from = source
         elif self._hazards:
             self._guard_hazards_locked(inflight)
         self._inflight[key.encoded] = inflight
         return inflight
 
-    def _carve_locked(self, batch: Sequence[_Inflight], length: int) -> int | None:
+    def _carve_locked(
+        self, batch: Sequence[_Inflight], length: int
+    ) -> tuple[int | None, _Inflight | None]:
         """Take ``length`` bytes from the head of a fence in ``batch``, if one
-        is long enough."""
+        is long enough.
+
+        Returns:
+            The offset and the store whose fence it came from, or
+            ``(None, None)``.
+        """
         for other in batch:
             if other.fence is not None and other.fence[1] >= length:
                 start, fence_len = other.fence
@@ -1940,17 +1976,34 @@ class RawBlockCore:
                     self._fence_count -= 1
                 else:
                     other.fence = (start + length, fence_len - length)
-                return start
-        return None
+                return start, other
+        return None, None
 
-    def _finish_write_locked(self, encoded_key: str, success: bool) -> _Entry | None:
+    def _finish_write_locked(
+        self,
+        encoded_key: str,
+        success: bool,
+        settle: Optional[list[_Inflight]] = None,
+    ) -> _Entry | None:
         """Commit a finished write, or free its space if it failed or was cancelled.
+
+        Args:
+            encoded_key: The key written.
+            success: Whether the write succeeded.
+            settle: For a write that was submitted: a failed one that covered
+                hazards, or was carved from such a write's fence, is appended
+                here instead of being freed, for ``_settle_failed_writes``
+                once the lock is released.
 
         Returns:
             The committed entry, or None when nothing was committed.
         """
         inflight = self._inflight.pop(encoded_key, None)
         if inflight is None:
+            return None
+        covers_hazard = inflight.kills or inflight.carved_from is not None
+        if not success and covers_hazard and settle is not None:
+            settle.append(inflight)
             return None
         if inflight.fence is not None:
             self._free_locked(*inflight.fence, inflight.placement_id)
@@ -2268,14 +2321,63 @@ class RawBlockCore:
                     self._invalidation_failures += 1
                     self._retire_locked(offset, length, allocated=True)
 
+    def _settle_failed_writes(self, failed: Sequence[_Inflight]) -> None:
+        """Zero the headers of the hazards failed writes covered, then free
+        the writes' space, or retire it if zeroing fails too.
+
+        A failed request may have landed in part, so a hazard's later bytes
+        may have changed while its header still matches.
+        """
+        if not failed:
+            return
+        targets = [
+            (start, self.header_bytes, inflight.placement_id)
+            for inflight in failed
+            for start in inflight.kills
+        ]
+        zeroed = dict(
+            zip(
+                (start for start, _, _ in targets),
+                self._write_headers(targets),
+                strict=True,
+            )
+        )
+        with self._lock:
+            # A carved store goes with the store whose fence it came from
+            # (failed in the same batch).
+            safe = {
+                id(inflight): all(zeroed[start] for start in inflight.kills)
+                for inflight in failed
+                if inflight.carved_from is None
+            }
+            for inflight in failed:
+                spans = [(inflight.offset, inflight.length)]
+                if inflight.fence is not None:
+                    spans.append(inflight.fence)
+                    inflight.fence = None
+                    self._fence_count -= 1
+                source = inflight.carved_from or inflight
+                if safe.get(id(source), True):
+                    self._header_invalidations += len(inflight.kills)
+                    for start in inflight.kills:
+                        self._drop_hazard_locked(start)
+                    for offset, length in spans:
+                        self._free_locked(offset, length, inflight.placement_id)
+                else:
+                    self._invalidation_failures += 1
+                    for offset, length in spans:
+                        self._retire_locked(offset, length, allocated=True)
+            self._fence_released.notify_all()
+
     def _write_headers(
         self, ranges: Sequence[tuple[int, int, PlacementId]]
     ) -> list[bool]:
         """Zero the header block at the start of each range.
 
-        Used with io_uring_cmd only (see ``_zero_headers_on_delete``). Writes
-        go in batches of ``max_batch_size``; a batch with a failed request is
-        retried one request at a time.
+        Used by deletes with io_uring_cmd (see ``_zero_headers_on_delete``)
+        and after failed writes over hazards. Writes go in batches of
+        ``max_batch_size``; a batch with a failed request is retried one
+        request at a time.
 
         Returns:
             Whether each range's header was written, aligned with ``ranges``.
