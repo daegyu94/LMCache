@@ -416,7 +416,8 @@ def test_raw_block_l2_adapter_reports_exhausted_space_while_stores_find_none():
             adapter.delete([keys[0], keys[2]])
             assert adapter.get_usage().usage_fraction == 0.5
             assert adapter.space_exhausted_count() == 0
-            big = _create_memory_obj(size=3 * 1024, fill_value=9.0)  # 16 KiB object
+            # More than the free bytes, even split across the two holes.
+            big = _create_memory_obj(size=5 * 1024, fill_value=9.0)  # 24 KiB object
             assert _run_store(adapter, [_create_object_key(60)], [big]) is False
             # Usage stays truthful; only the eviction signal changes.
             assert adapter.get_usage().usage_fraction == 0.5

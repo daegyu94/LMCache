@@ -26,6 +26,8 @@ from tests.v1.distributed.test_raw_block_l2_adapter import (
 controller_logger = L2EvictionController.__module__
 SMALL = 8 * 1024  # header + one 1024-float payload
 N = 32
+# 4 KiB header + 68 KiB payload: nine holes, one more than an object may span.
+BIG_FLOATS = 17 * 1024
 
 
 def _adapter(tmp_path) -> RawBlockL2Adapter:
@@ -53,7 +55,7 @@ def _fill_and_punch(adapter: RawBlockL2Adapter) -> None:
 
 def _store_until_it_fits(adapter, controller, state, key) -> int:
     rounds = 0
-    while not _run_store(adapter, [key], [_create_memory_obj(4096)]):
+    while not _run_store(adapter, [key], [_create_memory_obj(BIG_FLOATS)]):
         controller._check_and_evict(state)
         rounds += 1
         assert rounds < 10
@@ -78,7 +80,8 @@ def test_a_store_that_finds_no_range_gets_eviction_below_the_watermark(tmp_path)
             adapter, controller, state, _create_object_key(99)
         )
         assert rounds >= 1
-        assert adapter.get_usage().total_bytes_used < used + 5 * SMALL
+        # Something was evicted to make room for the nine-hole object.
+        assert adapter.get_usage().total_bytes_used < used + 9 * SMALL
         status = controller.report_status()["adapters"][0]
         assert status["space_exhausted_rounds"] == rounds
     finally:
@@ -195,7 +198,7 @@ def test_a_round_that_frees_nothing_is_not_counted(tmp_path):
         _run_lookup(adapter, alice)
         used = adapter.get_usage().total_bytes_used
         assert not _run_store(
-            adapter, [_create_object_key(99)], [_create_memory_obj(4096)]
+            adapter, [_create_object_key(99)], [_create_memory_obj(BIG_FLOATS)]
         )
         controller._check_and_evict(state)
         assert adapter.get_usage().total_bytes_used == used

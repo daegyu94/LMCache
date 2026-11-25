@@ -244,12 +244,15 @@ def test_crash_at_any_point_never_returns_bytes_of_another_write(
 
 @ENGINE_PARAMS
 @pytest.mark.parametrize("seed", [1, 2])
+# 256 KiB: stores often split, and loaded split entries are listed by both
+# containers, so their deletes zero headers.
+@pytest.mark.parametrize("data_kib", [640, 256])
 def test_second_crash_after_recovering_from_a_first_one(
-    tmp_path, engine, odirect, seed
+    tmp_path, engine, odirect, seed, data_kib
 ):
     """Crash, recover (possibly past a torn checkpoint copy, with loaded
     entries listed by both containers), run again and crash again."""
-    config = _config(tmp_path, engine, 640 * 1024, odirect)
+    config = _config(tmp_path, engine, data_kib * 1024, odirect)
     versions: dict[int, list[bytes]] = {}
     vcount = itertools.count(seed * 1_000_000)
     rng = random.Random(seed)
@@ -472,3 +475,36 @@ def test_a_store_waiting_for_a_fence_yields_to_a_store_of_the_same_key(tmp_path)
     finally:
         release.set()
         core.close()
+
+
+@ENGINE_PARAMS
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_split_objects_crash_at_any_point_never_return_bytes_of_another_write(
+    tmp_path, engine, odirect, seed
+):
+    """The same workload on a device a third the size: stores often find no
+    single free range and split across several, and deletes of split objects
+    a checkpoint lists zero their headers while the others stay hazards."""
+    config = _config(tmp_path, engine, 256 * 1024, odirect)
+    versions: dict[int, list[bytes]] = {}
+    vcount = itertools.count(seed * 1_000_000)
+    core = RawBlockCore(config)
+    base = Path(config.device_path).read_bytes()
+    log = _run_workload(core, versions, vcount, seed)
+    status = core.report_status()
+    core.close()
+    assert status["multi_extent_alloc_count"] > 5, status
+    assert status["header_invalidation_count"] > 0, status
+
+    last = max(c["end"] for c in log.calls)
+    rng = random.Random(seed)
+    bad: list[str] = []
+    total = 0
+    for t in sorted(rng.sample(range(1, last + 1), min(60, last))):
+        for _ in range(3):
+            Path(config.device_path).write_bytes(log.image(base, t, rng))
+            loaded, b = _check_recovery(config, versions, f"t={t}")
+            total += loaded
+            bad += b
+    assert total > 20, total
+    assert not bad, bad[:10]

@@ -25,6 +25,7 @@ import torch
 # First Party
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.l2_adapters.raw_block.extent_allocator import (
+    Extent,
     ExtentAllocator,
 )
 from lmcache.v1.distributed.l2_adapters.raw_block.io_engine import (
@@ -58,8 +59,12 @@ _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
 _MAX_PUT_MANY_IO_URING_BATCH_KEYS = 64
 _MAX_FIXED_BUFFER_REGION_BYTES = 1 << 30
 # Checkpoint payload format. Version 1 is the fixed-slot layout; it is still
-# accepted on load and converted.
+# accepted on load and converted. Version 3 is written only when the checkpoint
+# lists an object split across several extents: a binary that knows only
+# version 2 then rejects the whole checkpoint and starts empty, instead of
+# trusting a split object's header while it reuses the object's later extents.
 _CHECKPOINT_FORMAT_VERSION = 2
+_CHECKPOINT_SPLIT_FORMAT_VERSION = 3
 # The first data block holds this marker. A fixed-slot binary that does not
 # understand format 2 starts empty and writes its first object at that block,
 # so a missing marker means such a run reused the space (see
@@ -74,6 +79,12 @@ os.register_at_fork(after_in_child=_GENERATION_RNG.seed)
 # A header block that was read but holds no valid header (e.g. invalidated),
 # as opposed to None: the read itself failed.
 _NO_HEADER = (0, 0, 0)
+# Most extents one object may span when no single free extent fits it. Each
+# extent costs one more I/O request; past this the store fails instead. In a
+# simulation at watermark 0.95 store failures stop falling beyond 8 (several
+# models: 11 % at 1, 1.2 % at 4, 0.9 % at 8 and at 16), while split objects
+# and their extent counts keep growing (see the design doc).
+_MAX_EXTENTS_PER_OBJECT = 8
 
 # Slot-header validation issues many small pread calls during POSIX restart
 # recovery. Use a conservative reader count to expose device parallelism without
@@ -96,16 +107,24 @@ def _without_overlaps(
     A consistent checkpoint never has overlapping entries, so an overlap means
     corruption and neither entry can be trusted.
     """
-    order = sorted(range(len(entries)), key=lambda i: entries[i][1].offset)
+    spans = sorted(
+        (start, start + length, i)
+        for i, (_, entry) in enumerate(entries)
+        for start, length in _extents_of(entry)
+    )
     bad: set[int] = set()
     reach_end, reach_idx = -1, -1
-    for i in order:
-        entry = entries[i][1]
-        if entry.offset < reach_end:
+    for start, end, i in spans:
+        if start < reach_end:
             bad.update((i, reach_idx))
-        if entry.offset + entry.length > reach_end:
-            reach_end, reach_idx = entry.offset + entry.length, i
+        if end > reach_end:
+            reach_end, reach_idx = end, i
     return [item for i, item in enumerate(entries) if i not in bad]
+
+
+def _extents_of(item: "_Entry | _Inflight") -> tuple[Extent, ...]:
+    """Return an object's extents, header first."""
+    return item.extents or ((item.offset, item.length),)
 
 
 def round_up(x: int, align: int) -> int:
@@ -181,6 +200,9 @@ class _Entry:
     generation: int = 0
     # Bit i set: metadata container i may list this entry (see _Hazard).
     listed: int = 0
+    # Set only for an object split across several extents, header first
+    # (``offset`` is then the first one's start); None means one extent.
+    extents: tuple[Extent, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -193,14 +215,16 @@ class _Inflight:
     generation: int = 0
     # Starts of the hazards this write covers; it kills them by succeeding.
     kills: tuple[int, ...] = ()
-    # Free bytes of those hazards past this object, held until the write ends.
-    fence: tuple[int, int] | None = None
+    # Free bytes of those hazards past this object's extents, held until the
+    # write ends.
+    fences: tuple[tuple[int, int], ...] = ()
     # A hazard starts inside the header request: write the header first.
     header_first: bool = False
     # Carved from a fence of an earlier store in the same batch: written
     # after that store's whole write, which may cover a hazard start in its
     # payload too.
     after_fence: bool = False
+    extents: tuple[Extent, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -346,6 +370,7 @@ class RawBlockCore:
         self._fdp_slot_affinity_hit_count: int = 0
         self._fdp_slot_affinity_fallback_count: int = 0
         self._alloc_failure_count: int = 0
+        self._multi_extent_alloc_count: int = 0
         # Stores that found no free range long enough although one could be
         # freed; free bytes may be below the watermark (space_exhausted_count).
         self._space_exhausted_count: int = 0
@@ -679,6 +704,20 @@ class RawBlockCore:
             entry = self._index.get(encoded_key)
             return None if entry is None else int(entry.offset)
 
+    def entry_extents(self, encoded_key: str) -> list[Extent] | None:
+        """Return the device extents of an indexed key's object, header first.
+
+        Args:
+            encoded_key: Encoded raw-block key string.
+
+        Returns:
+            ``(offset, length)`` per extent, or None when the key is not
+            indexed.
+        """
+        with self._lock:
+            entry = self._index.get(encoded_key)
+            return None if entry is None else list(_extents_of(entry))
+
     def metadata_container_offsets(self) -> list[int]:
         """Return checkpoint metadata container offsets in bytes."""
         return self._meta_container_offsets()
@@ -761,7 +800,7 @@ class RawBlockCore:
             success = self._write_one(
                 key,
                 obj,
-                inflight.offset,
+                _extents_of(inflight),
                 inflight.generation,
                 placement_id=placement_id,
                 header_first=inflight.header_first,
@@ -905,11 +944,19 @@ class RawBlockCore:
                         read_buffer = buf
                         read_payload_len = payload_len
 
-                    read_indices.append(i)
-                    read_offsets.append(entry.offset + self.header_bytes)
-                    read_buffers.append(read_buffer)
-                    read_payload_lens.append(read_payload_len)
-                    read_total_lens.append(total_len)
+                    for (
+                        offset,
+                        buffer,
+                        request_len,
+                        request_total,
+                    ) in self._payload_segments(
+                        _extents_of(entry), read_buffer, read_payload_len, total_len
+                    ):
+                        read_indices.append(i)
+                        read_offsets.append(offset)
+                        read_buffers.append(buffer)
+                        read_payload_lens.append(request_len)
+                        read_total_lens.append(request_total)
                 except Exception as e:
                     logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
 
@@ -930,8 +977,13 @@ class RawBlockCore:
                 if unrecovered_reads:
                     removed = []
                     with self._lock:
-                        for read_idx, error in unrecovered_reads.items():
-                            key, entry = items[read_indices[read_idx]]
+                        # One failed segment quarantines its whole object, once.
+                        failed_items = {
+                            read_indices[read_idx]: error
+                            for read_idx, error in unrecovered_reads.items()
+                        }
+                        for item_idx, error in failed_items.items():
+                            key, entry = items[item_idx]
                             assert entry is not None
                             removed.extend(self._quarantine_locked(key, entry, error))
                     if on_quarantine is not None:
@@ -942,8 +994,12 @@ class RawBlockCore:
                     self._log_worker_error_once(worker_error)
                     return results
 
+                # A key is a hit only if every one of its segments was read.
+                item_ok: dict[int, bool] = {}
+                for item_idx, ok in zip(read_indices, io_results, strict=True):
+                    item_ok[item_idx] = item_ok.get(item_idx, True) and bool(ok)
                 with self._lock:
-                    for item_idx, ok in zip(read_indices, io_results, strict=True):
+                    for item_idx, ok in item_ok.items():
                         key, entry = items[item_idx]
                         if ok and entry is not None and self._index.get(key) is entry:
                             objs[
@@ -1005,9 +1061,11 @@ class RawBlockCore:
         Nothing is written. A metadata container may still list a deleted
         object, and recovery checks only its header, so its space is freed as
         a hazard (see ``_Hazard``): a later store writes over its first byte
-        before any other byte of it. With io_uring_cmd the header is zeroed
-        first instead, and a range whose header write fails is retired like a
-        quarantined one. In-flight writes of the keys are cancelled.
+        before any other byte of it. With io_uring_cmd, and for a split object
+        a container may list, the header is zeroed first instead (one
+        ``header_bytes`` write), and an object whose header write fails is
+        retired like a quarantined one. In-flight writes of the keys are
+        cancelled.
 
         Args:
             encoded_keys: Ordered encoded raw-block keys to delete.
@@ -1020,7 +1078,7 @@ class RawBlockCore:
             cancelled, or None when nothing was deleted.
         """
         sizes: list[int | None] = []
-        invalidate: list[tuple[int, int, PlacementId]] = []
+        invalidate: list[tuple[tuple[Extent, ...], PlacementId]] = []
         with self._lock:
             for encoded_key in encoded_keys:
                 locked = self._lock_refcnt.get(encoded_key, 0) > 0
@@ -1034,13 +1092,14 @@ class RawBlockCore:
                     inflight.canceled = True
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    if self._zero_headers_on_delete:
+                    # A split object listed by a checkpoint gets its header
+                    # zeroed: a hazard per extent could not make a store over a
+                    # later extent wait for the header extent's start.
+                    if self._zero_headers_on_delete or (
+                        removed_entry.extents and removed_entry.listed
+                    ):
                         invalidate.append(
-                            (
-                                removed_entry.offset,
-                                removed_entry.length,
-                                removed_entry.placement_id,
-                            )
+                            (_extents_of(removed_entry), removed_entry.placement_id)
                         )
                     else:
                         self._release_locked(removed_entry)
@@ -1150,6 +1209,7 @@ class RawBlockCore:
                 "largest_free_extent_bytes": self._allocator.largest_free_extent,
                 "alloc_failure_count": self._alloc_failure_count,
                 "space_exhausted_count": self._space_exhausted_count,
+                "multi_extent_alloc_count": self._multi_extent_alloc_count,
                 "quarantined_bytes": self._retired_bytes,
                 "quarantined_range_count": len(self._retired),
                 "header_invalidation_count": self._header_invalidations,
@@ -1319,6 +1379,54 @@ class RawBlockCore:
         except Exception:
             return None
 
+    def _payload_segments(
+        self,
+        extents: Sequence[Extent],
+        buf: Any,
+        payload_len: int,
+        total_len: int,
+    ) -> list[tuple[int, Any, int, int]]:
+        """Split one object's payload I/O across its extents.
+
+        The payload starts after the header in the first extent and continues
+        through the later extents in order. Every extent and the header are
+        block multiples, so each segment starts block-aligned on the device and
+        in ``buf``; only the last segment carries padding.
+
+        Args:
+            extents: The object's extents, header first.
+            buf: Payload buffer, at least ``payload_len`` long; it may extend
+                to ``total_len`` when it covers the padding.
+            payload_len: Valid bytes in ``buf``.
+            total_len: Payload I/O length including padding.
+
+        Returns:
+            ``(device_offset, buffer_view, payload_len, total_len)`` per segment,
+            in the form the I/O engine takes for one request.
+        """
+        if len(extents) == 1:
+            # The common case: one payload request, as before splitting.
+            return [(extents[0][0] + self.header_bytes, buf, payload_len, total_len)]
+        view = memoryview(buf)
+        segments: list[tuple[int, Any, int, int]] = []
+        pos = 0
+        for index, (offset, length) in enumerate(extents):
+            skip = self.header_bytes if index == 0 else 0
+            seg_total = min(length - skip, total_len - pos)
+            if seg_total <= 0:
+                continue
+            seg_payload = max(0, min(seg_total, payload_len - pos))
+            segments.append(
+                (
+                    offset + skip,
+                    view[pos : min(len(view), pos + seg_total)],
+                    seg_payload,
+                    seg_total,
+                )
+            )
+            pos += seg_total
+        return segments
+
     def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
         """Prepare the payload buffer and lengths for a raw-block write.
 
@@ -1409,18 +1517,18 @@ class RawBlockCore:
         self,
         key: RawBlockKeySpec,
         memory_obj: MemoryObj,
-        offset: int,
+        extents: Sequence[Extent],
         generation: int,
         *,
         placement_id: PlacementId = None,
         header_first: bool = False,
     ) -> bool:
-        """Write one object header and payload at its allocated offset.
+        """Write one object header and payload into its allocated extents.
 
         Args:
             key: Raw-block key spec with the slot-header identity.
             memory_obj: Source object to write.
-            offset: Byte offset of the object's allocation on the raw device.
+            extents: The object's extents on the raw device, header first.
             generation: The write's generation, stored in the header.
             placement_id: FDP placement identifier for this raw-block write.
                 ``None`` omits the directive; explicit identifier 0 is rejected.
@@ -1447,6 +1555,9 @@ class RawBlockCore:
                     else self.header_bytes
                 )
 
+                requests = [(extents[0][0], header_buf, hdr_total, hdr_total)]
+                requests += self._payload_segments(extents, buf, payload_len, total_len)
+                offsets, buffers, payload_lens, total_lens = zip(*requests, strict=True)
                 with self._lock:
                     self._inflight_io_count += 1
                 try:
@@ -1454,26 +1565,26 @@ class RawBlockCore:
                     # as its payload; future policy can split them if needed.
                     if header_first and self.io_engine != "posix":
                         self._write_buffers(
-                            [offset],
-                            [header_buf],
-                            [hdr_total],
-                            [hdr_total],
+                            offsets[:1],
+                            buffers[:1],
+                            payload_lens[:1],
+                            total_lens[:1],
                             [placement_id],
                         )
                         self._write_buffers(
-                            [offset + self.header_bytes],
-                            [buf],
-                            [payload_len],
-                            [total_len],
-                            [placement_id],
+                            offsets[1:],
+                            buffers[1:],
+                            payload_lens[1:],
+                            total_lens[1:],
+                            [placement_id] * (len(requests) - 1),
                         )
                     else:
                         self._write_buffers(
-                            [offset, offset + self.header_bytes],
-                            [header_buf, buf],
-                            [hdr_total, payload_len],
-                            [hdr_total, total_len],
-                            [placement_id, placement_id],
+                            offsets,
+                            buffers,
+                            payload_lens,
+                            total_lens,
+                            [placement_id] * len(requests),
                         )
                 finally:
                     with self._lock:
@@ -1652,7 +1763,6 @@ class RawBlockCore:
         write_succeeded = True
         with ExitStack() as released_buffers:
             for i, key, obj, inflight, placement_id in write_plan:
-                offset = inflight.offset
                 try:
                     header_buf = released_buffers.enter_context(
                         self._io_engine.lease_buffer(self.header_bytes)
@@ -1682,7 +1792,16 @@ class RawBlockCore:
                 # Queue the key only once every fallible step has succeeded, so a
                 # failed key never leaves a header behind for space that the
                 # rollback above just freed.
-                header = (offset, header_buf, hdr_total, hdr_total, placement_id)
+                header = (
+                    inflight.offset,
+                    header_buf,
+                    hdr_total,
+                    hdr_total,
+                    placement_id,
+                )
+                # Phase 1: everything else; phase 2 (later): payloads whose
+                # header must land first; phase 3 (last): stores carved from a
+                # fence of an earlier store, which are never split.
                 if inflight.after_fence:
                     last.append(header)
                 else:
@@ -1691,23 +1810,19 @@ class RawBlockCore:
                     payload_lens.append(header[2])
                     total_lens.append(header[3])
                     write_placement_ids.append(header[4])
-                payload = (
-                    offset + self.header_bytes,
-                    buf,
-                    payload_len,
-                    total_len,
-                    placement_id,
-                )
-                if inflight.after_fence:
-                    last.append(payload)
-                elif inflight.header_first:
-                    later.append(payload)
-                else:
-                    offsets.append(payload[0])
-                    buffers.append(payload[1])
-                    payload_lens.append(payload[2])
-                    total_lens.append(payload[3])
-                    write_placement_ids.append(payload[4])
+                for segment in self._payload_segments(
+                    _extents_of(inflight), buf, payload_len, total_len
+                ):
+                    if inflight.after_fence:
+                        last.append((*segment, placement_id))
+                    elif inflight.header_first:
+                        later.append((*segment, placement_id))
+                    else:
+                        offsets.append(segment[0])
+                        buffers.append(segment[1])
+                        payload_lens.append(segment[2])
+                        total_lens.append(segment[3])
+                        write_placement_ids.append(placement_id)
                 prepared_plan.append((i, key))
 
             if prepared_plan:
@@ -1883,12 +1998,14 @@ class RawBlockCore:
         """
         length = self._alloc_len(payload_len)
         carved = self._carve_locked(batch, length)
-        offset = carved
-        if offset is None:
-            own = sum(1 for other in batch if other.fence is not None)
+        extents: tuple[Extent, ...] | None = (
+            None if carved is None else ((carved, length),)
+        )
+        if extents is None:
+            own = sum(len(other.fences) for other in batch)
             if self._fence_count > own:
-                offset = self._allocate_locked(length, placement_id, count=False)
-                if offset is None:
+                extents = self._allocate_locked(length, placement_id, count=False)
+                if extents is None:
                     # Space a write in flight holds back may be what this
                     # store needs; it is released when that write ends.
                     self._fence_released.wait(timeout=1.0)
@@ -1900,12 +2017,13 @@ class RawBlockCore:
                         or key.encoded in self._inflight
                     ):
                         return None
-                    offset = self._allocate_locked(length, placement_id)
+                    extents = self._allocate_locked(length, placement_id)
             else:
-                offset = self._allocate_locked(length, placement_id)
-        if offset is None:
+                extents = self._allocate_locked(length, placement_id)
+        if extents is None:
             self._warn_no_space_locked(length)
             return None
+        offset = extents[0][0]
         meta = DiskCacheMetadata(
             path=f"{self.device_path}@{offset}",
             size=payload_len,
@@ -1921,6 +2039,7 @@ class RawBlockCore:
             meta=meta,
             placement_id=placement_id,
             generation=_GENERATION_RNG.getrandbits(64) | 1,
+            extents=extents if len(extents) > 1 else None,
         )
         if carved is not None:
             inflight.after_fence = True
@@ -1933,13 +2052,15 @@ class RawBlockCore:
         """Take ``length`` bytes from the head of a fence in ``batch``, if one
         is long enough."""
         for other in batch:
-            if other.fence is not None and other.fence[1] >= length:
-                start, fence_len = other.fence
+            for k, (start, fence_len) in enumerate(other.fences):
+                if fence_len < length:
+                    continue
+                rest = other.fences[:k] + other.fences[k + 1 :]
                 if fence_len == length:
-                    other.fence = None
                     self._fence_count -= 1
                 else:
-                    other.fence = (start + length, fence_len - length)
+                    rest = (*rest, (start + length, fence_len - length))
+                other.fences = rest
                 return start
         return None
 
@@ -1952,9 +2073,10 @@ class RawBlockCore:
         inflight = self._inflight.pop(encoded_key, None)
         if inflight is None:
             return None
-        if inflight.fence is not None:
-            self._free_locked(*inflight.fence, inflight.placement_id)
+        for fence in inflight.fences:
+            self._free_locked(*fence, inflight.placement_id)
             self._fence_count -= 1
+        if inflight.fences:
             self._fence_released.notify_all()
         if success:
             # The write is on the device, also when cancelled: the bytes of the
@@ -1963,7 +2085,8 @@ class RawBlockCore:
                 self._drop_hazard_locked(start)
         if inflight.canceled or not success:
             # A header it left carries a generation no checkpoint lists.
-            self._free_locked(inflight.offset, inflight.length, inflight.placement_id)
+            for offset, length in _extents_of(inflight):
+                self._free_locked(offset, length, inflight.placement_id)
             return None
         self._meta_dirty_total += 1
         entry = _Entry(
@@ -1973,18 +2096,21 @@ class RawBlockCore:
             meta=inflight.meta,
             placement_id=inflight.placement_id,
             generation=inflight.generation,
+            extents=inflight.extents,
         )
         self._index[encoded_key] = entry
         return entry
 
     def _allocate_locked(
         self, nbytes: int, placement_id: PlacementId, *, count: bool = True
-    ) -> int | None:
+    ) -> tuple[Extent, ...] | None:
         """Allocate ``nbytes`` of device space while ``self._lock`` is held.
 
         With FDP slot affinity, a free range of exactly ``nbytes`` last written
         with the same placement identifier is preferred. Affinity counters
-        count only allocations of space written before.
+        count only allocations of space written before. When no single free
+        range is long enough, up to ``_MAX_EXTENTS_PER_OBJECT`` ranges serve
+        it, the first long enough for the header; affinity does not apply.
 
         Args:
             nbytes: Bytes to allocate.
@@ -1993,17 +2119,25 @@ class RawBlockCore:
                 space_exhausted_count); false for an attempt that is retried.
 
         Returns:
-            The offset, or None when no free range is long enough.
+            The extents, header first, or None when no free space can hold
+            ``nbytes``.
         """
         assert self._allocator is not None
         tag = placement_id if self.fdp_slot_affinity_enabled else None
         hit = tag is not None and self._allocator.has_tagged_extent(nbytes, tag)
         offset = self._allocator.allocate(nbytes, tag=tag)
         if offset is None:
+            split = self._allocator.allocate_extents(
+                nbytes, _MAX_EXTENTS_PER_OBJECT, min_first=self.header_bytes
+            )
+            if split is not None:
+                self._multi_extent_alloc_count += 1
+                self._high_water = max(self._high_water, *(o + n for o, n in split))
+                return tuple(split)
             if not count:
                 return None
             self._alloc_failure_count += 1
-            if nbytes <= self._largest_unretired_span_locked():
+            if self._evicting_could_fit_locked(nbytes):
                 self._space_exhausted_count += 1
             return None
         if tag is not None and offset < self._high_water:
@@ -2012,7 +2146,7 @@ class RawBlockCore:
             else:
                 self._fdp_slot_affinity_fallback_count += 1
         self._high_water = max(self._high_water, offset + nbytes)
-        return offset
+        return ((offset, nbytes),)
 
     def _warn_no_space_locked(self, nbytes: int) -> None:
         """Log a failed allocation, at most once a minute (they come in runs)."""
@@ -2021,7 +2155,7 @@ class RawBlockCore:
         self._no_space_since_log += 1
         if now - self._no_space_logged_at < 60:
             return
-        never = nbytes > self._largest_unretired_span_locked()
+        never = not self._evicting_could_fit_locked(nbytes)
         logger.warning(
             "RawBlockCore: %d stores found no free range long enough on %s "
             "since the last warning (latest needed %d bytes%s; %d bytes free, "
@@ -2037,8 +2171,13 @@ class RawBlockCore:
         self._no_space_since_log = 0
 
     def _release_locked(self, entry: _Entry) -> None:
-        """Free a deleted object's space, as a hazard if a container may list it."""
-        self._free_locked(entry.offset, entry.length, entry.placement_id)
+        """Free a deleted object's space, as a hazard if a container may list it.
+
+        A split object reaches here only when no container lists it (see
+        ``delete_many_with_sizes``), so a hazard always has one extent.
+        """
+        for offset, length in _extents_of(entry):
+            self._free_locked(offset, length, entry.placement_id)
         if entry.listed:
             self._hazard_seq += 1
             self._hazards[entry.offset] = _Hazard(
@@ -2078,46 +2217,63 @@ class RawBlockCore:
     def _guard_hazards_locked(self, inflight: _Inflight) -> None:
         """Make a reservation safe to write over the hazards it covers.
 
-        An allocation starts at the head of a free extent, so it never starts
-        inside a hazard: the extent of a hazard begins at or before its first
-        byte, and the store that takes that byte holds the rest (the fence)
-        until its write ends. The covered hazards' first bytes are therefore
-        in this write, and their other bytes either in it too, after that
-        byte, or in the fence. What a process crash leaves of a posix write or
-        of one io_uring request is a prefix of it, so only a hazard starting
-        inside the header request needs the header written before the
-        payload. Stores of the same batch may take the fence; they are
-        written after this whole write (``after_fence``).
+        Every extent of an allocation starts at the head of a free extent (a
+        split object takes whole free extents and the head of one more), so
+        none starts inside a hazard: the free extent holding a hazard begins
+        at or before its first byte, and the store that takes that byte holds
+        the rest (a fence) until its write ends. A hazard has one extent
+        (split objects get their header zeroed instead) and is freed whole,
+        so a hazard whose first byte lies in one of this store's extents has
+        its other bytes in that same extent, after that byte, or in the fence
+        taken right after it. Each extent's payload is one request, and what a
+        process crash leaves of a posix write or of one io_uring request is a
+        prefix of it, so only a hazard starting inside the header request
+        needs the header written before the payload. Stores of the same batch
+        may take a fence; they are never split and are written after this
+        whole write (``after_fence``).
         """
-        start, end = inflight.offset, inflight.offset + inflight.length
-        i = bisect.bisect_left(self._hazard_starts, start)
+        assert self._allocator is not None
+        extents = _extents_of(inflight)
         kills: list[int] = []
-        reach = end
-        while i < len(self._hazard_starts) and self._hazard_starts[i] < end:
-            hazard_start = self._hazard_starts[i]
-            kills.append(hazard_start)
-            reach = max(reach, self._hazards[hazard_start].end)
-            i += 1
+        fences: list[tuple[int, int]] = []
+        for start, length in extents:
+            end = start + length
+            i = bisect.bisect_left(self._hazard_starts, start)
+            reach = end
+            while i < len(self._hazard_starts) and self._hazard_starts[i] < end:
+                hazard_start = self._hazard_starts[i]
+                kills.append(hazard_start)
+                reach = max(reach, self._hazards[hazard_start].end)
+                i += 1
+            free_after = self._allocator.free_length_at(end)
+            if reach > end and free_after:
+                fence_len = min(reach - end, free_after)
+                self._allocator.take_head(end, fence_len)
+                fences.append((end, fence_len))
+                self._fence_count += 1
         if not kills:
             return
         inflight.kills = tuple(kills)
-        inflight.header_first = kills[0] < start + self.header_bytes
-        assert self._allocator is not None
-        free_after = self._allocator.free_length_at(end)
-        if reach > end and free_after:
-            fence_len = min(reach - end, free_after)
-            self._allocator.take_head(end, fence_len)
-            inflight.fence = (end, fence_len)
-            self._fence_count += 1
+        inflight.fences = tuple(fences)
+        head = extents[0][0]
+        inflight.header_first = any(head <= s < head + self.header_bytes for s in kills)
 
-    def _largest_unretired_span_locked(self) -> int:
-        """Return the length of the longest data range with no retired byte."""
+    def _evicting_could_fit_locked(self, nbytes: int) -> bool:
+        """Return whether ``nbytes`` could fit once everything is evicted.
+
+        Retired bytes are never freed, so the data region splits into spans
+        without them; a store fits at best in its
+        ``_MAX_EXTENTS_PER_OBJECT`` longest spans. The bound ignores locked
+        objects, so a store that only they block still counts.
+        """
         assert self._allocator is not None
-        cursor, longest = self._allocator.base, 0
+        cursor, spans = self._allocator.base, []
         for start, length in self._retired:
-            longest = max(longest, start - cursor)
+            spans.append(start - cursor)
             cursor = max(cursor, start + length)
-        return max(longest, self._allocator.base + self._allocator.size - cursor)
+        spans.append(self._allocator.base + self._allocator.size - cursor)
+        spans.sort(reverse=True)
+        return sum(spans[:_MAX_EXTENTS_PER_OBJECT]) >= nbytes
 
     def _free_locked(self, offset: int, length: int, placement_id: PlacementId) -> None:
         """Return a range to free space, minus any retired parts of it."""
@@ -2196,47 +2352,54 @@ class RawBlockCore:
         Returns:
             The removed keys with the bytes each held.
         """
-        start, end = observed.offset, observed.offset + observed.length
+        failed = _extents_of(observed)
         self._last_payload_uecc = error
+
+        def overlaps(item: _Entry | _Inflight) -> bool:
+            return any(
+                o < f_o + f_n and f_o < o + n
+                for o, n in _extents_of(item)
+                for f_o, f_n in failed
+            )
+
         if self._index.get(key) is observed:
             owners = [key]
         else:
             # Scans the index under the lock; fine while payload
             # UECCs stay rare, index entries by offset if they are not.
-            owners = [
-                k
-                for k, entry in self._index.items()
-                if entry.offset < end and start < entry.offset + entry.length
-            ]
+            owners = [k for k, entry in self._index.items() if overlaps(entry)]
             for pending in self._inflight.values():
-                if pending.offset < end and start < pending.offset + pending.length:
+                if overlaps(pending):
                     pending.canceled = True
         # The observed object may be gone, its space partly free or reused.
-        self._retire_locked(start, observed.length, allocated=False)
+        for offset, length in failed:
+            self._retire_locked(offset, length, allocated=False)
         removed: list[tuple[str, int]] = []
         for owner in owners:
             entry = self._index.pop(owner)
-            self._retire_locked(entry.offset, entry.length, allocated=True)
+            for offset, length in _extents_of(entry):
+                self._retire_locked(offset, length, allocated=True)
             removed.append((owner, entry.length))
         self._meta_dirty_total += len(removed)
         logger.error(
-            "RawBlockCore quarantined bytes [%d, %d) on %s: %s",
-            start,
-            end,
+            "RawBlockCore quarantined %d bytes in %d extents at %d on %s: %s",
+            observed.length,
+            len(failed),
+            observed.offset,
             self.device_path,
             error,
         )
         return removed
 
     def _invalidate_and_free(
-        self, ranges: Sequence[tuple[int, int, PlacementId]]
+        self, ranges: Sequence[tuple[tuple[Extent, ...], PlacementId]]
     ) -> None:
-        """Overwrite the header at the start of each range, then free it.
+        """Overwrite each object's header, then free all of its extents.
 
         Used instead of hazards with io_uring_cmd (see
-        ``_zero_headers_on_delete``). Called outside the lock for deleted
-        objects. Nothing is flushed, so
-        this ordering holds for process crashes, not for power loss on drives
+        ``_zero_headers_on_delete``) and for split objects a checkpoint may
+        list. Called outside the lock for deleted objects. Nothing is flushed,
+        so this ordering holds for process crashes, not for power loss on drives
         with volatile write caches (issue #6568). A range whose header write
         fails is retired instead: its old header may still be valid, so
         reusing the rest of it could let recovery return another object's
@@ -2246,8 +2409,9 @@ class RawBlockCore:
         is left allocated; this run reuses nothing any more.
 
         Args:
-            ranges: ``(offset, length, placement_id)`` per range; the header
-                write uses the range's placement identifier.
+            ranges: ``(extents, placement_id)`` per object, header at the
+                start of the first extent; the header write uses the
+                placement identifier.
         """
         with self._lock:
             if self._closed:
@@ -2260,22 +2424,26 @@ class RawBlockCore:
                 self._invalidations_inflight -= 1
                 self._invalidations_done.notify_all()
         with self._lock:
-            for (offset, length, placement_id), ok in zip(ranges, written, strict=True):
+            for (extents, placement_id), ok in zip(ranges, written, strict=True):
                 if ok:
                     self._header_invalidations += 1
-                    self._free_locked(offset, length, placement_id)
                 else:
                     self._invalidation_failures += 1
-                    self._retire_locked(offset, length, allocated=True)
+                for offset, length in extents:
+                    if ok:
+                        self._free_locked(offset, length, placement_id)
+                    else:
+                        self._retire_locked(offset, length, allocated=True)
 
     def _write_headers(
-        self, ranges: Sequence[tuple[int, int, PlacementId]]
+        self, ranges: Sequence[tuple[tuple[Extent, ...], PlacementId]]
     ) -> list[bool]:
-        """Zero the header block at the start of each range.
+        """Zero the header block at the start of each object.
 
-        Used with io_uring_cmd only (see ``_zero_headers_on_delete``). Writes
-        go in batches of ``max_batch_size``; a batch with a failed request is
-        retried one request at a time.
+        Used with io_uring_cmd and for listed split objects (see
+        ``_invalidate_and_free``). Writes go in batches of
+        ``max_batch_size``; a batch with a failed request is retried one
+        request at a time.
 
         Returns:
             Whether each range's header was written, aligned with ``ranges``.
@@ -2295,19 +2463,19 @@ class RawBlockCore:
             return written
 
     def _write_headers_once(
-        self, block: Any, ranges: Sequence[tuple[int, int, PlacementId]]
+        self, block: Any, ranges: Sequence[tuple[tuple[Extent, ...], PlacementId]]
     ) -> bool:
-        """Write ``block`` at the start of each range in one engine call."""
+        """Write ``block`` at the start of each object in one engine call."""
         n = len(ranges)
         with self._lock:
             self._inflight_io_count += 1
         try:
             self._write_buffers(
-                [offset for offset, _, _ in ranges],
+                [extents[0][0] for extents, _ in ranges],
                 [block] * n,
                 [self.header_bytes] * n,
                 [self.header_bytes] * n,
-                [placement_id for _, _, placement_id in ranges],
+                [placement_id for _, placement_id in ranges],
             )
             return True
         except Exception:
@@ -2428,12 +2596,16 @@ class RawBlockCore:
             Exception: Propagates raw-device write errors.
         """
         read = self._read_marker()
-        if read is None and loaded_format == _CHECKPOINT_FORMAT_VERSION:
+        marked_format = loaded_format in (
+            _CHECKPOINT_FORMAT_VERSION,
+            _CHECKPOINT_SPLIT_FORMAT_VERSION,
+        )
+        if read is None and marked_format:
             raise RuntimeError(
                 "RawBlockCore could not read the data-region format marker"
             )
         marked = bool(read)
-        if loaded_format == _CHECKPOINT_FORMAT_VERSION and not marked:
+        if marked_format and not marked:
             logger.warning(
                 "RawBlockCore: the data-region marker is missing, so a "
                 "fixed-slot run used %s after its last checkpoint; starting "
@@ -2602,8 +2774,11 @@ class RawBlockCore:
             for entry in self._index.values():
                 entry.listed |= target
             hazard_seq = self._hazard_seq
+            split = any(entry.extents for entry in self._index.values())
             snapshot = {
-                "version": _CHECKPOINT_FORMAT_VERSION,
+                "version": _CHECKPOINT_SPLIT_FORMAT_VERSION
+                if split
+                else _CHECKPOINT_FORMAT_VERSION,
                 "device_path": self.device_path,
                 "capacity_bytes": self.capacity_bytes,
                 "block_align": self.block_align,
@@ -2614,7 +2789,11 @@ class RawBlockCore:
                 "data_base_offset": self._data_base_offset,
                 "entries": {
                     encoded_key: {
-                        "offset": entry.offset,
+                        **(
+                            {"extents": [list(x) for x in entry.extents]}
+                            if entry.extents
+                            else {"offset": entry.offset}
+                        ),
                         "size": entry.meta.size,
                         "gen": entry.generation,
                         "shape": list(entry.meta.shape)
@@ -2760,7 +2939,8 @@ class RawBlockCore:
     def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Apply decoded checkpoint state after validating layout fields.
 
-        Format 2 lists each object's offset; format 1 (fixed slots) is
+        Format 2 lists each object's offset; format 3 also lists split
+        objects by their extents; format 1 (fixed slots) is
         imported by giving each object only the space it needs, so the rest of
         its old slot becomes free. Entries outside the data region, off the
         block (or, in format 1, slot) grid, or overlapping another entry are
@@ -2769,7 +2949,11 @@ class RawBlockCore:
         if not isinstance(data, dict):
             return False
         version = data.get("version")
-        if version not in (1, _CHECKPOINT_FORMAT_VERSION):
+        if version not in (
+            1,
+            _CHECKPOINT_FORMAT_VERSION,
+            _CHECKPOINT_SPLIT_FORMAT_VERSION,
+        ):
             return False
         checkpoint_device_path = data.get("device_path")
         if checkpoint_device_path and checkpoint_device_path != self.device_path:
@@ -2816,16 +3000,28 @@ class RawBlockCore:
                 if not isinstance(entry, dict):
                     continue
 
-                offset = int(entry.get("offset", 0))
                 size = int(entry.get("size", 0))
                 length = self._alloc_len(size)
-                if (
-                    size <= 0
-                    or offset % self.block_align
-                    or offset < region_start
-                    or offset + length > region_end
-                ):
+                if size <= 0:
                     continue
+                extents = None
+                if "extents" in entry:
+                    if version != _CHECKPOINT_SPLIT_FORMAT_VERSION:
+                        continue
+                    extents = self._checkpoint_entry_extents(entry, length)
+                    if extents is None or not all(
+                        region_start <= o and o + n <= region_end for o, n in extents
+                    ):
+                        continue
+                    offset = extents[0][0]
+                else:
+                    offset = int(entry.get("offset", 0))
+                    if (
+                        offset % self.block_align
+                        or offset < region_start
+                        or offset + length > region_end
+                    ):
+                        continue
                 if version == 1 and (
                     (offset - self._data_base_offset) % slot_bytes
                     or length > slot_bytes
@@ -2873,6 +3069,7 @@ class RawBlockCore:
                             generation=generation,
                             # The other container may hold an older copy.
                             listed=(1 << self._meta_copy_count) - 1,
+                            extents=extents,
                         ),
                     )
                 )
@@ -2887,10 +3084,10 @@ class RawBlockCore:
             self._index = dict(kept)
             self._lock_refcnt.clear()
             self._allocator = self._new_allocator(
-                [(entry.offset, entry.length) for _, entry in kept]
+                [x for _, entry in kept for x in _extents_of(entry)]
             )
             self._high_water = max(
-                (entry.offset + entry.length for _, entry in kept), default=0
+                (o + n for _, entry in kept for o, n in _extents_of(entry)), default=0
             )
             self._meta_dirty_total = 0
             self._meta_persisted = 0
@@ -2901,6 +3098,35 @@ class RawBlockCore:
             for entry in self._index.values():
                 entry.generation = max(entry.generation, 0)
         return True
+
+    def _checkpoint_entry_extents(
+        self, entry: dict[str, Any], length: int
+    ) -> tuple[Extent, ...] | None:
+        """Parse and check a split entry's ``extents``.
+
+        Returns:
+            The extents, or None when they are malformed, misaligned, more than
+            ``_MAX_EXTENTS_PER_OBJECT``, not ``length`` bytes in total, or the
+            first cannot hold the header.
+        """
+        raw = entry["extents"]
+        if not isinstance(raw, list) or not 2 <= len(raw) <= _MAX_EXTENTS_PER_OBJECT:
+            return None
+        extents: list[Extent] = []
+        for item in raw:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(v, int) for v in item)
+            ):
+                return None
+            offset, n = item
+            if n <= 0 or offset % self.block_align or n % self.block_align:
+                return None
+            extents.append((offset, n))
+        if sum(n for _, n in extents) != length or extents[0][1] < self.header_bytes:
+            return None
+        return tuple(extents)
 
     def _recover_checkpoint_dtype(
         self,
@@ -2965,13 +3191,13 @@ class RawBlockCore:
                 if unreadable:
                     # The header may still be valid on the device, so the
                     # space cannot be reused without rewriting it first.
-                    self._retire_locked(
-                        removed_entry.offset, removed_entry.length, allocated=True
-                    )
+                    for offset, length in _extents_of(removed_entry):
+                        self._retire_locked(offset, length, allocated=True)
                 else:
                     # Its header already fails the check, so no checkpoint can
                     # bring it back: the space is free at once.
-                    self._free_locked(removed_entry.offset, removed_entry.length, None)
+                    for offset, length in _extents_of(removed_entry):
+                        self._free_locked(offset, length, None)
             self._meta_dirty_total += 1
 
         logger.warning(

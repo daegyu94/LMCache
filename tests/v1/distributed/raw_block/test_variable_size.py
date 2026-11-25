@@ -153,7 +153,7 @@ def test_objects_of_different_sizes_round_trip(tmp_path, engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES, ids=ENGINE_IDS)
-def test_fragmented_space_fails_cleanly_until_a_hole_fits(tmp_path, engine):
+def test_fragmented_space_serves_an_object_from_several_extents(tmp_path, engine):
     payload_len = 3 * ALIGN  # 16 KiB objects
     count = 16
     core = RawBlockCore(
@@ -161,22 +161,42 @@ def test_fragmented_space_fails_cleanly_until_a_hole_fits(tmp_path, engine):
     )
     try:
         kept = _fragment(core, count, payload_len)
-        before = core.report_status()
-        assert before["largest_free_extent_bytes"] == _need(payload_len)
-        assert before["free_bytes"] == count // 2 * _need(payload_len)
+        status = core.report_status()
+        assert status["largest_free_extent_bytes"] == _need(payload_len)
         # Larger than any hole, smaller than their sum.
-        assert not _put(core, 100, _payload(100, payload_len + 1), aligned=engine[2])
+        big = 3 * _need(payload_len) - HEADER - 5
+        assert _put(core, 100, _payload(100, big), aligned=engine[2])
+        assert core.space_exhausted_count() == 0
+        extents = core.entry_extents(_spec(100).encoded)
+        assert extents is not None and len(extents) == 3
+        assert all(off % ALIGN == 0 and n % ALIGN == 0 for off, n in extents)
+        assert sum(n for _, n in extents) == _need(big)
+        assert core.entry_offset(_spec(100).encoded) == extents[0][0]
+        assert core.report_status()["multi_extent_alloc_count"] == 1
+        assert core.report_status()["alloc_failure_count"] == 0
+        assert _load(core, 100, big) == _payload(100, big)
+        for i in kept:
+            assert _load(core, i, payload_len) == _payload(i, payload_len)
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_fragmentation_beyond_the_extent_limit_fails_cleanly(tmp_path):
+    count = 40
+    core = RawBlockCore(_config(tmp_path, data_bytes=ALIGN + count * _need(1)))
+    try:
+        _fragment(core, count, 1)  # 20 one-object holes
+        before = core.report_status()
+        too_many = 9 * _need(1) - HEADER  # needs 9 > 8 extents
+        assert not _put(core, 100, b"x" * too_many)
         after = core.report_status()
         assert after["free_bytes"] == before["free_bytes"]
         assert after["alloc_failure_count"] == before["alloc_failure_count"] + 1
         assert after["inflight_key_count"] == 0
-        # A smaller object takes the head of a hole.
-        assert _put(core, 101, _payload(101, 5), aligned=engine[2])
-        offset = core.entry_offset(_spec(101).encoded)
-        assert offset is not None and offset % ALIGN == 0
-        assert _load(core, 101, 5) == _payload(101, 5)
-        for i in kept:
-            assert _load(core, i, payload_len) == _payload(i, payload_len)
+        assert core.space_exhausted_count() == 1
+        assert _put(core, 101, b"y" * (8 * _need(1) - HEADER))
+        assert core.space_exhausted_count() == 1
         _check_accounting(core)
     finally:
         core.close()
@@ -186,14 +206,15 @@ def test_a_store_that_finds_no_long_enough_range_reports_the_device_full(tmp_pat
     """Free space split into short ranges can sit below the eviction
     watermark; the core must say so until space is freed."""
     payload_len = 3 * ALIGN
-    count = 16
+    count = 32
     core = RawBlockCore(
         _config(tmp_path, data_bytes=ALIGN + count * _need(payload_len))
     )
     try:
         kept = _fragment(core, count, payload_len)
         assert core.space_exhausted_count() == 0
-        assert not _put(core, 100, _payload(100, 2 * _need(payload_len)))
+        # Needs nine holes, one more than an object may span.
+        assert not _put(core, 100, _payload(100, 9 * _need(payload_len) - HEADER))
         assert core.space_exhausted_count() == 1
         assert core.report_status()["space_exhausted_count"] == 1
         assert core.delete_many([_spec(kept[0]).encoded]) == [True]
@@ -1108,44 +1129,43 @@ def test_imported_entries_adopt_the_generation_of_their_header(tmp_path):
     assert newest[1][_spec(1).encoded]["gen"] == 0xA5A5
 
 
-@pytest.mark.parametrize("retired", [1, 4])  # the longest range after it, or before
-def test_an_object_longer_than_every_unretired_range_does_not_count(tmp_path, retired):
-    """A retired range in the middle splits the data region: an object that
-    fits the usable capacity but no range between retired bytes never fits,
-    so evicting for it would only empty the cache."""
-    payload_len = 3 * ALIGN
-    count = 8
-    config = _config(tmp_path, data_bytes=ALIGN + count * _need(payload_len))
+def test_an_object_longer_than_its_reachable_unretired_ranges_does_not_count(
+    tmp_path,
+):
+    """Retired ranges split the data region into spans; an object can use at
+    most its 8 longest spans. One longer than those but within the usable
+    capacity never fits, so evicting for it would only empty the cache."""
+    count = 17
+    hole = _need(ALIGN)
+    config = _config(tmp_path, data_bytes=ALIGN + count * hole)
     first = RawBlockCore(config)
     try:
         for i in range(count):
-            assert _put(first, i, _payload(i, payload_len))
-        bad = first.entry_offset(_spec(retired).encoded)
+            assert _put(first, i, _payload(i, ALIGN))
+        bad = {first.entry_offset(_spec(i).encoded) for i in range(1, count, 2)}
     finally:
         first.close()
     real_read = PosixBlockIO.read_buffers
 
     def unreadable(self, offsets, *args, **kwargs):
-        if list(offsets) == [bad]:
-            return [False]
+        if bad & set(offsets):
+            return [off not in bad for off in offsets]
         return real_read(self, offsets, *args, **kwargs)
 
     with patch.object(PosixBlockIO, "read_buffers", unreadable):
-        core = RawBlockCore(config)  # retires the object at bad
+        core = RawBlockCore(config)  # retires the objects at bad
     try:
         core.delete_many(core.snapshot_indexed_keys())
         status = core.report_status()
-        span = status["largest_free_extent_bytes"]
-        too_long = span + _need(payload_len)
-        assert too_long <= status["usable_capacity_bytes"]
-        assert not _put(core, 100, b"x" * (too_long - HEADER))
+        assert status["quarantined_range_count"] == 8  # nine one-hole spans
+        assert status["usable_capacity_bytes"] == 9 * hole
+        assert not _put(core, 100, b"x" * (9 * hole - HEADER))
         assert core.space_exhausted_count() == 0
-        # One that fits a range counts when it fails.
-        for i in range(count):
-            _put(core, 200 + i, _payload(i, payload_len))
-        counted = core.space_exhausted_count()
-        assert not _put(core, 300, b"x" * (span - HEADER))
-        assert core.space_exhausted_count() == counted + 1
+        # One that eight spans could hold counts when it fails.
+        for i in range(9):
+            assert _put(core, 200 + i, _payload(i, ALIGN))
+        assert not _put(core, 300, b"x" * (2 * hole - HEADER))
+        assert core.space_exhausted_count() == 1
     finally:
         core.close()
 
@@ -1154,16 +1174,17 @@ def test_exhausted_space_is_counted_once_per_failed_store(tmp_path):
     """Each store that finds no long enough range counts once; reading the
     count changes nothing, so several readers see the same value."""
     payload_len = 3 * ALIGN
-    count = 16
+    count = 32
+    too_long = 9 * _need(payload_len) - HEADER  # nine holes: one too many
     core = RawBlockCore(
         _config(tmp_path, data_bytes=ALIGN + count * _need(payload_len))
     )
     try:
         _fragment(core, count, payload_len)
-        assert not _put(core, 100, _payload(100, 2 * _need(payload_len)))
+        assert not _put(core, 100, _payload(100, too_long))
         assert core.space_exhausted_count() == 1
         assert core.space_exhausted_count() == 1
-        assert not _put(core, 101, _payload(101, 2 * _need(payload_len)))
+        assert not _put(core, 101, _payload(101, too_long))
         assert core.space_exhausted_count() == 2
         assert _put(core, 102, b"s")  # a store that fits counts nothing
         assert core.space_exhausted_count() == 2
@@ -1321,6 +1342,647 @@ def test_import_keeps_the_cache_if_the_marker_write_fails(tmp_path):
         assert _load(again, 1, 100) == _payload(1, 100)
     finally:
         again.close()
+
+
+@pytest.mark.parametrize("io_engine", ["posix", "io_uring"])
+def test_the_header_never_lands_in_an_extent_shorter_than_it(tmp_path, io_engine):
+    """With header_bytes above block_align, free space can split into ranges
+    shorter than a header; a split object must still start its header in an
+    extent that holds all of it, or it would overwrite the next object."""
+    block, header = 512, 4096
+    config = replace(
+        _config(tmp_path, (io_engine, False, False), data_bytes=1 << 20),
+        block_align=block,
+        header_bytes=header,
+    )
+    core = RawBlockCore(config)
+    stored: dict[int, int] = {}
+    try:
+        # Objects of header + 1024 bytes, then reuse each other hole for
+        # header + 512, leaving 512-byte holes between live objects.
+        key = 0
+        while _put(core, key, _payload(key, 1024)):
+            stored[key] = 1024
+            key += 1
+        olds = sorted(stored)[::2]
+        core.delete_many([_spec(k).encoded for k in olds])
+        for k in olds:
+            del stored[k]
+        for k in olds:
+            assert _put(core, 1000 + k, _payload(1000 + k, 512))
+            stored[1000 + k] = 512
+        assert core.report_status()["largest_free_extent_bytes"] < header
+        # Fits in the free bytes, but no free range holds the header.
+        assert not _put(core, 9999, _payload(9999, 2 * block))
+        for k, n in stored.items():
+            assert _load(core, k, n) == _payload(k, n)
+    finally:
+        core.close()
+    reopened = RawBlockCore(config)
+    try:
+        assert sorted(reopened.snapshot_indexed_keys()) == sorted(
+            _spec(k).encoded for k in stored
+        )
+    finally:
+        reopened.close()
+
+
+def _newest_checkpoint(config, offsets) -> dict:
+    newest: tuple[int, dict] = (0, {})
+    with open(config.device_path, "rb") as f:
+        for offset in offsets:
+            f.seek(offset)
+            _, _, seq, length, _ = _META_HEADER.unpack(f.read(_META_HEADER.size))
+            f.seek(offset + ALIGN)
+            if seq > newest[0]:
+                newest = (seq, json.loads(f.read(length)))
+    return newest[1]
+
+
+def test_split_entries_have_no_offset_and_a_new_format(tmp_path):
+    """A reader without split objects must drop the checkpoint, not read a
+    split entry as one contiguous range from its first extent; without split
+    objects the checkpoint keeps the format such a reader understands."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        offsets = core.metadata_container_offsets()
+        core.checkpoint_now()
+        assert _newest_checkpoint(config, offsets)["version"] == 2
+        assert _put(core, 100, _payload(100, 2 * _need(ALIGN) - HEADER))
+        core.checkpoint_now()
+        state = _newest_checkpoint(config, offsets)
+        assert state["version"] == 3
+        split = state["entries"][_spec(100).encoded]
+        assert "offset" not in split and len(split["extents"]) == 2
+        assert "offset" in state["entries"][_spec(1).encoded]
+        assert core.delete_many([_spec(100).encoded]) == [True]
+        core.checkpoint_now()
+        assert _newest_checkpoint(config, offsets)["version"] == 2
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize("engine", ENGINES, ids=ENGINE_IDS)
+def test_split_objects_survive_restart(tmp_path, engine):
+    config = _config(tmp_path, engine, data_bytes=ALIGN + 16 * _need(ALIGN))
+    big = 3 * _need(ALIGN) - HEADER - 9
+    core = RawBlockCore(config)
+    try:
+        kept = _fragment(core, 16, ALIGN)
+        assert _put(core, 100, _payload(100, big), aligned=engine[2])
+        extents = core.entry_extents(_spec(100).encoded)
+        assert extents is not None and len(extents) == 3
+    finally:
+        core.close()
+    again = RawBlockCore(config)
+    try:
+        assert again.entry_extents(_spec(100).encoded) == extents
+        assert _load(again, 100, big) == _payload(100, big)
+        for i in kept:
+            assert _load(again, i, ALIGN) == _payload(i, ALIGN)
+        _check_accounting(again)
+    finally:
+        again.close()
+
+
+def test_a_deleted_split_object_cannot_come_back_over_its_reused_extents(tmp_path):
+    """The checkpoint still lists the split object; a new object in one of its
+    later extents does not touch its header, so only the zeroed header keeps
+    recovery from returning the new bytes for it."""
+    config = replace(
+        _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN)),
+        meta_enable_periodic=False,
+    )
+    big = 3 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, big))
+        later = {off for off, _ in core.entry_extents(_spec(100).encoded)[1:]}
+        core.checkpoint_now()
+        assert core.delete_many([_spec(100).encoded]) == [True]
+        # Fill every hole: the split object's later extents get new objects.
+        k = 200
+        while _put(core, k, _payload(k, ALIGN)):
+            k += 1
+        assert later <= {core.entry_offset(_spec(i).encoded) for i in range(200, k)}
+        crashed = RawBlockCore(config)
+        try:
+            assert _load(crashed, 100, big) is None
+            _check_accounting(crashed)
+        finally:
+            crashed.close()
+    finally:
+        core.close()
+
+
+def test_a_failed_header_write_retires_every_extent_of_a_split_object(tmp_path):
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    big = 3 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    real_write = PosixBlockIO.write_buffers
+
+    def failing_header_write(self, offsets, *args, **kwargs):
+        if len(offsets) == 1 and offsets[0] == extents[0][0]:
+            raise OSError("injected")
+        return real_write(self, offsets, *args, **kwargs)
+
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, big))
+        extents = core.entry_extents(_spec(100).encoded)
+        core.checkpoint_now()  # listed, so the delete zeroes its header
+        free = core.report_status()["free_bytes"]
+        with patch.object(PosixBlockIO, "write_buffers", failing_header_write):
+            assert core.delete_many([_spec(100).encoded]) == [True]
+        status = core.report_status()
+        assert status["header_invalidation_failure_count"] == 1
+        assert status["quarantined_bytes"] == _need(big)
+        assert status["quarantined_range_count"] == len(extents)
+        assert status["free_bytes"] == free
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_a_split_object_whose_header_is_unreadable_at_startup_retires_it(tmp_path):
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    big = 3 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, big))
+        extents = core.entry_extents(_spec(100).encoded)
+        free = core.report_status()["free_bytes"]
+    finally:
+        core.close()
+    real_read = PosixBlockIO.read_buffers
+
+    def failing_header_read(self, offsets, *args, **kwargs):
+        if extents[0][0] in offsets:
+            return [off != extents[0][0] for off in offsets]
+        return real_read(self, offsets, *args, **kwargs)
+
+    with patch.object(PosixBlockIO, "read_buffers", failing_header_read):
+        again = RawBlockCore(config)
+    try:
+        assert again.entry_extents(_spec(100).encoded) is None
+        status = again.report_status()
+        assert status["quarantined_bytes"] == _need(big)
+        assert status["free_bytes"] == free
+        _check_accounting(again)
+    finally:
+        again.close()
+
+
+def test_a_split_object_with_another_writes_header_is_dropped(tmp_path):
+    """The generation in the first extent's header ties a split entry to its
+    own write, as for a single extent."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    big = 3 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, big))
+        head = core.entry_offset(_spec(100).encoded)
+    finally:
+        core.close()
+    with open(config.device_path, "r+b") as f:
+        f.seek(head + 24)
+        gen = int.from_bytes(f.read(8), "little")
+        f.seek(head + 24)
+        f.write((gen ^ 2).to_bytes(8, "little"))
+    again = RawBlockCore(config)
+    try:
+        assert again.entry_extents(_spec(100).encoded) is None
+        assert again.report_status()["free_bytes"] == _need(big) + _need(ALIGN)
+        _check_accounting(again)
+    finally:
+        again.close()
+
+
+def test_a_failed_or_cancelled_split_store_frees_every_extent(tmp_path):
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    big = 3 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    real_write = PosixBlockIO.write_buffers
+
+    def failing_write(self, offsets, *args, **kwargs):
+        if len(offsets) > 2:
+            raise OSError("injected")
+        return real_write(self, offsets, *args, **kwargs)
+
+    def cancelling_write(self, offsets, *args, **kwargs):
+        if len(offsets) > 2:
+            core.delete_many([_spec(101).encoded])
+        return real_write(self, offsets, *args, **kwargs)
+
+    try:
+        _fragment(core, 8, ALIGN)
+        free = core.report_status()["free_bytes"]
+        with patch.object(PosixBlockIO, "write_buffers", failing_write):
+            assert not _put(core, 100, _payload(100, big))
+        assert core.report_status()["free_bytes"] == free
+        with patch.object(PosixBlockIO, "write_buffers", cancelling_write):
+            assert not _put(core, 101, _payload(101, big))
+        assert core.report_status()["free_bytes"] == free
+        assert core.report_status()["free_extent_count"] == 4
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize("queue_depth", [8, 64])
+def test_a_large_batch_of_split_objects_round_trips(tmp_path, queue_depth):
+    """64 objects of 8 extents each are 576 requests in one batch, far beyond
+    the io_uring queue depth."""
+    engine = ("io_uring", True, True)
+    count = 1024
+    config = replace(
+        _config(tmp_path, engine, data_bytes=ALIGN + count * _need(ALIGN)),
+        iouring_queue_depth=queue_depth,
+    )
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, count, ALIGN)  # 512 holes of one object each
+        size = 8 * _need(ALIGN) - HEADER - 7
+        keys = list(range(5000, 5064))
+        result = core.put_many(
+            [_spec(k) for k in keys],
+            [make_aligned_memory_obj(_payload(k, size)) for k in keys],
+        )
+        assert result.results == [True] * 64
+        assert all(len(core.entry_extents(_spec(k).encoded) or []) == 8 for k in keys)
+        dests = [make_empty_memory_obj(size) for _ in keys]
+        assert (
+            core.load_many_into([_spec(k).encoded for k in keys], dests) == [True] * 64
+        )
+        for k, dest in zip(keys, dests, strict=True):
+            assert memory_obj_bytes(dest) == _payload(k, size)
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_split_entries_in_a_format_2_checkpoint_are_dropped(tmp_path):
+    """Only format 3 lists extents; one in a format-2 checkpoint is corrupt."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, 2 * _need(ALIGN) - HEADER))
+        offsets = core.metadata_container_offsets()
+        core.checkpoint_now()
+        state = _newest_checkpoint(config, offsets)
+        seq = core.report_status()["metadata_seq"]
+    finally:
+        core.close()
+    state["version"] = 2
+    _write_container(config.device_path, offsets[0], seq + 5, state)
+    again = RawBlockCore(config)
+    try:
+        assert again.entry_extents(_spec(100).encoded) is None
+        assert _load(again, 1, ALIGN) == _payload(1, ALIGN)
+        _check_accounting(again)
+    finally:
+        again.close()
+
+
+def _split_checkpoint(tmp_path, payload_len: int):
+    """Eight objects, every other one deleted, then one split over two holes;
+    return the config, the checkpoint state, its container offsets and seq,
+    and where objects start."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(payload_len))
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, payload_len)
+        assert _put(core, 100, _payload(100, 2 * _need(payload_len) - HEADER))
+        assert len(core.entry_extents(_spec(100).encoded) or []) == 2
+        offsets = core.metadata_container_offsets()
+        core.checkpoint_now()
+        seq = core.report_status()["metadata_seq"]
+        base = _first_object_offset(core)
+    finally:
+        core.close()
+    return config, _newest_checkpoint(config, offsets), offsets, seq, base
+
+
+def _free_hole(state: dict, payload_len: int, base: int) -> int:
+    """Start of a hole of one object that no entry uses."""
+    used = set()
+    for entry in state["entries"].values():
+        for off, _ in entry.get("extents") or [[entry["offset"], 0]]:
+            used.add(off)
+    hole = _need(payload_len)
+    return next(base + i * hole for i in range(8) if base + i * hole not in used)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["total-length", "misaligned", "too-many", "overlap"],
+)
+def test_corrupt_split_entries_are_dropped(tmp_path, corrupt):
+    payload_len = 7 * ALIGN  # holes of 8 blocks
+    config, state, offsets, seq, base = _split_checkpoint(tmp_path, payload_len)
+    entries = state["entries"]
+    split = entries[_spec(100).encoded]["extents"]
+    (o1, n1), (o2, n2) = split
+    free = _free_hole(state, payload_len, base)
+    dropped = {_spec(100).encoded}
+    if corrupt == "total-length":
+        split[1] = [o2, n2 - ALIGN]
+    elif corrupt == "misaligned":
+        split[1:] = [[o2, n2 - ALIGN // 2], [free, ALIGN // 2]]
+    elif corrupt == "too-many":
+        split[1:] = [[o2, n2 - 7 * ALIGN]] + [
+            [free + i * ALIGN, ALIGN] for i in range(7)
+        ]
+    else:
+        victim = _spec(1).encoded
+        split[1] = [entries[victim]["offset"], n2]
+        dropped.add(victim)
+    _write_container(config.device_path, offsets[0], seq + 5, state)
+    again = RawBlockCore(config)
+    try:
+        assert set(again.snapshot_indexed_keys()) == set(entries) - dropped
+        _check_accounting(again)
+    finally:
+        again.close()
+
+
+def test_a_split_object_deleted_while_it_is_read_retires_every_extent(tmp_path):
+    """A media error found after a force-delete raced the read: the observed
+    object is gone and its extents free, and all of them must be retired."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    big = 2 * _need(ALIGN) - HEADER
+    core = RawBlockCore(config)
+    real_read = PosixBlockIO.read_buffers
+
+    def read_racing_delete(self, offsets, *args, unrecovered_reads=None, **kwargs):
+        if not raced and len(offsets) == 2:
+            raced.append(1)
+            assert core.delete_many([_spec(100).encoded], force=True) == [True]
+            results = real_read(self, offsets, *args, **kwargs)
+            unrecovered_reads[0] = "injected media error"
+            return [False] + results[1:]
+        return real_read(
+            self, offsets, *args, unrecovered_reads=unrecovered_reads, **kwargs
+        )
+
+    raced: list[int] = []
+    try:
+        _fragment(core, 8, ALIGN)
+        assert _put(core, 100, _payload(100, big))
+        extents = core.entry_extents(_spec(100).encoded)
+        with patch.object(PosixBlockIO, "read_buffers", read_racing_delete):
+            assert _load(core, 100, big) is None
+        assert raced
+        status = core.report_status()
+        assert status["quarantined_bytes"] == sum(n for _, n in extents)
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_a_split_object_reusing_failed_space_in_a_later_extent_is_retired(tmp_path):
+    """A new object may hold the failed space in its second extent only; it
+    must be found as an owner and retired too."""
+    hole = _need(ALIGN)
+    # A(1) O(1) B(1) C(2) D(1): deleting C leaves a two-hole range.
+    config = _config(tmp_path, data_bytes=ALIGN + 6 * hole)
+    core = RawBlockCore(config)
+    real_read = PosixBlockIO.read_buffers
+
+    def read_racing_reuse(self, offsets, *args, unrecovered_reads=None, **kwargs):
+        if not raced and list(offsets) == [o_offset + HEADER]:
+            raced.append(1)
+            assert core.delete_many([_spec(2).encoded], force=True) == [True]
+            # Three holes' worth: the two-hole range, then O's space.
+            assert _put(core, 9, _payload(9, 3 * hole - HEADER))
+            real_read(self, offsets, *args, **kwargs)
+            unrecovered_reads[0] = "injected media error"
+            return [False]
+        return real_read(
+            self, offsets, *args, unrecovered_reads=unrecovered_reads, **kwargs
+        )
+
+    raced: list[int] = []
+    try:
+        assert _put(core, 1, _payload(1, ALIGN))
+        assert _put(core, 2, _payload(2, ALIGN))  # O
+        assert _put(core, 3, _payload(3, ALIGN))
+        assert _put(core, 4, _payload(4, 2 * hole - HEADER))  # C
+        assert _put(core, 5, _payload(5, ALIGN))
+        o_offset = core.entry_offset(_spec(2).encoded)
+        assert core.delete_many([_spec(4).encoded]) == [True]
+        with patch.object(PosixBlockIO, "read_buffers", read_racing_reuse):
+            assert _load(core, 2, ALIGN) is None
+        assert raced
+        assert core.entry_extents(_spec(9).encoded) is None
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_a_split_checkpoint_without_the_marker_is_not_trusted(tmp_path):
+    config, state, offsets, _, _ = _split_checkpoint(tmp_path, ALIGN)
+    assert state["version"] == 3
+    probe = RawBlockCore(replace(config, load_checkpoint_on_init=False))
+    base = probe.data_base_offset()
+    probe.close()
+    # The probe superseded the checkpoint; put the split one back, newer.
+    _write_container(config.device_path, offsets[0], 1000, state)
+    with open(config.device_path, "r+b") as f:
+        f.seek(base)
+        f.write(b"\0" * ALIGN)  # as an older binary's first object would
+    again = RawBlockCore(config)
+    try:
+        assert again.indexed_key_count() == 0
+    finally:
+        again.close()
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_a_listed_split_object_delete_zeroes_its_header_once(tmp_path, verify):
+    """Deletes of one-extent objects write nothing; a split object that a
+    checkpoint may list has its header zeroed (one header_bytes write), with
+    verification off too (a later run may verify the same checkpoint), then
+    every extent is freed."""
+    config = replace(
+        _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN)),
+        meta_verify_on_load=verify,
+    )
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        free = core.report_status()["free_bytes"]
+        assert _put(core, 100, _payload(100, 2 * _need(ALIGN) - HEADER))
+        head = core.entry_offset(_spec(100).encoded)
+        core.checkpoint_now()
+        assert core.delete_many([_spec(1).encoded]) == [True]
+        assert core.report_status()["header_invalidation_count"] == 0
+        free += _need(ALIGN)
+        assert core.delete_many([_spec(100).encoded]) == [True]
+        assert core.report_status()["free_bytes"] == free
+        assert core.report_status()["header_invalidation_count"] == 1
+        assert core.report_status()["reuse_hazard_count"] == 1  # key 1 only
+        with open(config.device_path, "rb") as f:
+            f.seek(head)
+            assert f.read(HEADER) == b"\0" * HEADER
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_an_unlisted_split_object_delete_writes_nothing(tmp_path):
+    """No checkpoint lists it, so no recovery can trust its header."""
+    config = _config(tmp_path, data_bytes=ALIGN + 8 * _need(ALIGN))
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)
+        free = core.report_status()["free_bytes"]
+        assert _put(core, 100, _payload(100, 2 * _need(ALIGN) - HEADER))
+        with patch.object(PosixBlockIO, "write_buffers") as write:
+            assert core.delete_many([_spec(100).encoded]) == [True]
+        write.assert_not_called()
+        status = core.report_status()
+        assert status["free_bytes"] == free
+        assert status["reuse_hazard_count"] == 0
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def _layout(core, sizes: list[int]) -> list[int]:
+    """Store objects of ``sizes`` holes each, in order; return their keys."""
+    hole = _need(ALIGN)
+    keys = []
+    for k, n in enumerate(sizes, start=10):
+        assert _put(core, k, _payload(k, n * hole - HEADER))
+        keys.append(k)
+    return keys
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_a_split_store_over_a_deleted_object_writes_the_header_first(tmp_path, batched):
+    """The split store's first extent is a deleted object's whole free range,
+    so its header covers that object's first byte: io_uring must complete the
+    header before any payload segment, which overwrite the rest of it."""
+    hole = _need(ALIGN)
+    config = replace(
+        _config(tmp_path, ("io_uring", False, False), data_bytes=ALIGN + 7 * hole),
+        meta_enable_periodic=False,
+    )
+    core = RawBlockCore(config)
+    real_write = IoUringBlockIO.write_buffers
+    calls: list[list[int]] = []
+
+    def record(self, offsets, *args, **kwargs):
+        calls.append(list(offsets))
+        return real_write(self, offsets, *args, **kwargs)
+
+    try:
+        s0, deleted, s1, other, s2 = _layout(core, [1, 3, 1, 1, 1])
+        assert core.delete_many([_spec(other).encoded]) == [True]  # no hazard
+        core.checkpoint_now()
+        head = core.entry_offset(_spec(deleted).encoded)
+        assert core.delete_many([_spec(deleted).encoded]) == [True]
+        # The only hazard starts in the first extent's header request.
+        assert core.report_status()["reuse_hazard_count"] == 1
+        big = _payload(100, 4 * hole - HEADER)
+        with patch.object(IoUringBlockIO, "write_buffers", record):
+            if batched:
+                result = core.put_many(
+                    [_spec(100), _spec(101)],
+                    [_obj(big, False), _obj(b"tiny", False)],
+                )
+                assert result.results == [True, False]  # no room left for 101
+            else:
+                assert _put(core, 100, big)
+        extents = core.entry_extents(_spec(100).encoded)
+        assert extents is not None and extents[0] == (head, 3 * hole)
+        header_call = next(i for i, c in enumerate(calls) if head in c)
+        payload_calls = [i for i, c in enumerate(calls) if any(o > head for o in c)]
+        assert all(header_call < i for i in payload_calls)
+        assert head not in [o for i in payload_calls for o in calls[i]]
+        assert core.report_status()["reuse_hazard_count"] == 0
+        assert _load(core, 100, len(big)) == big
+    finally:
+        core.close()
+
+
+def test_a_split_store_fences_a_deleted_object_past_its_last_extent(tmp_path):
+    """The best-fit extent of a split store takes the head of a deleted
+    object's range; the rest of that object is held until the write ends, so
+    no other store can overwrite it before its first byte."""
+    hole = _need(ALIGN)
+    config = replace(
+        _config(tmp_path, data_bytes=ALIGN + 7 * hole), meta_enable_periodic=False
+    )
+    core = RawBlockCore(config)
+    real_write = PosixBlockIO.write_buffers
+    during: list[dict] = []
+
+    def record(self, offsets, *args, **kwargs):
+        if len(offsets) > 2:
+            during.append(core.report_status())
+        return real_write(self, offsets, *args, **kwargs)
+
+    try:
+        unlisted, s1, deleted, s2 = _layout(core, [3, 1, 2, 1])
+        assert core.delete_many([_spec(unlisted).encoded]) == [True]  # no hazard
+        core.checkpoint_now()
+        head = core.entry_offset(_spec(deleted).encoded)
+        assert core.delete_many([_spec(deleted).encoded]) == [True]
+        assert core.report_status()["reuse_hazard_count"] == 1
+        big = _payload(100, 4 * hole - HEADER)
+        with patch.object(PosixBlockIO, "write_buffers", record):
+            assert _put(core, 100, big)
+        extents = core.entry_extents(_spec(100).encoded)
+        assert extents is not None and extents[1] == (head, hole)
+        # While the write ran, the deleted object's last hole was taken too.
+        assert during and during[0]["free_bytes"] == 0
+        status = core.report_status()
+        assert status["free_bytes"] == hole  # the fence came back
+        assert status["reuse_hazard_count"] == 0
+        _check_accounting(core)
+    finally:
+        core.close()
+
+
+def test_a_listed_split_object_reused_at_a_later_extent_head_does_not_return(
+    tmp_path,
+):
+    """A store at the head of a later extent of a deleted split object writes
+    nothing over its header extent; only the header zeroed at delete keeps a
+    crash from returning that store's bytes for the split key."""
+    hole = _need(ALIGN)
+    config = replace(
+        _config(tmp_path, data_bytes=ALIGN + 8 * hole), meta_enable_periodic=False
+    )
+    big = 3 * hole - HEADER
+    core = RawBlockCore(config)
+    try:
+        _fragment(core, 8, ALIGN)  # four one-hole holes
+        assert _put(core, 100, _payload(100, big))
+        extents = core.entry_extents(_spec(100).encoded)
+        assert extents is not None and len(extents) == 3
+        core.checkpoint_now()
+        assert core.delete_many([_spec(100).encoded]) == [True]
+        # The most recently freed hole of that size: the split object's last.
+        assert _put(core, 200, _payload(200, ALIGN))
+        reused = core.entry_offset(_spec(200).encoded)
+        assert reused in {off for off, _ in extents[1:]}
+        crashed = RawBlockCore(config)
+        try:
+            assert _load(crashed, 100, big) is None
+            assert _load(crashed, 1, ALIGN) == _payload(1, ALIGN)
+        finally:
+            crashed.close()
+    finally:
+        core.close()
 
 
 @pytest.mark.parametrize("how", ["skipped", "rejected"])

@@ -171,13 +171,17 @@ the Rust wheel's version, so pin it yourself to guarantee a matching pair:
 Free space is kept as maximal free extents. A store takes the head of the
 smallest free extent that fits (best fit), so an object the size of one that
 was just evicted reuses exactly that space. Freed space merges with adjacent
-free space immediately. A store fails when no single free extent is long
-enough, even if the free bytes add up. The eviction controller then runs one
-eviction round per pass in which such a store failed, although usage is below
-its watermark. With per-``cache_salt`` quotas, a salt over its quota is
-evicted as usual; when every salt is under its quota, only the salt using the
-largest share of its quota gives up a round. Reported usage is unchanged; the
-controller status counts these rounds as ``space_exhausted_rounds``.
+free space immediately. When no single free extent is long enough, the object
+is split across up to 8 free extents, longest first, with its header in the
+first; each extra extent costs one more I/O request. This keeps stores
+working when objects that cannot be evicted (for example locked ones) split
+the free space. A store fails when those 8 extents cannot hold it. The
+eviction controller then runs one eviction round per pass in which such a
+store failed, although usage is below its watermark. With per-``cache_salt``
+quotas, a salt over its quota is evicted as usual; when every salt is under
+its quota, only the salt using the largest share of its quota gives up a
+round. Reported usage is unchanged; the controller status counts these rounds
+as ``space_exhausted_rounds``.
 
 This trades hit rate for stores that fit: while stores keep failing, one
 round per second is evicted, also when the evicted objects are not next to
@@ -190,8 +194,9 @@ The core status (``/status``, under the adapter's ``core``) reports
 ``usable_capacity_bytes``, ``allocated_bytes``, ``free_bytes``,
 ``free_extent_count``, ``largest_free_extent_bytes``,
 ``alloc_failure_count``, ``space_exhausted_count``, ``reuse_hazard_count``,
+``multi_extent_alloc_count`` (objects stored split),
 ``header_invalidation_count``, ``header_invalidation_failure_count``
-(``use_uring_cmd`` only), ``quarantined_bytes`` and
+(``use_uring_cmd`` and split objects only), ``quarantined_bytes`` and
 ``quarantined_range_count``. The fixed-slot keys ``slot_bytes``,
 ``max_slots``, ``next_slot``, ``free_slot_count`` and
 ``quarantined_slot_count`` are gone.
@@ -231,6 +236,10 @@ copies have been rewritten without it:
   and frees the space after that write returns. If it fails, the space is
   retired like quarantined space and counted in
   ``header_invalidation_failure_count``.
+- An object split across several extents has its header only in the first,
+  so deleting one that a checkpoint copy may list also overwrites the header
+  first (one ``header_bytes`` write per such delete). Split objects only
+  occur when no single free range fits a store.
 
 ``reuse_hazard_count`` in the status counts the guarded objects. At startup,
 an entry whose header cannot be read is retired.
@@ -283,6 +292,11 @@ marker, and this version then starts empty instead of trusting a checkpoint
 whose space the older run may have reused. It does not catch an older run
 that stopped before that first write reached the device while later writes
 did (one io_uring batch has no order, and posix runs several store workers).
+
+A checkpoint that lists a split object is written in a newer format still.
+A version that loads per-object checkpoints but cannot split objects rejects
+it and starts empty, voiding every metadata container before its first store, so
+going back to such a version also loses the cache.
 
 **Fixed-buffer registration and memlock:**
 
